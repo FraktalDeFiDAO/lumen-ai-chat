@@ -72,6 +72,32 @@ codex login
 
 `GET /api/coders` reports `installed_unverified` or `unavailable`. Installation is not reported as authenticated; the first harmless execution verifies native CLI authentication.
 
+## Run with Podman Compose
+
+The checked-in Compose deployment builds a release Rust API image and a production nginx/Vue image. It uses host networking but binds both services to loopback only:
+
+```bash
+podman build -f Containerfile.backend -t localhost/lumen-ai-chat-api:dev .
+podman build -f Containerfile.frontend -t localhost/lumen-ai-chat-web:dev .
+podman compose --in-pod=false -f compose.yaml up -d --no-build
+```
+
+Open http://127.0.0.1:41789. Check service state and logs with:
+
+```bash
+podman compose --in-pod=false -f compose.yaml ps
+podman logs lumen-ai-chat-api
+podman logs lumen-ai-chat-web
+```
+
+The API container runs rootlessly with dropped capabilities and a read-only project mount. The native coder executables and their existing per-user authentication/configuration directories are mounted from the host at their original paths so Hermes, OpenCode, KiloCode, Claude Code, and Codex retain their native login state. Coder source inspection still uses the temporary secret-filtered read-only snapshot described below. No `.env` file is mounted or loaded by Compose.
+
+Stop the deployment with:
+
+```bash
+podman compose --in-pod=false -f compose.yaml down
+```
+
 ### Workspace safety
 
 Coder processes run in one fixed workspace and cannot accept a working directory from an HTTP request:
@@ -229,6 +255,7 @@ npm run typecheck
 npm test
 npm run build
 npm run test:e2e
+npm run test:podman  # while the Compose deployment is running
 ```
 
 The E2E gate invokes isolated executable mocks through all five CLI adapters, validates read-only command construction and output normalization, exercises all native direct-provider protocols, and verifies the complete desktop/mobile UI in Chromium.

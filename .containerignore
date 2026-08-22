@@ -1,0 +1,11 @@
+.git
+.hermes
+node_modules
+dist
+coverage
+backend/target
+test-results
+playwright-report
+*.log
+.env
+.env.*

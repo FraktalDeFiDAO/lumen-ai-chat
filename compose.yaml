@@ -1,0 +1,82 @@
+name: lumen-ai-chat
+
+services:
+  api:
+    image: localhost/lumen-ai-chat-api:dev
+    build:
+      context: .
+      dockerfile: Containerfile.backend
+    container_name: lumen-ai-chat-api
+    network_mode: host
+    userns_mode: keep-id
+    user: "${UID:-1000}:${GID:-1000}"
+    working_dir: /workspace
+    environment:
+      APP_BIND: 127.0.0.1:41788
+      AI_CODER_WORKSPACE: /workspace
+      AI_CODER_ALLOW_WRITES: "false"
+      AI_CODER_TIMEOUT_SECONDS: "300"
+      AI_CODER_MAX_CONCURRENCY: "2"
+      HOME: "${HOME}"
+      USER: "${USER:-admministrator}"
+      PATH: "${HOME}/.local/bin:${HOME}/.local/share/pnpm/bin:/usr/local/sbin:/usr/local/bin:/usr/bin"
+      RUST_LOG: info,tower_http=info
+    volumes:
+      - .:/workspace:ro
+      - ${HOME}/.hermes:${HOME}/.hermes
+      - ${HOME}/.claude:${HOME}/.claude
+      - ${HOME}/.codex:${HOME}/.codex
+      - ${HOME}/.config/opencode:${HOME}/.config/opencode
+      - ${HOME}/.local/share/opencode:${HOME}/.local/share/opencode
+      - ${HOME}/.local/state/opencode:${HOME}/.local/state/opencode
+      - ${HOME}/.config/kilo:${HOME}/.config/kilo
+      - ${HOME}/.local/share/kilo:${HOME}/.local/share/kilo
+      - ${HOME}/.local/state/kilo:${HOME}/.local/state/kilo
+      - ${HOME}/.local/bin/hermes:${HOME}/.local/bin/hermes:ro
+      - ${HOME}/.local/share/pnpm:${HOME}/.local/share/pnpm:ro
+      - /usr/bin/opencode:/usr/bin/opencode:ro
+      - /usr/bin/claude:/usr/bin/claude:ro
+      - /opt/claude-code:/opt/claude-code:ro
+    tmpfs:
+      - /tmp:rw,size=1g,exec
+      - ${HOME}/.cache:rw,size=512m,exec,mode=1777
+      - ${HOME}/.local/state:rw,size=128m,exec,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 512
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:41788/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+
+  web:
+    image: localhost/lumen-ai-chat-web:dev
+    build:
+      context: .
+      dockerfile: Containerfile.frontend
+    container_name: lumen-ai-chat-web
+    network_mode: host
+    depends_on:
+      api:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:rw,size=32m
+      - /var/cache/nginx:rw,size=32m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:41789/"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s

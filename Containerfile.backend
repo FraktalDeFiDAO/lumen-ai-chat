@@ -1,0 +1,22 @@
+FROM docker.io/library/archlinux:latest AS builder
+
+RUN pacman -Syu --noconfirm --needed ca-certificates cargo rust \
+    && pacman -Scc --noconfirm
+WORKDIR /build
+COPY backend/ ./
+RUN cargo build --release --locked \
+    && strip target/release/ai-chatbot-gateway
+
+FROM docker.io/library/archlinux:latest
+RUN for attempt in 1 2 3; do \
+      pacman -Syu --noconfirm --needed bash ca-certificates curl nodejs python && installed=1 && break; \
+      sleep 5; \
+    done \
+    && test "${installed:-0}" = 1 \
+    && update-ca-trust \
+    && pacman -Scc --noconfirm
+COPY --from=builder /build/target/release/ai-chatbot-gateway /usr/local/bin/lumen-api
+RUN chmod 0755 /usr/local/bin/lumen-api
+WORKDIR /workspace
+EXPOSE 41788
+ENTRYPOINT ["/usr/local/bin/lumen-api"]
