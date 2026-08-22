@@ -1,4 +1,4 @@
-use std::{env, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
+use std::{collections::HashSet, env, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
 use async_stream::stream;
 use axum::{
@@ -10,7 +10,7 @@ use axum::{
     routing::{get, post},
 };
 use eventsource_stream::Eventsource;
-use futures_util::{StreamExt, pin_mut};
+use futures_util::{StreamExt, future::join_all, pin_mut};
 use reqwest::{Client, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -27,23 +27,24 @@ const MAX_CONTENT_BYTES: usize = 256 * 1024;
 const MAX_TOTAL_CONTENT_BYTES: usize = 768 * 1024;
 const MAX_MODEL_BYTES: usize = 200;
 const MAX_ERROR_BYTES: usize = 64 * 1024;
+const MAX_CUSTOM_PROVIDERS: usize = 20;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
-pub enum Provider {
+pub enum ProviderKind {
     Openai,
     Anthropic,
     Gemini,
     OpenaiCompatible,
 }
 
-impl Provider {
+impl ProviderKind {
     fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "openai" => Some(Self::Openai),
             "anthropic" => Some(Self::Anthropic),
             "gemini" => Some(Self::Gemini),
-            "openai-compatible" => Some(Self::OpenaiCompatible),
+            "openai-compatible" | "custom" | "ollama" => Some(Self::OpenaiCompatible),
             _ => None,
         }
     }
@@ -56,110 +57,41 @@ impl Provider {
             Self::OpenaiCompatible => "openai-compatible",
         }
     }
-
-    fn default_base_url(self) -> &'static str {
-        match self {
-            Self::Openai => "https://api.openai.com/v1",
-            Self::Anthropic => "https://api.anthropic.com",
-            Self::Gemini => "https://generativelanguage.googleapis.com/v1beta",
-            Self::OpenaiCompatible => "http://127.0.0.1:11434/v1",
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
-pub struct Config {
-    pub bind: SocketAddr,
-    pub provider: Provider,
-    pub ai_base_url: String,
-    pub ai_model: String,
-    pub ai_api_key: Option<String>,
+pub struct ProviderConfig {
+    pub id: String,
+    pub name: String,
+    pub kind: ProviderKind,
+    pub base_url: String,
+    pub default_model: String,
+    pub api_key: Option<String>,
 }
 
-#[derive(Debug, Error)]
-pub enum ConfigError {
-    #[error("APP_BIND must be a valid socket address: {0}")]
-    InvalidBind(String),
-    #[error("AI_PROVIDER must be openai, anthropic, gemini, or openai-compatible")]
-    InvalidProvider,
-    #[error("AI_BASE_URL must be an absolute http(s) URL")]
-    InvalidBaseUrl,
-    #[error("AI_MODEL must not be empty or longer than {MAX_MODEL_BYTES} bytes")]
-    InvalidModel,
-    #[error("a provider API key is required for {0}")]
-    MissingApiKey(&'static str),
-}
-
-impl Config {
-    pub fn from_env() -> Result<Self, ConfigError> {
-        let bind_text = env::var("APP_BIND").unwrap_or_else(|_| "127.0.0.1:41788".into());
-        let bind = SocketAddr::from_str(&bind_text)
-            .map_err(|_| ConfigError::InvalidBind(bind_text.clone()))?;
-        let provider = env::var("AI_PROVIDER")
-            .ok()
-            .map(|value| Provider::parse(&value).ok_or(ConfigError::InvalidProvider))
-            .transpose()?
-            .unwrap_or(Provider::OpenaiCompatible);
-        let ai_base_url =
-            env::var("AI_BASE_URL").unwrap_or_else(|_| provider.default_base_url().to_owned());
-        let ai_model = env::var("AI_MODEL").unwrap_or_else(|_| "llama3.2".into());
-        let provider_api_key = match provider {
-            Provider::Openai => env_key("OPENAI_API_KEY"),
-            Provider::Anthropic => env_key("ANTHROPIC_API_KEY"),
-            Provider::Gemini => env_key("GOOGLE_API_KEY").or_else(|| env_key("GEMINI_API_KEY")),
-            Provider::OpenaiCompatible => None,
-        };
-        let ai_api_key = env_key("AI_API_KEY").or(provider_api_key);
-
-        let config = Self {
-            bind,
-            provider,
-            ai_base_url,
-            ai_model,
-            ai_api_key,
-        };
-        config.validate()?;
-        Ok(config)
-    }
-
-    pub fn validate(&self) -> Result<(), ConfigError> {
-        let url =
-            reqwest::Url::parse(&self.ai_base_url).map_err(|_| ConfigError::InvalidBaseUrl)?;
-        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-            return Err(ConfigError::InvalidBaseUrl);
-        }
-        if self.ai_model.trim().is_empty()
-            || self.ai_model.len() > MAX_MODEL_BYTES
-            || self.ai_model.chars().any(char::is_control)
-        {
-            return Err(ConfigError::InvalidModel);
-        }
-        if !matches!(self.provider, Provider::OpenaiCompatible) && self.ai_api_key.is_none() {
-            return Err(ConfigError::MissingApiKey(self.provider.as_str()));
-        }
-        Ok(())
-    }
-
+impl ProviderConfig {
     fn endpoint(&self, suffix: &str) -> String {
         format!(
             "{}/{}",
-            self.ai_base_url.trim_end_matches('/'),
+            self.base_url.trim_end_matches('/'),
             suffix.trim_start_matches('/')
         )
     }
 
     fn models_endpoint(&self) -> String {
-        match self.provider {
-            Provider::Anthropic => self.endpoint("v1/models"),
+        match self.kind {
+            ProviderKind::Anthropic => self.endpoint("v1/models"),
             _ => self.endpoint("models"),
         }
     }
 
     fn chat_endpoint(&self, model: &str) -> String {
-        match self.provider {
-            Provider::Openai | Provider::OpenaiCompatible => self.endpoint("chat/completions"),
-            Provider::Anthropic => self.endpoint("v1/messages"),
-            Provider::Gemini => self.endpoint(&format!(
+        match self.kind {
+            ProviderKind::Openai | ProviderKind::OpenaiCompatible => {
+                self.endpoint("chat/completions")
+            }
+            ProviderKind::Anthropic => self.endpoint("v1/messages"),
+            ProviderKind::Gemini => self.endpoint(&format!(
                 "models/{}:streamGenerateContent?alt=sse",
                 encode_path_segment(model.strip_prefix("models/").unwrap_or(model))
             )),
@@ -167,10 +99,249 @@ impl Config {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct Config {
+    pub bind: SocketAddr,
+    pub providers: Vec<ProviderConfig>,
+    pub default_provider: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CustomProviderInput {
+    id: String,
+    #[serde(default)]
+    name: Option<String>,
+    base_url: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    api_key_env: Option<String>,
+}
+
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    #[error("APP_BIND must be a valid socket address: {0}")]
+    InvalidBind(String),
+    #[error("provider `{0}` has an invalid identifier")]
+    InvalidProviderId(String),
+    #[error("provider `{0}` must use an absolute http(s) URL")]
+    InvalidBaseUrl(String),
+    #[error("provider `{0}` has an invalid default model")]
+    InvalidModel(String),
+    #[error("duplicate provider identifier: {0}")]
+    DuplicateProvider(String),
+    #[error("AI_ENDPOINTS_JSON is invalid: {0}")]
+    InvalidCustomProviders(String),
+    #[error("AI_DEFAULT_PROVIDER does not name a configured provider: {0}")]
+    InvalidDefaultProvider(String),
+}
+
+impl Config {
+    pub fn from_env() -> Result<Self, ConfigError> {
+        let bind_text = env::var("APP_BIND").unwrap_or_else(|_| "127.0.0.1:41788".into());
+        let bind = SocketAddr::from_str(&bind_text)
+            .map_err(|_| ConfigError::InvalidBind(bind_text.clone()))?;
+        let legacy_kind = env::var("AI_PROVIDER")
+            .ok()
+            .and_then(|value| ProviderKind::parse(&value));
+        let legacy_key = env_key("AI_API_KEY");
+        let legacy_model = env::var("AI_MODEL").ok();
+        let legacy_base = env::var("AI_BASE_URL").ok();
+        let mut providers = Vec::new();
+
+        if let Some(key) = env_key("OPENAI_API_KEY").or_else(|| {
+            (legacy_kind == Some(ProviderKind::Openai))
+                .then(|| legacy_key.clone())
+                .flatten()
+        }) {
+            providers.push(ProviderConfig {
+                id: "openai".into(),
+                name: "OpenAI".into(),
+                kind: ProviderKind::Openai,
+                base_url: env::var("OPENAI_BASE_URL")
+                    .ok()
+                    .or_else(|| {
+                        (legacy_kind == Some(ProviderKind::Openai))
+                            .then(|| legacy_base.clone())
+                            .flatten()
+                    })
+                    .unwrap_or_else(|| "https://api.openai.com/v1".into()),
+                default_model: env::var("OPENAI_MODEL")
+                    .ok()
+                    .or_else(|| {
+                        (legacy_kind == Some(ProviderKind::Openai))
+                            .then(|| legacy_model.clone())
+                            .flatten()
+                    })
+                    .unwrap_or_else(|| "gpt-5-mini".into()),
+                api_key: Some(key),
+            });
+        }
+        if let Some(key) = env_key("ANTHROPIC_API_KEY").or_else(|| {
+            (legacy_kind == Some(ProviderKind::Anthropic))
+                .then(|| legacy_key.clone())
+                .flatten()
+        }) {
+            providers.push(ProviderConfig {
+                id: "anthropic".into(),
+                name: "Anthropic".into(),
+                kind: ProviderKind::Anthropic,
+                base_url: env::var("ANTHROPIC_BASE_URL")
+                    .ok()
+                    .or_else(|| {
+                        (legacy_kind == Some(ProviderKind::Anthropic))
+                            .then(|| legacy_base.clone())
+                            .flatten()
+                    })
+                    .unwrap_or_else(|| "https://api.anthropic.com".into()),
+                default_model: env::var("ANTHROPIC_MODEL")
+                    .ok()
+                    .or_else(|| {
+                        (legacy_kind == Some(ProviderKind::Anthropic))
+                            .then(|| legacy_model.clone())
+                            .flatten()
+                    })
+                    .unwrap_or_else(|| "claude-sonnet-4-5".into()),
+                api_key: Some(key),
+            });
+        }
+        if let Some(key) = env_key("GOOGLE_API_KEY")
+            .or_else(|| env_key("GEMINI_API_KEY"))
+            .or_else(|| {
+                (legacy_kind == Some(ProviderKind::Gemini))
+                    .then(|| legacy_key.clone())
+                    .flatten()
+            })
+        {
+            providers.push(ProviderConfig {
+                id: "gemini".into(),
+                name: "Google Gemini".into(),
+                kind: ProviderKind::Gemini,
+                base_url: env::var("GEMINI_BASE_URL")
+                    .ok()
+                    .or_else(|| {
+                        (legacy_kind == Some(ProviderKind::Gemini))
+                            .then(|| legacy_base.clone())
+                            .flatten()
+                    })
+                    .unwrap_or_else(|| "https://generativelanguage.googleapis.com/v1beta".into()),
+                default_model: env::var("GEMINI_MODEL")
+                    .ok()
+                    .or_else(|| {
+                        (legacy_kind == Some(ProviderKind::Gemini))
+                            .then(|| legacy_model.clone())
+                            .flatten()
+                    })
+                    .unwrap_or_else(|| "gemini-2.5-flash".into()),
+                api_key: Some(key),
+            });
+        }
+
+        let ollama_is_legacy = legacy_kind == Some(ProviderKind::OpenaiCompatible);
+        providers.push(ProviderConfig {
+            id: "ollama".into(),
+            name: "Ollama / Local".into(),
+            kind: ProviderKind::OpenaiCompatible,
+            base_url: env::var("OLLAMA_BASE_URL")
+                .ok()
+                .or_else(|| ollama_is_legacy.then(|| legacy_base.clone()).flatten())
+                .unwrap_or_else(|| "http://127.0.0.1:11434/v1".into()),
+            default_model: env::var("OLLAMA_MODEL")
+                .ok()
+                .or_else(|| ollama_is_legacy.then(|| legacy_model.clone()).flatten())
+                .unwrap_or_else(|| "llama3.2".into()),
+            api_key: env_key("OLLAMA_API_KEY")
+                .or_else(|| ollama_is_legacy.then(|| legacy_key.clone()).flatten()),
+        });
+
+        if let Ok(raw) = env::var("AI_ENDPOINTS_JSON") {
+            let custom: Vec<CustomProviderInput> = serde_json::from_str(&raw)
+                .map_err(|error| ConfigError::InvalidCustomProviders(error.to_string()))?;
+            if custom.len() > MAX_CUSTOM_PROVIDERS {
+                return Err(ConfigError::InvalidCustomProviders(format!(
+                    "at most {MAX_CUSTOM_PROVIDERS} endpoints are allowed"
+                )));
+            }
+            for item in custom {
+                let api_key = item.api_key_env.as_deref().and_then(env_key);
+                providers.push(ProviderConfig {
+                    name: item.name.unwrap_or_else(|| item.id.clone()),
+                    id: item.id,
+                    kind: ProviderKind::OpenaiCompatible,
+                    base_url: item.base_url,
+                    default_model: item.model.unwrap_or_else(|| "default".into()),
+                    api_key,
+                });
+            }
+        }
+
+        let legacy_default = match legacy_kind {
+            Some(ProviderKind::Openai) => "openai",
+            Some(ProviderKind::Anthropic) => "anthropic",
+            Some(ProviderKind::Gemini) => "gemini",
+            Some(ProviderKind::OpenaiCompatible) | None => "ollama",
+        };
+        let default_provider =
+            env::var("AI_DEFAULT_PROVIDER").unwrap_or_else(|_| legacy_default.into());
+        let config = Self {
+            bind,
+            providers,
+            default_provider,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.providers.is_empty() {
+            return Err(ConfigError::InvalidDefaultProvider(
+                self.default_provider.clone(),
+            ));
+        }
+        let mut ids = HashSet::new();
+        for provider in &self.providers {
+            if !valid_provider_id(&provider.id) {
+                return Err(ConfigError::InvalidProviderId(provider.id.clone()));
+            }
+            if !ids.insert(provider.id.clone()) {
+                return Err(ConfigError::DuplicateProvider(provider.id.clone()));
+            }
+            let url = reqwest::Url::parse(&provider.base_url)
+                .map_err(|_| ConfigError::InvalidBaseUrl(provider.id.clone()))?;
+            if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+                return Err(ConfigError::InvalidBaseUrl(provider.id.clone()));
+            }
+            if provider.default_model.trim().is_empty()
+                || provider.default_model.len() > MAX_MODEL_BYTES
+                || provider.default_model.chars().any(char::is_control)
+            {
+                return Err(ConfigError::InvalidModel(provider.id.clone()));
+            }
+        }
+        if !ids.contains(&self.default_provider) {
+            return Err(ConfigError::InvalidDefaultProvider(
+                self.default_provider.clone(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn provider(&self, id: &str) -> Option<&ProviderConfig> {
+        self.providers.iter().find(|provider| provider.id == id)
+    }
+}
+
+fn valid_provider_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 48
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
 fn env_key(name: &str) -> Option<String> {
     env::var(name).ok().filter(|key| !key.is_empty())
 }
-
 fn encode_path_segment(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -194,7 +365,7 @@ pub fn build_router(config: Config) -> Result<Router, BuildError> {
     config.validate()?;
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(5))
-        .read_timeout(Duration::from_secs(90))
+        .read_timeout(Duration::from_secs(120))
         .pool_idle_timeout(Duration::from_secs(30))
         .user_agent(concat!(
             env!("CARGO_PKG_NAME"),
@@ -206,9 +377,9 @@ pub fn build_router(config: Config) -> Result<Router, BuildError> {
         config: Arc::new(config),
         client,
     };
-
     Ok(Router::new()
         .route("/api/health", get(health))
+        .route("/api/providers", get(providers))
         .route("/api/models", get(models))
         .route("/api/chat", post(chat))
         .fallback(not_found)
@@ -232,55 +403,112 @@ pub enum BuildError {
     Http(#[from] reqwest::Error),
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct ProviderInfo {
+    id: String,
+    name: String,
+    kind: String,
+    default_model: String,
+    is_default: bool,
+}
+
 async fn health(State(state): State<AppState>) -> Json<Value> {
     Json(json!({
         "status": "ok",
-        "provider": state.config.provider.as_str(),
-        "model": state.config.ai_model
+        "default_provider": state.config.default_provider,
+        "provider_count": state.config.providers.len()
     }))
+}
+async fn providers(State(state): State<AppState>) -> Json<Value> {
+    let providers = state
+        .config
+        .providers
+        .iter()
+        .map(|provider| ProviderInfo {
+            id: provider.id.clone(),
+            name: provider.name.clone(),
+            kind: provider.kind.as_str().into(),
+            default_model: provider.default_model.clone(),
+            is_default: provider.id == state.config.default_provider,
+        })
+        .collect::<Vec<_>>();
+    Json(json!({ "providers": providers, "default_provider": state.config.default_provider }))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelInfo {
     pub id: String,
+    pub key: String,
     pub name: String,
+    pub provider: String,
+    pub provider_name: String,
 }
 
 async fn models(State(state): State<AppState>) -> Json<Value> {
-    let discovered = fetch_models(&state).await;
-    let models = match discovered {
-        Ok(models) if !models.is_empty() => models,
-        Ok(_) | Err(_) => {
-            tracing::warn!(
-                provider = state.config.provider.as_str(),
-                "model discovery unavailable; using configured fallback"
-            );
-            vec![ModelInfo {
-                id: state.config.ai_model.clone(),
-                name: state.config.ai_model.clone(),
-            }]
+    let tasks = state.config.providers.iter().cloned().map(|provider| {
+        let client = state.client.clone();
+        async move {
+            let result = fetch_models(&client, &provider).await;
+            (provider, result)
         }
-    };
-    Json(json!({ "models": models }))
+    });
+    let mut all_models = Vec::new();
+    let mut provider_errors = Vec::new();
+    for (provider, result) in join_all(tasks).await {
+        let discovered = match result {
+            Ok(models) if !models.is_empty() => models,
+            Ok(_) => {
+                provider_errors.push(json!({"provider": provider.id, "message": "No models were returned; using the configured default."}));
+                vec![(
+                    provider.default_model.clone(),
+                    provider.default_model.clone(),
+                )]
+            }
+            Err(error) => {
+                tracing::warn!(provider = provider.id, error = %error, "model discovery unavailable");
+                provider_errors.push(json!({"provider": provider.id, "message": "Provider unavailable; showing the configured default."}));
+                vec![(
+                    provider.default_model.clone(),
+                    provider.default_model.clone(),
+                )]
+            }
+        };
+        for (id, name) in discovered {
+            all_models.push(ModelInfo {
+                key: format!("{}::{id}", provider.id),
+                id,
+                name,
+                provider: provider.id.clone(),
+                provider_name: provider.name.clone(),
+            });
+        }
+    }
+    all_models.sort_by(|a, b| {
+        a.provider_name
+            .cmp(&b.provider_name)
+            .then(a.name.cmp(&b.name))
+    });
+    Json(
+        json!({ "models": all_models, "provider_errors": provider_errors, "default_provider": state.config.default_provider }),
+    )
 }
 
-async fn fetch_models(state: &AppState) -> Result<Vec<ModelInfo>, reqwest::Error> {
-    let request = authenticated(
-        state.client.get(state.config.models_endpoint()),
-        &state.config,
-    );
+async fn fetch_models(
+    client: &Client,
+    provider: &ProviderConfig,
+) -> Result<Vec<(String, String)>, reqwest::Error> {
+    let request = authenticated(client.get(provider.models_endpoint()), provider);
     let response = request
         .timeout(Duration::from_secs(10))
         .send()
         .await?
         .error_for_status()?;
     let payload: Value = response.json().await?;
-    Ok(normalize_models(state.config.provider, &payload))
+    Ok(normalize_models(provider.kind, &payload))
 }
-
-fn normalize_models(provider: Provider, payload: &Value) -> Vec<ModelInfo> {
-    let items = match provider {
-        Provider::Gemini => payload.get("models"),
+fn normalize_models(kind: ProviderKind, payload: &Value) -> Vec<(String, String)> {
+    let items = match kind {
+        ProviderKind::Gemini => payload.get("models"),
         _ => payload.get("data"),
     }
     .and_then(Value::as_array);
@@ -301,7 +529,7 @@ fn normalize_models(provider: Provider, payload: &Value) -> Vec<ModelInfo> {
             .filter(|name| !name.is_empty())
             .unwrap_or(&id)
             .to_owned();
-        result.push(ModelInfo { id, name });
+        result.push((id, name));
     }
     result
 }
@@ -310,17 +538,21 @@ fn normalize_models(provider: Provider, payload: &Value) -> Vec<ModelInfo> {
 #[serde(deny_unknown_fields)]
 pub struct ChatRequest {
     #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
     pub messages: Vec<ChatMessage>,
 }
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChatMessage {
     pub role: Role,
     pub content: String,
 }
-
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -346,42 +578,68 @@ async fn chat(
     if let Err(message) = validate_chat(&request) {
         return json_error(StatusCode::BAD_REQUEST, "invalid_request", message);
     }
-    let model = request
+    let (provider_id, embedded_model) = request
         .model
         .as_deref()
-        .unwrap_or(&state.config.ai_model)
-        .to_owned();
-    let upstream_payload = provider_payload(state.config.provider, &model, &request.messages);
+        .and_then(|model| model.split_once("::"))
+        .map_or((None, None), |(provider, model)| {
+            (Some(provider), Some(model))
+        });
+    let requested_provider = request
+        .provider
+        .as_deref()
+        .or(provider_id)
+        .unwrap_or(&state.config.default_provider);
+    let Some(provider) = state.config.provider(requested_provider) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "unknown_provider",
+            format!("Provider `{requested_provider}` is not configured"),
+        );
+    };
+    let model = embedded_model
+        .or(request.model.as_deref())
+        .unwrap_or(&provider.default_model);
+    if model.trim().is_empty()
+        || model.len() > MAX_MODEL_BYTES
+        || model.chars().any(char::is_control)
+    {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "model is invalid",
+        );
+    }
+    let upstream_payload = provider_payload(
+        provider.kind,
+        model,
+        &request.messages,
+        request.temperature,
+        request.max_tokens,
+    );
     let upstream_request = authenticated(
         state
             .client
-            .post(state.config.chat_endpoint(&model))
+            .post(provider.chat_endpoint(model))
             .header(header::ACCEPT, "text/event-stream")
             .json(&upstream_payload),
-        &state.config,
+        provider,
     );
-
     let upstream = match tokio::time::timeout(Duration::from_secs(30), upstream_request.send())
         .await
     {
         Ok(Ok(response)) => response,
         Ok(Err(error)) => {
-            tracing::warn!(provider = state.config.provider.as_str(), error = %error, "chat upstream request failed");
-            return sse_error("The AI provider is unavailable");
+            tracing::warn!(provider = provider.id, error = %error, "chat upstream request failed");
+            return sse_error("The selected AI provider is unavailable");
         }
-        Err(_) => {
-            tracing::warn!(
-                provider = state.config.provider.as_str(),
-                "chat upstream response timed out"
-            );
-            return sse_error("The AI provider timed out");
-        }
+        Err(_) => return sse_error("The selected AI provider timed out"),
     };
     if !upstream.status().is_success() {
         let status = upstream.status();
         let detail = limited_error_body(upstream).await;
-        tracing::warn!(provider = state.config.provider.as_str(), %status, upstream_detail = %detail, "chat upstream rejected request");
-        return sse_error(&format!("The AI provider returned {status}"));
+        tracing::warn!(provider = provider.id, %status, upstream_detail = %detail, "chat upstream rejected request");
+        return sse_error(&format!("The selected AI provider returned {status}"));
     }
     let is_sse = upstream
         .headers()
@@ -389,14 +647,10 @@ async fn chat(
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.to_ascii_lowercase().starts_with("text/event-stream"));
     if !is_sse {
-        tracing::warn!(
-            provider = state.config.provider.as_str(),
-            "chat upstream returned a non-SSE response"
-        );
-        return sse_error("The AI provider returned an invalid stream");
+        return sse_error("The selected AI provider returned an invalid stream");
     }
 
-    let provider = state.config.provider;
+    let kind = provider.kind;
     let source = upstream.bytes_stream().eventsource();
     let output = stream! {
         pin_mut!(source);
@@ -404,48 +658,57 @@ async fn chat(
         while let Some(event) = source.next().await {
             match event {
                 Ok(event) => {
-                    if let Some(data) = translate_event(provider, &event.event, &event.data) {
+                    if let Some(data) = translate_event(kind, &event.event, &event.data) {
                         if data == "[DONE]" { sent_done = true; }
                         yield Ok::<Bytes, std::io::Error>(Bytes::from(format!("data: {data}\n\n")));
                         if sent_done { break; }
                     }
                 }
                 Err(error) => {
-                    tracing::warn!(provider = provider.as_str(), error = %error, "chat upstream stream interrupted");
-                    let payload = error_payload("The AI provider stream was interrupted");
-                    yield Ok(Bytes::from(format!("data: {payload}\n\n")));
+                    tracing::warn!(provider = kind.as_str(), error = %error, "chat upstream stream interrupted");
+                    yield Ok(Bytes::from(format!("data: {}\n\n", error_payload("The AI provider stream was interrupted"))));
                     break;
                 }
             }
         }
-        if !sent_done {
-            yield Ok(Bytes::from_static(b"data: [DONE]\n\n"));
-        }
+        if !sent_done { yield Ok(Bytes::from_static(b"data: [DONE]\n\n")); }
     };
     let mut response = Response::new(Body::from_stream(output));
     add_sse_headers(response.headers_mut());
     response
 }
 
-fn authenticated(request: RequestBuilder, config: &Config) -> RequestBuilder {
-    let Some(key) = &config.ai_api_key else {
+fn authenticated(request: RequestBuilder, provider: &ProviderConfig) -> RequestBuilder {
+    let Some(key) = &provider.api_key else {
         return request;
     };
-    match config.provider {
-        Provider::Openai | Provider::OpenaiCompatible => request.bearer_auth(key),
-        Provider::Anthropic => request
+    match provider.kind {
+        ProviderKind::Openai | ProviderKind::OpenaiCompatible => request.bearer_auth(key),
+        ProviderKind::Anthropic => request
             .header("x-api-key", key)
             .header("anthropic-version", "2023-06-01"),
-        Provider::Gemini => request.header("x-goog-api-key", key),
+        ProviderKind::Gemini => request.header("x-goog-api-key", key),
     }
 }
-
-fn provider_payload(provider: Provider, model: &str, messages: &[ChatMessage]) -> Value {
-    match provider {
-        Provider::Openai | Provider::OpenaiCompatible => json!({
-            "model": model, "messages": messages, "stream": true
-        }),
-        Provider::Anthropic => {
+fn provider_payload(
+    kind: ProviderKind,
+    model: &str,
+    messages: &[ChatMessage],
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+) -> Value {
+    match kind {
+        ProviderKind::Openai | ProviderKind::OpenaiCompatible => {
+            let mut payload = json!({"model": model, "messages": messages, "stream": true});
+            if let Some(value) = temperature {
+                payload["temperature"] = json!(value);
+            }
+            if let Some(value) = max_tokens {
+                payload["max_tokens"] = json!(value);
+            }
+            payload
+        }
+        ProviderKind::Anthropic => {
             let system = messages
                 .iter()
                 .filter(|m| matches!(m.role, Role::System))
@@ -453,16 +716,17 @@ fn provider_payload(provider: Provider, model: &str, messages: &[ChatMessage]) -
                 .collect::<Vec<_>>()
                 .join("\n\n");
             let messages = messages.iter().filter(|m| !matches!(m.role, Role::System))
-                .map(|m| json!({"role": match m.role { Role::Assistant => "assistant", _ => "user" }, "content": m.content}))
-                .collect::<Vec<_>>();
-            let mut payload =
-                json!({"model": model, "messages": messages, "max_tokens": 4096, "stream": true});
+                .map(|m| json!({"role": match m.role { Role::Assistant => "assistant", _ => "user" }, "content": m.content})).collect::<Vec<_>>();
+            let mut payload = json!({"model": model, "messages": messages, "max_tokens": max_tokens.unwrap_or(4096), "stream": true});
             if !system.is_empty() {
                 payload["system"] = Value::String(system);
             }
+            if let Some(value) = temperature {
+                payload["temperature"] = json!(value);
+            }
             payload
         }
-        Provider::Gemini => {
+        ProviderKind::Gemini => {
             let system = messages
                 .iter()
                 .filter(|m| matches!(m.role, Role::System))
@@ -470,25 +734,33 @@ fn provider_payload(provider: Provider, model: &str, messages: &[ChatMessage]) -
                 .collect::<Vec<_>>()
                 .join("\n\n");
             let contents = messages.iter().filter(|m| !matches!(m.role, Role::System))
-                .map(|m| json!({"role": if matches!(m.role, Role::Assistant) { "model" } else { "user" }, "parts": [{"text": m.content}]}))
-                .collect::<Vec<_>>();
+                .map(|m| json!({"role": if matches!(m.role, Role::Assistant) { "model" } else { "user" }, "parts": [{"text": m.content}]})).collect::<Vec<_>>();
+            let mut generation = serde_json::Map::new();
+            if let Some(value) = temperature {
+                generation.insert("temperature".into(), json!(value));
+            }
+            if let Some(value) = max_tokens {
+                generation.insert("maxOutputTokens".into(), json!(value));
+            }
             let mut payload = json!({"contents": contents});
             if !system.is_empty() {
                 payload["systemInstruction"] = json!({"parts": [{"text": system}]});
+            }
+            if !generation.is_empty() {
+                payload["generationConfig"] = Value::Object(generation);
             }
             payload
         }
     }
 }
-
-fn translate_event(provider: Provider, event_type: &str, data: &str) -> Option<String> {
+fn translate_event(kind: ProviderKind, event_type: &str, data: &str) -> Option<String> {
     if data.trim().is_empty() {
         return None;
     }
-    match provider {
-        Provider::Openai | Provider::OpenaiCompatible => Some(data.to_owned()),
-        Provider::Anthropic => {
-            if matches!(event_type, "message_stop") || data == "[DONE]" {
+    match kind {
+        ProviderKind::Openai | ProviderKind::OpenaiCompatible => Some(data.to_owned()),
+        ProviderKind::Anthropic => {
+            if event_type == "message_stop" || data == "[DONE]" {
                 return Some("[DONE]".into());
             }
             let payload: Value = serde_json::from_str(data).ok()?;
@@ -504,25 +776,31 @@ fn translate_event(provider: Provider, event_type: &str, data: &str) -> Option<S
                 _ => None,
             }
         }
-        Provider::Gemini => {
+        ProviderKind::Gemini => {
             let payload: Value = serde_json::from_str(data).ok()?;
             let text = payload
-                .pointer("/candidates/0/content/parts/0/text")
-                .and_then(Value::as_str);
+                .pointer("/candidates/0/content/parts")
+                .and_then(Value::as_array)
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .filter_map(|part| part.get("text").and_then(Value::as_str))
+                        .collect::<String>()
+                })
+                .filter(|text| !text.is_empty());
             let finish = payload
                 .pointer("/candidates/0/finishReason")
                 .and_then(Value::as_str);
-            text.map(openai_delta)
+            text.as_deref()
+                .map(openai_delta)
                 .or_else(|| finish.map(|_| "[DONE]".into()))
         }
     }
 }
-
 fn openai_delta(text: &str) -> String {
     json!({"choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]})
         .to_string()
 }
-
 fn validate_chat(request: &ChatRequest) -> Result<(), &'static str> {
     if request.messages.is_empty() {
         return Err("messages must contain at least one message");
@@ -530,12 +808,20 @@ fn validate_chat(request: &ChatRequest) -> Result<(), &'static str> {
     if request.messages.len() > MAX_MESSAGES {
         return Err("too many messages");
     }
-    if let Some(model) = &request.model
-        && (model.trim().is_empty()
-            || model.len() > MAX_MODEL_BYTES
-            || model.chars().any(char::is_control))
+    if let Some(provider) = &request.provider
+        && (!valid_provider_id(provider) || provider.chars().any(char::is_control))
     {
-        return Err("model is invalid");
+        return Err("provider is invalid");
+    }
+    if let Some(temperature) = request.temperature
+        && !(0.0..=2.0).contains(&temperature)
+    {
+        return Err("temperature must be between 0 and 2");
+    }
+    if let Some(max_tokens) = request.max_tokens
+        && !(1..=32768).contains(&max_tokens)
+    {
+        return Err("max_tokens must be between 1 and 32768");
     }
     let mut total = 0usize;
     for message in &request.messages {
@@ -566,11 +852,9 @@ async fn limited_error_body(response: reqwest::Response) -> String {
     }
     String::from_utf8_lossy(&collected).into_owned()
 }
-
 fn error_payload(message: &str) -> Value {
     json!({"error": {"type": "upstream_error", "message": message}})
 }
-
 fn json_error(status: StatusCode, kind: &str, message: impl Into<String>) -> Response {
     (
         status,
@@ -578,14 +862,12 @@ fn json_error(status: StatusCode, kind: &str, message: impl Into<String>) -> Res
     )
         .into_response()
 }
-
 fn sse_error(message: &str) -> Response {
     let body = format!("data: {}\n\ndata: [DONE]\n\n", error_payload(message));
     let mut response = Response::new(Body::from(body));
     add_sse_headers(response.headers_mut());
     response
 }
-
 fn add_sse_headers(headers: &mut HeaderMap) {
     headers.insert(
         header::CONTENT_TYPE,
@@ -598,7 +880,6 @@ fn add_sse_headers(headers: &mut HeaderMap) {
     headers.insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
     headers.insert("x-accel-buffering", HeaderValue::from_static("no"));
 }
-
 async fn not_found() -> Response {
     json_error(StatusCode::NOT_FOUND, "not_found", "route not found")
 }
@@ -607,45 +888,79 @@ async fn not_found() -> Response {
 mod tests {
     use super::*;
 
-    fn config(provider: Provider) -> Config {
-        Config {
-            bind: "127.0.0.1:41788".parse().unwrap(),
-            provider,
-            ai_base_url: provider.default_base_url().to_owned(),
-            ai_model: "test-model".to_owned(),
-            ai_api_key: Some("test-key".to_owned()),
+    fn provider(id: &str, kind: ProviderKind) -> ProviderConfig {
+        ProviderConfig {
+            id: id.into(),
+            name: id.into(),
+            kind,
+            base_url: "https://example.test/v1".into(),
+            default_model: "test-model".into(),
+            api_key: Some("test-key".into()),
+        }
+    }
+    fn request() -> ChatRequest {
+        ChatRequest {
+            provider: None,
+            model: None,
+            temperature: None,
+            max_tokens: None,
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: "Hello".into(),
+            }],
         }
     }
 
     #[test]
-    fn translates_native_events() {
+    fn validates_multi_provider_configuration() {
+        let config = Config {
+            bind: "127.0.0.1:41788".parse().unwrap(),
+            providers: vec![
+                provider("openai", ProviderKind::Openai),
+                provider("local", ProviderKind::OpenaiCompatible),
+            ],
+            default_provider: "local".into(),
+        };
+        assert!(config.validate().is_ok());
+        let duplicate = Config {
+            providers: vec![
+                provider("same", ProviderKind::Openai),
+                provider("same", ProviderKind::Gemini),
+            ],
+            ..config.clone()
+        };
+        assert!(matches!(
+            duplicate.validate(),
+            Err(ConfigError::DuplicateProvider(_))
+        ));
+    }
+    #[test]
+    fn translates_all_native_streams() {
         let anthropic = translate_event(
-            Provider::Anthropic,
+            ProviderKind::Anthropic,
             "content_block_delta",
             r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"Hi"}}"#,
         )
         .unwrap();
         assert!(anthropic.contains(r#""content":"Hi""#));
         let gemini = translate_event(
-            Provider::Gemini,
+            ProviderKind::Gemini,
             "message",
-            r#"{"candidates":[{"content":{"parts":[{"text":"Hello"}]}}]}"#,
+            r#"{"candidates":[{"content":{"parts":[{"text":"Hello "},{"text":"world"}]}}]}"#,
         )
         .unwrap();
-        assert!(gemini.contains(r#""content":"Hello""#));
+        assert!(gemini.contains(r#""content":"Hello world""#));
+        assert_eq!(
+            translate_event(ProviderKind::Openai, "message", "[DONE]").unwrap(),
+            "[DONE]"
+        );
     }
-
     #[test]
-    fn encodes_model_path_segment() {
-        assert_eq!(encode_path_segment("gemini/foo bar"), "gemini%2Ffoo%20bar");
-    }
-
-    #[test]
-    fn applies_provider_specific_authentication_without_query_keys() {
+    fn applies_provider_specific_authentication() {
         let client = Client::new();
         let openai = authenticated(
-            client.get("https://example.test/models"),
-            &config(Provider::Openai),
+            client.get("https://example.test"),
+            &provider("openai", ProviderKind::Openai),
         )
         .build()
         .unwrap();
@@ -653,10 +968,9 @@ mod tests {
             openai.headers().get(header::AUTHORIZATION).unwrap(),
             "Bearer test-key"
         );
-
         let anthropic = authenticated(
-            client.get("https://example.test/models"),
-            &config(Provider::Anthropic),
+            client.get("https://example.test"),
+            &provider("anthropic", ProviderKind::Anthropic),
         )
         .build()
         .unwrap();
@@ -665,19 +979,17 @@ mod tests {
             anthropic.headers().get("anthropic-version").unwrap(),
             "2023-06-01"
         );
-
         let gemini = authenticated(
-            client.get("https://example.test/models"),
-            &config(Provider::Gemini),
+            client.get("https://example.test"),
+            &provider("gemini", ProviderKind::Gemini),
         )
         .build()
         .unwrap();
         assert_eq!(gemini.headers().get("x-goog-api-key").unwrap(), "test-key");
         assert!(gemini.url().query().is_none());
     }
-
     #[test]
-    fn builds_native_provider_payloads() {
+    fn builds_generation_parameters_for_every_protocol() {
         let messages = vec![
             ChatMessage {
                 role: Role::System,
@@ -687,51 +999,62 @@ mod tests {
                 role: Role::User,
                 content: "Hello".into(),
             },
-            ChatMessage {
-                role: Role::Assistant,
-                content: "Hi".into(),
-            },
         ];
-        let anthropic = provider_payload(Provider::Anthropic, "claude-test", &messages);
+        let openai = provider_payload(ProviderKind::Openai, "gpt", &messages, Some(0.4), Some(123));
+        assert!((openai["temperature"].as_f64().unwrap() - 0.4).abs() < 0.0001);
+        assert_eq!(openai["max_tokens"], 123);
+        let anthropic = provider_payload(
+            ProviderKind::Anthropic,
+            "claude",
+            &messages,
+            Some(0.4),
+            Some(123),
+        );
         assert_eq!(anthropic["system"], "Be concise");
-        assert_eq!(anthropic["messages"][0]["role"], "user");
-        assert_eq!(anthropic["stream"], true);
-
-        let gemini = provider_payload(Provider::Gemini, "gemini-test", &messages);
-        assert_eq!(
-            gemini["systemInstruction"]["parts"][0]["text"],
-            "Be concise"
+        assert_eq!(anthropic["max_tokens"], 123);
+        let gemini = provider_payload(
+            ProviderKind::Gemini,
+            "gemini",
+            &messages,
+            Some(0.4),
+            Some(123),
         );
-        assert_eq!(gemini["contents"][1]["role"], "model");
-
-        let openai = provider_payload(Provider::OpenaiCompatible, "local-test", &messages);
-        assert_eq!(openai["messages"][0]["role"], "system");
-        assert_eq!(openai["model"], "local-test");
+        assert_eq!(gemini["generationConfig"]["maxOutputTokens"], 123);
     }
-
     #[test]
-    fn normalizes_native_model_catalogs() {
-        let anthropic = normalize_models(
-            Provider::Anthropic,
-            &json!({"data": [{"id": "claude-test", "display_name": "Claude Test"}]}),
+    fn validates_generation_bounds() {
+        let mut value = request();
+        value.temperature = Some(2.1);
+        assert_eq!(
+            validate_chat(&value),
+            Err("temperature must be between 0 and 2")
+        );
+        value.temperature = None;
+        value.max_tokens = Some(0);
+        assert_eq!(
+            validate_chat(&value),
+            Err("max_tokens must be between 1 and 32768")
+        );
+    }
+    #[test]
+    fn normalizes_provider_model_catalogs() {
+        assert_eq!(
+            normalize_models(
+                ProviderKind::Anthropic,
+                &json!({"data":[{"id":"claude","display_name":"Claude"}]})
+            ),
+            vec![("claude".into(), "Claude".into())]
         );
         assert_eq!(
-            anthropic,
-            vec![ModelInfo {
-                id: "claude-test".into(),
-                name: "Claude Test".into()
-            }]
+            normalize_models(
+                ProviderKind::Gemini,
+                &json!({"models":[{"name":"models/gemini","displayName":"Gemini"}]})
+            ),
+            vec![("gemini".into(), "Gemini".into())]
         );
-        let gemini = normalize_models(
-            Provider::Gemini,
-            &json!({"models": [{"name": "models/gemini-test", "displayName": "Gemini Test"}]}),
-        );
-        assert_eq!(
-            gemini,
-            vec![ModelInfo {
-                id: "gemini-test".into(),
-                name: "Gemini Test".into()
-            }]
-        );
+    }
+    #[test]
+    fn encodes_model_paths() {
+        assert_eq!(encode_path_segment("gemini/foo bar"), "gemini%2Ffoo%20bar");
     }
 }

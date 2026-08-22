@@ -13,9 +13,12 @@ interface Settings {
   language: Language
   theme: Theme
   notifications: boolean
+  temperature: number
+  maxTokens: number
+  systemPrompt: string
 }
 
-const defaults: Settings = { displayName: 'Alex Morgan', email: 'alex@example.com', responseStyle: 'Balanced', language: 'English', theme: 'System', notifications: true }
+const defaults: Settings = { displayName: 'Alex Morgan', email: 'alex@example.com', responseStyle: 'Balanced', language: 'English', theme: 'System', notifications: true, temperature: 0.7, maxTokens: 4096, systemPrompt: '' }
 function load(): Settings {
   try { return { ...defaults, ...JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') } }
   catch { return { ...defaults } }

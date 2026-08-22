@@ -100,9 +100,12 @@ export const useChatStore = defineStore('chat', () => {
     try {
       const response = await fetch('/api/models')
       if (!response.ok) throw new Error(`Unable to load models (${response.status})`)
-      const data = await response.json() as { models?: ChatModel[] }
-      models.value = Array.isArray(data.models) ? data.models.filter(model => model?.id && model?.name) : []
-      if (!selectedModel.value || !models.value.some(model => model.id === selectedModel.value)) selectedModel.value = models.value[0]?.id ?? ''
+      const data = await response.json() as { models?: ChatModel[]; default_provider?: string; provider_errors?: Array<{ provider?: string; message?: string }> }
+      models.value = Array.isArray(data.models) ? data.models.filter(model => model?.id && model?.key && model?.provider && model?.name) : []
+      if (data.provider_errors?.length) modelsError.value = `${data.provider_errors.length} provider${data.provider_errors.length === 1 ? '' : 's'} unavailable; fallback models are shown.`
+      if (!selectedModel.value || !models.value.some(model => model.key === selectedModel.value)) {
+        selectedModel.value = models.value.find(model => model.provider === data.default_provider)?.key ?? models.value[0]?.key ?? ''
+      }
     } catch (error) {
       modelsError.value = error instanceof Error ? error.message : 'Unable to load models.'
     }
@@ -115,13 +118,16 @@ export const useChatStore = defineStore('chat', () => {
     controller = new AbortController()
     const currentController = controller
     try {
-      const systemPrompt = `Respond in ${preferences.settings.language}. Use a ${preferences.settings.responseStyle.toLowerCase()} level of detail.`
+      const selected = models.value.find(model => model.key === selectedModel.value)
+      const systemPrompt = [preferences.settings.systemPrompt.trim(), `Respond in ${preferences.settings.language}. Use a ${preferences.settings.responseStyle.toLowerCase()} level of detail.`].filter(Boolean).join('\n\n')
       const response = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
         signal: currentController.signal,
         body: JSON.stringify({
-          ...(selectedModel.value ? { model: selectedModel.value } : {}),
+          ...(selected ? { provider: selected.provider, model: selected.id } : {}),
+          temperature: preferences.settings.temperature,
+          max_tokens: preferences.settings.maxTokens,
           messages: [
             { role: 'system', content: systemPrompt },
             ...conversation.messages.slice(0, -1).filter(message => !message.error).map(({ role, content }) => ({ role, content })),

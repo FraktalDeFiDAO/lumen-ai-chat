@@ -42,12 +42,14 @@ describe('chat store', () => {
   it('streams a real API response and sends the selected model', async () => {
     const fetchMock = vi.fn().mockResolvedValue(sseResponse(['data: {"choices":[{"delta":{"content":"Hello"}}]}\n\n', 'data: {"choices":[{"delta":{"content":" there"}}]}\n\ndata: [DONE]\n\n']))
     vi.stubGlobal('fetch', fetchMock)
-    const store = useChatStore(); store.selectedModel = 'model-a'
+    const store = useChatStore()
+    store.models = [{ id: 'model-a', key: 'provider-a::model-a', name: 'Model A', provider: 'provider-a', provider_name: 'Provider A' }]
+    store.selectedModel = 'provider-a::model-a'
     await store.sendMessage('Hi')
     expect(store.activeConversation?.messages.map(message => message.content)).toEqual(['Hi', 'Hello there'])
     const [, options] = fetchMock.mock.calls[0]!
     expect(fetchMock.mock.calls[0]![0]).toBe('/api/chat')
-    expect(JSON.parse(options.body)).toEqual({ model: 'model-a', messages: [{ role: 'system', content: 'Respond in English. Use a balanced level of detail.' }, { role: 'user', content: 'Hi' }] })
+    expect(JSON.parse(options.body)).toEqual({ provider: 'provider-a', model: 'model-a', temperature: 0.7, max_tokens: 4096, messages: [{ role: 'system', content: 'Respond in English. Use a balanced level of detail.' }, { role: 'user', content: 'Hi' }] })
   })
   it('aborts safely without leaving an empty assistant response', async () => {
     vi.stubGlobal('fetch', vi.fn((_url: string, options: RequestInit) => new Promise((_resolve, reject) => {

@@ -18,5 +18,11 @@ export interface Conversation {
   updatedAt: number
 }
 
-export interface ChatModel { id: string; name: string }
+export interface ChatModel {
+  id: string
+  key: string
+  name: string
+  provider: string
+  provider_name: string
+}
 export interface Attachment { id: string; name: string; content: string; size: number }

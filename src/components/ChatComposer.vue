@@ -13,6 +13,15 @@ const fileInput = ref<HTMLInputElement | null>(null)
 const attachments = ref<Attachment[]>([])
 const attachmentError = ref('')
 const canSend = computed(() => !!text.value.trim() || attachments.value.length > 0 || props.generating)
+const groupedModels = computed(() => {
+  const groups = new Map<string, ChatModel[]>()
+  for (const model of props.models) {
+    const items = groups.get(model.provider_name) ?? []
+    items.push(model)
+    groups.set(model.provider_name, items)
+  }
+  return [...groups.entries()].map(([name, models]) => ({ name, models }))
+})
 
 function resize() { if (textarea.value) { textarea.value.style.height = 'auto'; textarea.value.style.height = `${Math.min(textarea.value.scrollHeight, 180)}px` } }
 function submit() {
@@ -41,6 +50,7 @@ async function chooseFiles(event: Event) {
 
 <template>
   <div class="composer-shell">
+    <p v-if="modelsError && models.length" class="model-warning" role="status">{{ modelsError }}</p>
     <div v-if="attachments.length" class="attachment-list" aria-label="Attachments">
       <span v-for="file in attachments" :key="file.id" class="attachment-chip"><FileText :size="14" /><span>{{ file.name }}</span><button type="button" :aria-label="`Remove ${file.name}`" @click="attachments = attachments.filter(item => item.id !== file.id)"><X :size="13" /></button></span>
     </div>
@@ -50,7 +60,7 @@ async function chooseFiles(event: Event) {
       <div class="flex items-center gap-1">
         <input ref="fileInput" class="sr-only" type="file" multiple accept="text/*,.md,.json,.csv,.ts,.tsx,.js,.jsx,.vue,.css,.html,.yaml,.yml,.py,.rs,.go,.java,.c,.cpp,.h,.sh,.sql,.toml" @change="chooseFiles" />
         <button type="button" class="composer-icon" aria-label="Attach text or code files" @click="fileInput?.click()"><Paperclip :size="18" /></button>
-        <label class="model-select-label"><span class="sr-only">Model</span><select :value="model" :disabled="!models.length" aria-label="Model" @change="emit('update:model', ($event.target as HTMLSelectElement).value)"><option v-if="!models.length" value="">{{ modelsError ? 'Models unavailable' : 'Loading models…' }}</option><option v-for="item in models" :key="item.id" :value="item.id">{{ item.name }}</option></select></label>
+        <label class="model-select-label"><span class="sr-only">Model and provider</span><select :value="model" :disabled="!models.length" aria-label="Model and provider" @change="emit('update:model', ($event.target as HTMLSelectElement).value)"><option v-if="!models.length" value="">{{ modelsError ? 'Models unavailable' : 'Loading models…' }}</option><optgroup v-for="group in groupedModels" :key="group.name" :label="group.name"><option v-for="item in group.models" :key="item.key" :value="item.key">{{ item.name }}</option></optgroup></select></label>
       </div>
       <button type="button" :disabled="!canSend" :class="['send-button', { ready: canSend }]" :aria-label="generating ? 'Stop generating' : 'Send message'" @click="submit"><Square v-if="generating" :size="13" fill="currentColor" /><ArrowUp v-else :size="18" /></button>
     </div>

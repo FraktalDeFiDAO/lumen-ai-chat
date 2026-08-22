@@ -45,11 +45,27 @@ try {
 
   const backend = start('cargo', ['run', '--manifest-path', 'backend/Cargo.toml'], {
     APP_BIND: '127.0.0.1:41788',
-    AI_PROVIDER: 'openai-compatible',
-    AI_BASE_URL: 'http://127.0.0.1:41800/v1',
-    AI_MODEL: 'lumen-test',
+    AI_DEFAULT_PROVIDER: 'ollama',
+    OPENAI_API_KEY: 'test-openai-key',
+    OPENAI_BASE_URL: 'http://127.0.0.1:41800/v1',
+    OPENAI_MODEL: 'openai-test',
+    ANTHROPIC_API_KEY: 'test-anthropic-key',
+    ANTHROPIC_BASE_URL: 'http://127.0.0.1:41800',
+    ANTHROPIC_MODEL: 'anthropic-test',
+    GEMINI_API_KEY: 'test-gemini-key',
+    GEMINI_BASE_URL: 'http://127.0.0.1:41800/v1beta',
+    GEMINI_MODEL: 'gemini-test',
+    OLLAMA_BASE_URL: 'http://127.0.0.1:41800/ollama/v1',
+    OLLAMA_MODEL: 'ollama-test',
   })
   await waitFor('http://127.0.0.1:41788/api/health', backend)
+
+  const providerTest = start('node', ['tests/provider-contract.mjs'])
+  await new Promise((resolve, reject) => {
+    providerTest.once('exit', code => code === 0 ? resolve() : reject(new Error(logs.get(providerTest)?.join('') || `Provider tests exited ${code}`)))
+    providerTest.once('error', reject)
+  })
+  process.stdout.write(logs.get(providerTest)?.join('') ?? '')
 
   const web = start('npm', ['run', 'dev:web'])
   await waitFor('http://127.0.0.1:41789', web, 30_000)
