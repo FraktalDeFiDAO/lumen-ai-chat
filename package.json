@@ -4,11 +4,15 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "vite --host 0.0.0.0",
+    "dev": "concurrently -k -n server,web -c yellow,cyan \"npm:dev:server\" \"npm:dev:web\"",
+    "dev:web": "vite --host 0.0.0.0 --port 41789",
+    "dev:server": "cargo run --manifest-path backend/Cargo.toml",
     "build": "vue-tsc -b && vite build",
+    "build:server": "cargo build --manifest-path backend/Cargo.toml",
+    "check:server": "cargo fmt --manifest-path backend/Cargo.toml --check && cargo clippy --manifest-path backend/Cargo.toml --all-targets -- -D warnings && cargo test --manifest-path backend/Cargo.toml",
     "typecheck": "vue-tsc -b",
     "test": "vitest run",
-    "test:e2e": "node tests/e2e.mjs",
+    "test:e2e": "node tests/run-e2e.mjs",
     "test:watch": "vitest"
   },
   "dependencies": {
@@ -23,6 +27,7 @@
     "@types/node": "^24.7.2",
     "@vitejs/plugin-vue": "^6.0.1",
     "@vue/test-utils": "^2.4.6",
+    "concurrently": "^9.2.1",
     "@vue/tsconfig": "^0.8.1",
     "jsdom": "^27.0.0",
     "playwright-core": "^1.62.1",

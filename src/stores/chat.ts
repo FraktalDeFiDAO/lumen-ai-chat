@@ -1,35 +1,77 @@
 import { computed, ref, watch } from 'vue'
 import { defineStore } from 'pinia'
-import type { Conversation, Message } from '@/types/chat'
+import type { ChatModel, Conversation, Feedback, Message } from '@/types/chat'
+import { useSettingsStore } from './settings'
 
 const STORAGE_KEY = 'lumen-conversations-v1'
+const MODEL_KEY = 'lumen-model-v1'
 const uid = () => crypto.randomUUID()
 
 function loadConversations(): Conversation[] {
-  try { return JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '[]') as Conversation[] }
-  catch { return [] }
+  try {
+    const value = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '[]')
+    return Array.isArray(value) ? value : []
+  } catch { return [] }
 }
 
-const responses = [
-  'I can help with that. A strong way to approach it is to separate the goal into three parts: what you know, what you need to decide, and the smallest useful next step. Start with the constraint that matters most, then test your assumptions before adding complexity.',
-  `Here’s a concise framework:
+export function parseSSEBlock(block: string): { done: boolean; content: string; error?: string } {
+  const data = block.split(/\r?\n/)
+    .filter(line => line.startsWith('data:'))
+    .map(line => line.slice(5).trimStart())
+    .join('\n')
+  if (!data) return { done: false, content: '' }
+  if (data.trim() === '[DONE]') return { done: true, content: '' }
+  try {
+    const event = JSON.parse(data) as { choices?: Array<{ delta?: { content?: unknown } }>; error?: { message?: unknown } | string }
+    if (event.error) {
+      const message = typeof event.error === 'string' ? event.error : event.error.message
+      return { done: false, content: '', error: typeof message === 'string' ? message : 'The AI provider returned an error.' }
+    }
+    const content = event.choices?.[0]?.delta?.content
+    return { done: false, content: typeof content === 'string' ? content : '' }
+  } catch { return { done: false, content: '' } }
+}
 
-1. Define the outcome in one sentence.
-2. List the two biggest constraints.
-3. Build the simplest version that proves the core idea.
-4. Review the result, then iterate with evidence.
-
-This keeps the work focused while leaving room to improve the details.`,
-  'The key tradeoff is usually speed versus flexibility. If this is an early exploration, optimize for a clear, reversible decision. If it is production work, spend more time on reliability, observability, and failure states. Tell me which stage you’re in and I’ll make this more specific.',
-]
+export async function readSSE(response: Response, onContent: (content: string) => void) {
+  if (!response.body) throw new Error('The server returned an empty response.')
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let doneEvent = false
+  while (!doneEvent) {
+    const { done, value } = await reader.read()
+    buffer += decoder.decode(value, { stream: !done })
+    const blocks = buffer.split(/\r?\n\r?\n/)
+    buffer = blocks.pop() ?? ''
+    for (const block of blocks) {
+      const event = parseSSEBlock(block)
+      if (event.error) throw new Error(event.error)
+      if (event.content) onContent(event.content)
+      if (event.done) { doneEvent = true; break }
+    }
+    if (done) break
+  }
+  if (buffer.trim() && !doneEvent) {
+    const event = parseSSEBlock(buffer)
+    if (event.error) throw new Error(event.error)
+    if (event.content) onContent(event.content)
+  }
+}
 
 export const useChatStore = defineStore('chat', () => {
+  const preferences = useSettingsStore()
   const conversations = ref<Conversation[]>(loadConversations())
   const activeId = ref<string | null>(null)
   const isGenerating = ref(false)
+  const models = ref<ChatModel[]>([])
+  const selectedModel = ref(localStorage.getItem(MODEL_KEY) ?? '')
+  const modelsError = ref('')
   const activeConversation = computed(() => conversations.value.find(c => c.id === activeId.value) ?? null)
   const sortedConversations = computed(() => [...conversations.value].sort((a, b) => b.updatedAt - a.updatedAt))
   watch(conversations, value => localStorage.setItem(STORAGE_KEY, JSON.stringify(value)), { deep: true })
+  watch(selectedModel, value => value ? localStorage.setItem(MODEL_KEY, value) : localStorage.removeItem(MODEL_KEY))
+
+  let controller: AbortController | null = null
 
   function createConversation(firstMessage?: string) {
     const now = Date.now()
@@ -40,32 +82,104 @@ export const useChatStore = defineStore('chat', () => {
   }
   function selectConversation(id: string | null) { activeId.value = id }
   function deleteConversation(id: string) {
+    if (activeId.value === id) stopGenerating()
     conversations.value = conversations.value.filter(c => c.id !== id)
     if (activeId.value === id) activeId.value = null
   }
-  function clearAll() { conversations.value = []; activeId.value = null }
-  function addMessage(conversationId: string, role: Message['role'], content: string) {
-    const conversation = conversations.value.find(c => c.id === conversationId)
-    if (!conversation) return
-    conversation.messages.push({ id: uid(), role, content, createdAt: Date.now() })
+  function clearAll() { stopGenerating(); conversations.value = []; activeId.value = null }
+  function addMessage(conversation: Conversation, role: Message['role'], content: string) {
+    const message: Message = { id: uid(), role, content, createdAt: Date.now(), feedback: null }
+    conversation.messages.push(message)
     conversation.updatedAt = Date.now()
-    if (role === 'user' && conversation.messages.filter(m => m.role === 'user').length === 1) conversation.title = content.slice(0, 42)
+    if (role === 'user' && conversation.messages.filter(m => m.role === 'user').length === 1) conversation.title = content.split('\n')[0]!.slice(0, 42)
+    return message
   }
-  let generationId = 0
+
+  async function loadModels() {
+    modelsError.value = ''
+    try {
+      const response = await fetch('/api/models')
+      if (!response.ok) throw new Error(`Unable to load models (${response.status})`)
+      const data = await response.json() as { models?: ChatModel[] }
+      models.value = Array.isArray(data.models) ? data.models.filter(model => model?.id && model?.name) : []
+      if (!selectedModel.value || !models.value.some(model => model.id === selectedModel.value)) selectedModel.value = models.value[0]?.id ?? ''
+    } catch (error) {
+      modelsError.value = error instanceof Error ? error.message : 'Unable to load models.'
+    }
+  }
+
+  async function generateAssistant(conversation: Conversation) {
+    if (isGenerating.value) return conversation.id
+    const assistant = addMessage(conversation, 'assistant', '')
+    isGenerating.value = true
+    controller = new AbortController()
+    const currentController = controller
+    try {
+      const systemPrompt = `Respond in ${preferences.settings.language}. Use a ${preferences.settings.responseStyle.toLowerCase()} level of detail.`
+      const response = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+        signal: currentController.signal,
+        body: JSON.stringify({
+          ...(selectedModel.value ? { model: selectedModel.value } : {}),
+          messages: [
+            { role: 'system', content: systemPrompt },
+            ...conversation.messages.slice(0, -1).filter(message => !message.error).map(({ role, content }) => ({ role, content })),
+          ],
+        }),
+      })
+      if (!response.ok) {
+        let detail = ''
+        try {
+          const payload = await response.json() as { error?: string | { message?: string }; message?: string }
+          detail = typeof payload.error === 'string' ? payload.error : payload.error?.message ?? payload.message ?? ''
+        } catch { /* non-JSON error */ }
+        throw new Error(detail || `Request failed (${response.status})`)
+      }
+      await readSSE(response, chunk => { assistant.content += chunk; conversation.updatedAt = Date.now() })
+      if (!assistant.content) throw new Error('The model returned no response.')
+    } catch (error) {
+      if (currentController.signal.aborted) {
+        if (!assistant.content) conversation.messages = conversation.messages.filter(message => message.id !== assistant.id)
+      } else {
+        assistant.error = error instanceof Error ? error.message : 'Something went wrong. Please try again.'
+        if (!assistant.content) assistant.content = 'Unable to generate a response.'
+      }
+    } finally {
+      if (controller === currentController) {
+        controller = null
+        isGenerating.value = false
+      }
+      conversation.updatedAt = Date.now()
+    }
+    return conversation.id
+  }
+
   async function sendMessage(content: string) {
     const text = content.trim()
     if (!text || isGenerating.value) return activeId.value
     const conversation = activeConversation.value ?? createConversation(text)
-    addMessage(conversation.id, 'user', text)
-    isGenerating.value = true
-    const requestId = ++generationId
-    await new Promise(resolve => setTimeout(resolve, 650))
-    if (requestId !== generationId) return conversation.id
-    const reply = responses[conversation.messages.length % responses.length]!
-    addMessage(conversation.id, 'assistant', reply)
-    isGenerating.value = false
-    return conversation.id
+    addMessage(conversation, 'user', text)
+    return generateAssistant(conversation)
   }
-  function stopGenerating() { generationId++; isGenerating.value = false }
-  return { conversations, activeId, activeConversation, sortedConversations, isGenerating, createConversation, selectConversation, deleteConversation, clearAll, sendMessage, stopGenerating }
+
+  async function regenerate(messageId?: string) {
+    if (isGenerating.value) return activeId.value
+    const conversation = activeConversation.value
+    if (!conversation) return null
+    let index = messageId ? conversation.messages.findIndex(message => message.id === messageId) : -1
+    if (index < 0) index = conversation.messages.map(message => message.role).lastIndexOf('assistant')
+    if (index < 0) return conversation.id
+    conversation.messages.splice(index)
+    if (!conversation.messages.some(message => message.role === 'user')) return conversation.id
+    return generateAssistant(conversation)
+  }
+
+  function stopGenerating() { controller?.abort(); controller = null; isGenerating.value = false }
+  function setFeedback(messageId: string, feedback: Exclude<Feedback, null>) {
+    const message = activeConversation.value?.messages.find(item => item.id === messageId)
+    if (message) message.feedback = message.feedback === feedback ? null : feedback
+  }
+
+  return { conversations, activeId, activeConversation, sortedConversations, isGenerating, models, selectedModel, modelsError, createConversation, selectConversation, deleteConversation, clearAll, sendMessage, stopGenerating, regenerate, setFeedback, loadModels }
 })

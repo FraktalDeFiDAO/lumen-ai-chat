@@ -1,8 +1,46 @@
 <script setup lang="ts">
-import { ArrowLeft, Bell, Brush, Database, Shield, Trash2, UserRound } from 'lucide-vue-next'
+import { ref } from 'vue'
+import { ArrowLeft, Bell, Brush, Database, Save, Trash2, UserRound, X } from 'lucide-vue-next'
 import { useRouter } from 'vue-router'
 import { useChatStore } from '@/stores/chat'
-const router = useRouter(); const store = useChatStore()
-function clearHistory() { if (confirm('Delete all conversations? This cannot be undone.')) store.clearAll() }
+import { useSettingsStore } from '@/stores/settings'
+
+const router = useRouter(); const chat = useChatStore(); const preferences = useSettingsStore()
+const active = ref<'general' | 'appearance' | 'notifications' | 'data'>('general')
+const editing = ref(false); const draftName = ref(''); const draftEmail = ref('')
+const sections = [
+  { id: 'general' as const, label: 'General', icon: UserRound },
+  { id: 'appearance' as const, label: 'Appearance', icon: Brush },
+  { id: 'notifications' as const, label: 'Notifications', icon: Bell },
+  { id: 'data' as const, label: 'Data controls', icon: Database },
+]
+function beginEdit() { draftName.value = preferences.settings.displayName; draftEmail.value = preferences.settings.email; editing.value = true }
+function saveProfile() {
+  if (!draftName.value.trim()) return
+  preferences.settings.displayName = draftName.value.trim()
+  preferences.settings.email = draftEmail.value.trim()
+  editing.value = false
+}
+function clearHistory() { if (confirm('Delete all conversations? This cannot be undone.')) chat.clearAll() }
 </script>
-<template><div class="settings-page"><header class="settings-header"><button class="icon-button" @click="router.back()"><ArrowLeft :size="19" /></button><strong>Settings</strong></header><div class="settings-layout"><nav><button class="active"><UserRound :size="17" />General</button><button><Brush :size="17" />Appearance</button><button><Bell :size="17" />Notifications</button><button><Database :size="17" />Data controls</button><button><Shield :size="17" />Security</button></nav><main><h1>General</h1><p class="settings-lead">Manage your account and preferences.</p><section class="settings-card"><div><span class="avatar large">A</span><div><strong>Alex Morgan</strong><p>alex@example.com</p></div></div><button class="secondary-button">Edit profile</button></section><h2>Preferences</h2><section class="settings-card stacked"><label><span><strong>Response style</strong><small>Choose how detailed Lumen should be.</small></span><select><option>Balanced</option><option>Concise</option><option>Detailed</option></select></label><label><span><strong>Language</strong><small>Used for the interface and responses.</small></span><select><option>English</option><option>Spanish</option><option>French</option></select></label></section><h2>Conversation history</h2><section class="settings-card"><div><Trash2 :size="18" /><div><strong>Delete all chats</strong><p>Permanently remove every saved conversation.</p></div></div><button class="danger-button" @click="clearHistory">Delete all</button></section></main></div></div></template>
+<template>
+  <div :class="['settings-page', `theme-${preferences.settings.theme.toLowerCase()}`]">
+    <header class="settings-header"><button class="icon-button" aria-label="Go back" @click="router.back()"><ArrowLeft :size="19" /></button><strong>Settings</strong></header>
+    <div class="settings-layout">
+      <nav aria-label="Settings sections"><button v-for="section in sections" :key="section.id" :class="{ active: active === section.id }" :aria-current="active === section.id ? 'page' : undefined" @click="active = section.id"><component :is="section.icon" :size="17" />{{ section.label }}</button></nav>
+      <main>
+        <template v-if="active === 'general'">
+          <h1>General</h1><p class="settings-lead">Manage your profile and response preferences.</p>
+          <section class="settings-card profile-card">
+            <template v-if="!editing"><div><span class="avatar large">{{ preferences.initials() }}</span><div><strong>{{ preferences.settings.displayName }}</strong><p>{{ preferences.settings.email || 'No email set' }}</p></div></div><button class="secondary-button" @click="beginEdit">Edit profile</button></template>
+            <form v-else class="profile-form" @submit.prevent="saveProfile"><label><span>Display name</span><input v-model="draftName" required maxlength="60" autocomplete="name" /></label><label><span>Email</span><input v-model="draftEmail" type="email" maxlength="120" autocomplete="email" /></label><div class="form-actions"><button type="button" class="secondary-button" @click="editing = false"><X :size="14" />Cancel</button><button class="primary-button"><Save :size="14" />Save</button></div></form>
+          </section>
+          <h2>Preferences</h2><section class="settings-card stacked"><label><span><strong>Response style</strong><small>Choose how detailed Lumen should be.</small></span><select v-model="preferences.settings.responseStyle" aria-label="Response style"><option>Balanced</option><option>Concise</option><option>Detailed</option></select></label><label><span><strong>Language</strong><small>Used for interface and response preferences.</small></span><select v-model="preferences.settings.language" aria-label="Language"><option>English</option><option>Spanish</option><option>French</option></select></label></section>
+        </template>
+        <template v-else-if="active === 'appearance'"><h1>Appearance</h1><p class="settings-lead">Choose how Lumen looks on this device.</p><section class="settings-card stacked"><label><span><strong>Theme</strong><small>Follow your system or choose a theme.</small></span><select v-model="preferences.settings.theme" aria-label="Theme"><option>System</option><option>Light</option><option>Dark</option></select></label></section></template>
+        <template v-else-if="active === 'notifications'"><h1>Notifications</h1><p class="settings-lead">Control non-essential interface notifications.</p><section class="settings-card"><div><Bell :size="18" /><div><strong>Activity notifications</strong><p>Show helpful status and product notices.</p></div></div><label class="switch"><input v-model="preferences.settings.notifications" type="checkbox" /><span aria-hidden="true" /></label></section></template>
+        <template v-else><h1>Data controls</h1><p class="settings-lead">Manage conversation data stored in this browser.</p><section class="settings-card"><div><Trash2 :size="18" /><div><strong>Delete all chats</strong><p>Permanently remove {{ chat.conversations.length }} saved conversation{{ chat.conversations.length === 1 ? '' : 's' }}.</p></div></div><button class="danger-button" :disabled="!chat.conversations.length" @click="clearHistory">Delete all</button></section></template>
+      </main>
+    </div>
+  </div>
+</template>

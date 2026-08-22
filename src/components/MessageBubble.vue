@@ -1,18 +1,30 @@
 <script setup lang="ts">
 import { ref } from 'vue'
-import { Check, Clipboard, RotateCcw, ThumbsDown, ThumbsUp, Sparkles } from 'lucide-vue-next'
+import { AlertCircle, Check, Clipboard, RotateCcw, ThumbsDown, ThumbsUp, Sparkles } from 'lucide-vue-next'
 import type { Message } from '@/types/chat'
-const props = defineProps<{ message: Message }>()
+const props = defineProps<{ message: Message; regenerating?: boolean }>()
+const emit = defineEmits<{ regenerate: [id: string]; feedback: [id: string, value: 'up' | 'down'] }>()
 const copied = ref(false)
-async function copy() { await navigator.clipboard.writeText(props.message.content); copied.value = true; setTimeout(() => copied.value = false, 1300) }
+async function copy() {
+  try {
+    await navigator.clipboard.writeText(props.message.content)
+    copied.value = true
+    setTimeout(() => copied.value = false, 1300)
+  } catch { copied.value = false }
+}
 </script>
 
 <template>
-  <article :class="['message', message.role]">
+  <article :class="['message', message.role, { 'has-error': message.error }]">
     <div v-if="message.role === 'assistant'" class="assistant-mark"><Sparkles :size="16" /></div>
-    <div class="message-body"><div class="message-content">{{ message.content }}</div>
+    <div class="message-body">
+      <div class="message-content">{{ message.content }}</div>
+      <p v-if="message.error" class="message-error" role="alert"><AlertCircle :size="15" />{{ message.error }}</p>
       <div v-if="message.role === 'assistant'" class="message-actions">
-        <button aria-label="Copy response" @click="copy"><Check v-if="copied" :size="15" /><Clipboard v-else :size="15" /></button><button aria-label="Good response"><ThumbsUp :size="15" /></button><button aria-label="Bad response"><ThumbsDown :size="15" /></button><button aria-label="Regenerate response"><RotateCcw :size="15" /></button>
+        <button type="button" :aria-label="copied ? 'Response copied' : 'Copy response'" @click="copy"><Check v-if="copied" :size="15" /><Clipboard v-else :size="15" /></button>
+        <button type="button" aria-label="Good response" :aria-pressed="message.feedback === 'up'" :class="{ selected: message.feedback === 'up' }" @click="emit('feedback', message.id, 'up')"><ThumbsUp :size="15" /></button>
+        <button type="button" aria-label="Bad response" :aria-pressed="message.feedback === 'down'" :class="{ selected: message.feedback === 'down' }" @click="emit('feedback', message.id, 'down')"><ThumbsDown :size="15" /></button>
+        <button type="button" aria-label="Regenerate response" :disabled="regenerating" @click="emit('regenerate', message.id)"><RotateCcw :size="15" /></button>
       </div>
     </div>
   </article>
