@@ -24,5 +24,7 @@ export interface ChatModel {
   name: string
   provider: string
   provider_name: string
+  ai_coder: string
+  ai_coder_name: string
 }
 export interface Attachment { id: string; name: string; content: string; size: number }

@@ -18,7 +18,7 @@ const suggestions = [
 const hasMessages = computed(() => !!store.activeConversation?.messages.length)
 const modelName = computed(() => {
   const model = store.models.find(item => item.key === store.selectedModel)
-  return model ? `${model.provider_name} · ${model.name}` : 'Lumen'
+  return model ? `${model.ai_coder_name} · ${model.provider_name} · ${model.name}` : 'Lumen'
 })
 async function send(text: string) { const id = await store.sendMessage(text); if (id && route.params.id !== id) await router.replace(`/chat/${id}`) }
 function syncRoute() { const id = typeof route.params.id === 'string' ? route.params.id : null; store.selectConversation(store.conversations.some(c => c.id === id) ? id : null) }

@@ -14,13 +14,14 @@ const attachments = ref<Attachment[]>([])
 const attachmentError = ref('')
 const canSend = computed(() => !!text.value.trim() || attachments.value.length > 0 || props.generating)
 const groupedModels = computed(() => {
-  const groups = new Map<string, ChatModel[]>()
+  const groups = new Map<string, { label: string; models: ChatModel[] }>()
   for (const model of props.models) {
-    const items = groups.get(model.provider_name) ?? []
-    items.push(model)
-    groups.set(model.provider_name, items)
+    const key = `${model.ai_coder}/${model.provider}`
+    const group = groups.get(key) ?? { label: `${model.ai_coder_name} · ${model.provider_name}`, models: [] }
+    group.models.push(model)
+    groups.set(key, group)
   }
-  return [...groups.entries()].map(([name, models]) => ({ name, models }))
+  return [...groups.entries()].map(([key, group]) => ({ key, ...group }))
 })
 
 function resize() { if (textarea.value) { textarea.value.style.height = 'auto'; textarea.value.style.height = `${Math.min(textarea.value.scrollHeight, 180)}px` } }
@@ -60,7 +61,7 @@ async function chooseFiles(event: Event) {
       <div class="flex items-center gap-1">
         <input ref="fileInput" class="sr-only" type="file" multiple accept="text/*,.md,.json,.csv,.ts,.tsx,.js,.jsx,.vue,.css,.html,.yaml,.yml,.py,.rs,.go,.java,.c,.cpp,.h,.sh,.sql,.toml" @change="chooseFiles" />
         <button type="button" class="composer-icon" aria-label="Attach text or code files" @click="fileInput?.click()"><Paperclip :size="18" /></button>
-        <label class="model-select-label"><span class="sr-only">Model and provider</span><select :value="model" :disabled="!models.length" aria-label="Model and provider" @change="emit('update:model', ($event.target as HTMLSelectElement).value)"><option v-if="!models.length" value="">{{ modelsError ? 'Models unavailable' : 'Loading models…' }}</option><optgroup v-for="group in groupedModels" :key="group.name" :label="group.name"><option v-for="item in group.models" :key="item.key" :value="item.key">{{ item.name }}</option></optgroup></select></label>
+        <label class="model-select-label"><span class="sr-only">AI coder, provider, and model</span><select :value="model" :disabled="!models.length" aria-label="AI coder, provider, and model" @change="emit('update:model', ($event.target as HTMLSelectElement).value)"><option v-if="!models.length" value="">{{ modelsError ? 'Models unavailable' : 'Loading models…' }}</option><optgroup v-for="group in groupedModels" :key="group.key" :label="group.label"><option v-for="item in group.models" :key="item.key" :value="item.key">{{ item.key }}</option></optgroup></select></label>
       </div>
       <button type="button" :disabled="!canSend" :class="['send-button', { ready: canSend }]" :aria-label="generating ? 'Stop generating' : 'Send message'" @click="submit"><Square v-if="generating" :size="13" fill="currentColor" /><ArrowUp v-else :size="18" /></button>
     </div>

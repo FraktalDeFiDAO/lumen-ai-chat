@@ -21,8 +21,11 @@ try {
   assert.match(page.url(), /\/chat\//)
   assert.ok((await page.locator('.history-row').count()) >= 1)
 
-  assert.equal(await page.getByLabel('Model and provider').inputValue(), 'ollama::ollama-test')
-  assert.equal(await page.getByLabel('Model and provider').locator('optgroup').count(), 4)
+  assert.equal(await page.getByLabel('AI coder, provider, and model').inputValue(), 'hermes/openai/openai-test')
+  assert.equal(await page.getByLabel('AI coder, provider, and model').locator('optgroup').count(), 6)
+  const labels = await page.getByLabel('AI coder, provider, and model').locator('optgroup').evaluateAll(groups => groups.map(group => group.label))
+  assert.ok(labels.includes('Hermes · Z.AI'))
+  assert.ok(labels.includes('Codex · Codex'))
   await page.locator('input[type="file"]').setInputFiles({ name: 'notes.txt', mimeType: 'text/plain', buffer: Buffer.from('Attachment body') })
   await page.getByText('notes.txt', { exact: true }).waitFor()
   await page.getByRole('button', { name: 'Remove notes.txt' }).click()
@@ -50,13 +53,19 @@ try {
   await page.screenshot({ path: '/tmp/lumen-settings.png', fullPage: true })
 
   const mobile = await browser.newPage({ viewport: { width: 390, height: 844 } })
+  const mobileErrors = []
+  mobile.on('console', message => { if (message.type() === 'error') mobileErrors.push(message.text()) })
   await mobile.goto(baseURL, { waitUntil: 'networkidle' })
   await mobile.getByRole('button', { name: 'Open sidebar' }).click()
   await mobile.getByRole('button', { name: 'Close sidebar' }).waitFor()
   await mobile.screenshot({ path: '/tmp/lumen-mobile.png', fullPage: true })
+  await mobile.getByRole('button', { name: 'Close sidebar' }).click()
+  await mobile.getByRole('button', { name: 'Open sidebar' }).waitFor()
+  await mobile.screenshot({ path: '/tmp/lumen-mobile-chat.png', fullPage: true })
   assert.deepEqual(errors, [])
+  assert.deepEqual(mobileErrors, [])
   console.log('E2E passed: streaming chat, model selection, attachments, feedback, regenerate, share, settings, theme, history, routing, and mobile navigation')
-  console.log('Screenshots: /tmp/lumen-desktop.png, /tmp/lumen-mobile.png')
+  console.log('Screenshots: /tmp/lumen-desktop.png, /tmp/lumen-mobile.png, /tmp/lumen-mobile-chat.png')
 } finally {
   await browser.close()
 }

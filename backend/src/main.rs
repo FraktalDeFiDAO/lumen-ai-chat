@@ -3,7 +3,7 @@ use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
@@ -11,6 +11,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
+    if let Err(error) = run().await {
+        tracing::error!(%error, "AI gateway failed to start");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
     let bind = config.bind;
     let app = build_router(config)?;

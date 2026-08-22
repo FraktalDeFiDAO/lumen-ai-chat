@@ -63,6 +63,9 @@ impl ProviderKind {
 pub struct ProviderConfig {
     pub id: String,
     pub name: String,
+    pub ai_coder: String,
+    pub ai_coder_name: String,
+    pub provider_id: String,
     pub kind: ProviderKind,
     pub base_url: String,
     pub default_model: String,
@@ -103,6 +106,7 @@ impl ProviderConfig {
 pub struct Config {
     pub bind: SocketAddr,
     pub providers: Vec<ProviderConfig>,
+    pub default_coder: String,
     pub default_provider: String,
 }
 
@@ -117,6 +121,12 @@ struct CustomProviderInput {
     model: Option<String>,
     #[serde(default)]
     api_key_env: Option<String>,
+    #[serde(default)]
+    ai_coder: Option<String>,
+    #[serde(default)]
+    ai_coder_name: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -129,12 +139,20 @@ pub enum ConfigError {
     InvalidBaseUrl(String),
     #[error("provider `{0}` has an invalid default model")]
     InvalidModel(String),
-    #[error("duplicate provider identifier: {0}")]
+    #[error("duplicate provider id: {0}")]
     DuplicateProvider(String),
+    #[error("duplicate AI coder/provider route: {0}")]
+    DuplicateRoute(String),
     #[error("AI_ENDPOINTS_JSON is invalid: {0}")]
     InvalidCustomProviders(String),
     #[error("AI_DEFAULT_PROVIDER does not name a configured provider: {0}")]
     InvalidDefaultProvider(String),
+    #[error("AI_DEFAULT_CODER does not name a configured AI coder: {0}")]
+    InvalidDefaultCoder(String),
+    #[error(
+        "no AI providers are configured; set a hosted provider credential or explicitly enable a custom/local endpoint"
+    )]
+    NoProviders,
 }
 
 impl Config {
@@ -158,6 +176,9 @@ impl Config {
             providers.push(ProviderConfig {
                 id: "openai".into(),
                 name: "OpenAI".into(),
+                ai_coder: "hermes".into(),
+                ai_coder_name: "Hermes".into(),
+                provider_id: "openai".into(),
                 kind: ProviderKind::Openai,
                 base_url: env::var("OPENAI_BASE_URL")
                     .ok()
@@ -186,6 +207,9 @@ impl Config {
             providers.push(ProviderConfig {
                 id: "anthropic".into(),
                 name: "Anthropic".into(),
+                ai_coder: "hermes".into(),
+                ai_coder_name: "Hermes".into(),
+                provider_id: "anthropic".into(),
                 kind: ProviderKind::Anthropic,
                 base_url: env::var("ANTHROPIC_BASE_URL")
                     .ok()
@@ -217,6 +241,9 @@ impl Config {
             providers.push(ProviderConfig {
                 id: "gemini".into(),
                 name: "Google Gemini".into(),
+                ai_coder: "hermes".into(),
+                ai_coder_name: "Hermes".into(),
+                provider_id: "gemini".into(),
                 kind: ProviderKind::Gemini,
                 base_url: env::var("GEMINI_BASE_URL")
                     .ok()
@@ -239,21 +266,31 @@ impl Config {
         }
 
         let ollama_is_legacy = legacy_kind == Some(ProviderKind::OpenaiCompatible);
-        providers.push(ProviderConfig {
-            id: "ollama".into(),
-            name: "Ollama / Local".into(),
-            kind: ProviderKind::OpenaiCompatible,
-            base_url: env::var("OLLAMA_BASE_URL")
-                .ok()
-                .or_else(|| ollama_is_legacy.then(|| legacy_base.clone()).flatten())
-                .unwrap_or_else(|| "http://127.0.0.1:11434/v1".into()),
-            default_model: env::var("OLLAMA_MODEL")
-                .ok()
-                .or_else(|| ollama_is_legacy.then(|| legacy_model.clone()).flatten())
-                .unwrap_or_else(|| "llama3.2".into()),
-            api_key: env_key("OLLAMA_API_KEY")
-                .or_else(|| ollama_is_legacy.then(|| legacy_key.clone()).flatten()),
-        });
+        let ollama_enabled = ollama_is_legacy
+            || env_flag("OLLAMA_ENABLED")
+            || env::var_os("OLLAMA_BASE_URL").is_some()
+            || env::var_os("OLLAMA_MODEL").is_some()
+            || env::var_os("OLLAMA_API_KEY").is_some();
+        if ollama_enabled {
+            providers.push(ProviderConfig {
+                id: "ollama".into(),
+                name: "Ollama / Local".into(),
+                ai_coder: "ollama".into(),
+                ai_coder_name: "Ollama".into(),
+                provider_id: "ollama".into(),
+                kind: ProviderKind::OpenaiCompatible,
+                base_url: env::var("OLLAMA_BASE_URL")
+                    .ok()
+                    .or_else(|| ollama_is_legacy.then(|| legacy_base.clone()).flatten())
+                    .unwrap_or_else(|| "http://127.0.0.1:11434/v1".into()),
+                default_model: env::var("OLLAMA_MODEL")
+                    .ok()
+                    .or_else(|| ollama_is_legacy.then(|| legacy_model.clone()).flatten())
+                    .unwrap_or_else(|| "llama3.2".into()),
+                api_key: env_key("OLLAMA_API_KEY")
+                    .or_else(|| ollama_is_legacy.then(|| legacy_key.clone()).flatten()),
+            });
+        }
 
         if let Ok(raw) = env::var("AI_ENDPOINTS_JSON") {
             let custom: Vec<CustomProviderInput> = serde_json::from_str(&raw)
@@ -265,9 +302,17 @@ impl Config {
             }
             for item in custom {
                 let api_key = item.api_key_env.as_deref().and_then(env_key);
+                let ai_coder = item.ai_coder.unwrap_or_else(|| item.id.clone());
+                let ai_coder_name = item
+                    .ai_coder_name
+                    .unwrap_or_else(|| display_identifier(&ai_coder));
+                let provider_id = item.provider.unwrap_or_else(|| ai_coder.clone());
                 providers.push(ProviderConfig {
-                    name: item.name.unwrap_or_else(|| item.id.clone()),
+                    name: item.name.unwrap_or_else(|| provider_id.clone()),
                     id: item.id,
+                    ai_coder,
+                    ai_coder_name,
+                    provider_id,
                     kind: ProviderKind::OpenaiCompatible,
                     base_url: item.base_url,
                     default_model: item.model.unwrap_or_else(|| "default".into()),
@@ -276,17 +321,36 @@ impl Config {
             }
         }
 
-        let legacy_default = match legacy_kind {
-            Some(ProviderKind::Openai) => "openai",
-            Some(ProviderKind::Anthropic) => "anthropic",
-            Some(ProviderKind::Gemini) => "gemini",
-            Some(ProviderKind::OpenaiCompatible) | None => "ollama",
-        };
-        let default_provider =
-            env::var("AI_DEFAULT_PROVIDER").unwrap_or_else(|_| legacy_default.into());
+        if providers.is_empty() {
+            return Err(ConfigError::NoProviders);
+        }
+        let default_coder = env::var("AI_DEFAULT_CODER").unwrap_or_else(|_| {
+            if legacy_kind == Some(ProviderKind::OpenaiCompatible) {
+                "ollama".into()
+            } else {
+                "hermes".into()
+            }
+        });
+        let provider_hint = env::var("AI_DEFAULT_PROVIDER").ok();
+        let default_provider = providers
+            .iter()
+            .find(|provider| {
+                provider.ai_coder == default_coder
+                    && provider_hint
+                        .as_ref()
+                        .is_none_or(|hint| provider.provider_id == *hint || provider.id == *hint)
+            })
+            .map(|provider| provider.id.clone())
+            .ok_or_else(|| {
+                provider_hint.clone().map_or_else(
+                    || ConfigError::InvalidDefaultCoder(default_coder.clone()),
+                    ConfigError::InvalidDefaultProvider,
+                )
+            })?;
         let config = Self {
             bind,
             providers,
+            default_coder,
             default_provider,
         };
         config.validate()?;
@@ -300,12 +364,20 @@ impl Config {
             ));
         }
         let mut ids = HashSet::new();
+        let mut routes = HashSet::new();
         for provider in &self.providers {
-            if !valid_provider_id(&provider.id) {
+            if !valid_provider_id(&provider.id)
+                || !valid_provider_id(&provider.ai_coder)
+                || !valid_provider_id(&provider.provider_id)
+            {
                 return Err(ConfigError::InvalidProviderId(provider.id.clone()));
             }
             if !ids.insert(provider.id.clone()) {
                 return Err(ConfigError::DuplicateProvider(provider.id.clone()));
+            }
+            let route = format!("{}/{}", provider.ai_coder, provider.provider_id);
+            if !routes.insert(route.clone()) {
+                return Err(ConfigError::DuplicateRoute(route));
             }
             let url = reqwest::Url::parse(&provider.base_url)
                 .map_err(|_| ConfigError::InvalidBaseUrl(provider.id.clone()))?;
@@ -324,6 +396,11 @@ impl Config {
                 self.default_provider.clone(),
             ));
         }
+        if !self.providers.iter().any(|provider| {
+            provider.ai_coder == self.default_coder && provider.id == self.default_provider
+        }) {
+            return Err(ConfigError::InvalidDefaultCoder(self.default_coder.clone()));
+        }
         Ok(())
     }
 
@@ -337,10 +414,33 @@ fn valid_provider_id(id: &str) -> bool {
         && id.len() <= 48
         && id
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+fn display_identifier(id: &str) -> String {
+    let mut chars = id.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
+}
+fn parse_model_path(value: &str) -> Option<(&str, &str, &str)> {
+    let mut parts = value.splitn(3, '/');
+    let ai_coder = parts.next()?;
+    let provider = parts.next()?;
+    let model = parts.next()?;
+    (valid_provider_id(ai_coder) && valid_provider_id(provider) && !model.trim().is_empty())
+        .then_some((ai_coder, provider, model))
 }
 fn env_key(name: &str) -> Option<String> {
     env::var(name).ok().filter(|key| !key.is_empty())
+}
+fn env_flag(name: &str) -> bool {
+    env::var(name).ok().is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 fn encode_path_segment(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
@@ -407,15 +507,20 @@ pub enum BuildError {
 struct ProviderInfo {
     id: String,
     name: String,
+    ai_coder: String,
+    ai_coder_name: String,
+    provider: String,
     kind: String,
     default_model: String,
     is_default: bool,
 }
 
 async fn health(State(state): State<AppState>) -> Json<Value> {
+    let default = state.config.provider(&state.config.default_provider);
     Json(json!({
         "status": "ok",
-        "default_provider": state.config.default_provider,
+        "default_ai_coder": state.config.default_coder,
+        "default_provider": default.map(|provider| provider.provider_id.as_str()),
         "provider_count": state.config.providers.len()
     }))
 }
@@ -427,12 +532,18 @@ async fn providers(State(state): State<AppState>) -> Json<Value> {
         .map(|provider| ProviderInfo {
             id: provider.id.clone(),
             name: provider.name.clone(),
+            ai_coder: provider.ai_coder.clone(),
+            ai_coder_name: provider.ai_coder_name.clone(),
+            provider: provider.provider_id.clone(),
             kind: provider.kind.as_str().into(),
             default_model: provider.default_model.clone(),
             is_default: provider.id == state.config.default_provider,
         })
         .collect::<Vec<_>>();
-    Json(json!({ "providers": providers, "default_provider": state.config.default_provider }))
+    let default = state.config.provider(&state.config.default_provider);
+    Json(
+        json!({ "providers": providers, "default_ai_coder": state.config.default_coder, "default_provider": default.map(|provider| provider.provider_id.as_str()) }),
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -442,6 +553,8 @@ pub struct ModelInfo {
     pub name: String,
     pub provider: String,
     pub provider_name: String,
+    pub ai_coder: String,
+    pub ai_coder_name: String,
 }
 
 async fn models(State(state): State<AppState>) -> Json<Value> {
@@ -475,21 +588,24 @@ async fn models(State(state): State<AppState>) -> Json<Value> {
         };
         for (id, name) in discovered {
             all_models.push(ModelInfo {
-                key: format!("{}::{id}", provider.id),
+                key: format!("{}/{}/{id}", provider.ai_coder, provider.provider_id),
                 id,
                 name,
-                provider: provider.id.clone(),
+                provider: provider.provider_id.clone(),
                 provider_name: provider.name.clone(),
+                ai_coder: provider.ai_coder.clone(),
+                ai_coder_name: provider.ai_coder_name.clone(),
             });
         }
     }
     all_models.sort_by(|a, b| {
-        a.provider_name
-            .cmp(&b.provider_name)
+        a.ai_coder_name
+            .cmp(&b.ai_coder_name)
+            .then(a.provider_name.cmp(&b.provider_name))
             .then(a.name.cmp(&b.name))
     });
     Json(
-        json!({ "models": all_models, "provider_errors": provider_errors, "default_provider": state.config.default_provider }),
+        json!({ "models": all_models, "provider_errors": provider_errors, "default_ai_coder": state.config.default_coder, "default_provider": state.config.provider(&state.config.default_provider).map(|provider| provider.provider_id.as_str()) }),
     )
 }
 
@@ -538,6 +654,8 @@ fn normalize_models(kind: ProviderKind, payload: &Value) -> Vec<(String, String)
 #[serde(deny_unknown_fields)]
 pub struct ChatRequest {
     #[serde(default)]
+    pub ai_coder: Option<String>,
+    #[serde(default)]
     pub provider: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
@@ -578,26 +696,59 @@ async fn chat(
     if let Err(message) = validate_chat(&request) {
         return json_error(StatusCode::BAD_REQUEST, "invalid_request", message);
     }
-    let (provider_id, embedded_model) = request
-        .model
+    let embedded = request.model.as_deref().and_then(parse_model_path);
+    if embedded.is_some_and(|(coder, provider, _)| {
+        request
+            .ai_coder
+            .as_deref()
+            .is_some_and(|value| value != coder)
+            || request
+                .provider
+                .as_deref()
+                .is_some_and(|value| value != provider)
+    }) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "conflicting_route",
+            "ai_coder/provider fields conflict with the canonical model path",
+        );
+    }
+    let requested_coder = request
+        .ai_coder
         .as_deref()
-        .and_then(|model| model.split_once("::"))
-        .map_or((None, None), |(provider, model)| {
-            (Some(provider), Some(model))
-        });
+        .or_else(|| embedded.map(|(coder, _, _)| coder))
+        .unwrap_or(&state.config.default_coder);
     let requested_provider = request
         .provider
         .as_deref()
-        .or(provider_id)
-        .unwrap_or(&state.config.default_provider);
-    let Some(provider) = state.config.provider(requested_provider) else {
+        .or_else(|| embedded.map(|(_, provider, _)| provider));
+    let provider = state
+        .config
+        .providers
+        .iter()
+        .find(|candidate| {
+            candidate.ai_coder == requested_coder
+                && requested_provider
+                    .is_none_or(|value| candidate.provider_id == value || candidate.id == value)
+        })
+        .or_else(|| {
+            (requested_coder == state.config.default_coder && requested_provider.is_none())
+                .then(|| state.config.provider(&state.config.default_provider))
+                .flatten()
+        });
+    let Some(provider) = provider else {
         return json_error(
             StatusCode::BAD_REQUEST,
-            "unknown_provider",
-            format!("Provider `{requested_provider}` is not configured"),
+            "unknown_route",
+            format!(
+                "AI coder/provider route `{}/{}` is not configured",
+                requested_coder,
+                requested_provider.unwrap_or("*")
+            ),
         );
     };
-    let model = embedded_model
+    let model = embedded
+        .map(|(_, _, model)| model)
         .or(request.model.as_deref())
         .unwrap_or(&provider.default_model);
     if model.trim().is_empty()
@@ -802,6 +953,11 @@ fn openai_delta(text: &str) -> String {
         .to_string()
 }
 fn validate_chat(request: &ChatRequest) -> Result<(), &'static str> {
+    if let Some(ai_coder) = &request.ai_coder
+        && (!valid_provider_id(ai_coder) || ai_coder.chars().any(char::is_control))
+    {
+        return Err("ai_coder is invalid");
+    }
     if request.messages.is_empty() {
         return Err("messages must contain at least one message");
     }
@@ -892,6 +1048,9 @@ mod tests {
         ProviderConfig {
             id: id.into(),
             name: id.into(),
+            ai_coder: "hermes".into(),
+            ai_coder_name: "Hermes".into(),
+            provider_id: id.into(),
             kind,
             base_url: "https://example.test/v1".into(),
             default_model: "test-model".into(),
@@ -900,6 +1059,7 @@ mod tests {
     }
     fn request() -> ChatRequest {
         ChatRequest {
+            ai_coder: None,
             provider: None,
             model: None,
             temperature: None,
@@ -919,6 +1079,7 @@ mod tests {
                 provider("openai", ProviderKind::Openai),
                 provider("local", ProviderKind::OpenaiCompatible),
             ],
+            default_coder: "hermes".into(),
             default_provider: "local".into(),
         };
         assert!(config.validate().is_ok());
@@ -932,6 +1093,20 @@ mod tests {
         assert!(matches!(
             duplicate.validate(),
             Err(ConfigError::DuplicateProvider(_))
+        ));
+        let mut duplicate_route_provider = provider("second", ProviderKind::OpenaiCompatible);
+        duplicate_route_provider.provider_id = "openai".into();
+        let duplicate_route = Config {
+            providers: vec![
+                provider("openai", ProviderKind::Openai),
+                duplicate_route_provider,
+            ],
+            default_provider: "openai".into(),
+            ..config
+        };
+        assert!(matches!(
+            duplicate_route.validate(),
+            Err(ConfigError::DuplicateRoute(route)) if route == "hermes/openai"
         ));
     }
     #[test]
@@ -1056,5 +1231,13 @@ mod tests {
     #[test]
     fn encodes_model_paths() {
         assert_eq!(encode_path_segment("gemini/foo bar"), "gemini%2Ffoo%20bar");
+        assert_eq!(
+            parse_model_path("hermes/z.ai/glm-5.2"),
+            Some(("hermes", "z.ai", "glm-5.2"))
+        );
+        assert_eq!(
+            parse_model_path("codex/codex/gpt-5.6"),
+            Some(("codex", "codex", "gpt-5.6"))
+        );
     }
 }

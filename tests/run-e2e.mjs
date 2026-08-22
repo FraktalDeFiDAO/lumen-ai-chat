@@ -45,7 +45,8 @@ try {
 
   const backend = start('cargo', ['run', '--manifest-path', 'backend/Cargo.toml'], {
     APP_BIND: '127.0.0.1:41788',
-    AI_DEFAULT_PROVIDER: 'ollama',
+    AI_DEFAULT_CODER: 'hermes',
+    AI_DEFAULT_PROVIDER: 'openai',
     OPENAI_API_KEY: 'test-openai-key',
     OPENAI_BASE_URL: 'http://127.0.0.1:41800/v1',
     OPENAI_MODEL: 'openai-test',
@@ -57,6 +58,10 @@ try {
     GEMINI_MODEL: 'gemini-test',
     OLLAMA_BASE_URL: 'http://127.0.0.1:41800/ollama/v1',
     OLLAMA_MODEL: 'ollama-test',
+    AI_ENDPOINTS_JSON: JSON.stringify([
+      { id: 'z-ai', name: 'Z.AI', ai_coder: 'hermes', ai_coder_name: 'Hermes', provider: 'z.ai', base_url: 'http://127.0.0.1:41800/zai/v1', model: 'glm-5.2' },
+      { id: 'codex', name: 'Codex', base_url: 'http://127.0.0.1:41800/codex/v1', model: 'gpt-5.6' },
+    ]),
   })
   await waitFor('http://127.0.0.1:41788/api/health', backend)
 

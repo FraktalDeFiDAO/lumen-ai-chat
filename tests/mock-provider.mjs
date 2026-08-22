@@ -27,6 +27,14 @@ const server = createServer((request, response) => {
     json(response, { data: [{ id: 'ollama-test', name: 'ollama-test' }] })
     return
   }
+  if (request.method === 'GET' && request.url === '/zai/v1/models') {
+    json(response, { data: [{ id: 'glm-5.2', name: 'GLM 5.2' }] })
+    return
+  }
+  if (request.method === 'GET' && request.url === '/codex/v1/models') {
+    json(response, { data: [{ id: 'gpt-5.6', name: 'GPT 5.6' }] })
+    return
+  }
 
   if (request.method === 'POST') {
     let body = ''
@@ -49,7 +57,7 @@ const server = createServer((request, response) => {
         ])
         return
       }
-      if (request.url === '/v1/chat/completions' || request.url === '/ollama/v1/chat/completions') {
+      if (request.url === '/v1/chat/completions' || request.url === '/ollama/v1/chat/completions' || request.url === '/zai/v1/chat/completions' || request.url === '/codex/v1/chat/completions') {
         const last = payload.messages?.at(-1)?.content ?? ''
         const events = chunks(`Mock response received: ${last.slice(0, 80)}`).map(token => `data: ${JSON.stringify({ choices: [{ delta: { content: token } }] })}\n\n`)
         events.push('data: [DONE]\n\n')

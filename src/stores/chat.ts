@@ -100,11 +100,11 @@ export const useChatStore = defineStore('chat', () => {
     try {
       const response = await fetch('/api/models')
       if (!response.ok) throw new Error(`Unable to load models (${response.status})`)
-      const data = await response.json() as { models?: ChatModel[]; default_provider?: string; provider_errors?: Array<{ provider?: string; message?: string }> }
-      models.value = Array.isArray(data.models) ? data.models.filter(model => model?.id && model?.key && model?.provider && model?.name) : []
+      const data = await response.json() as { models?: ChatModel[]; default_ai_coder?: string; default_provider?: string; provider_errors?: Array<{ provider?: string; message?: string }> }
+      models.value = Array.isArray(data.models) ? data.models.filter(model => model?.id && model?.key && model?.ai_coder && model?.provider && model?.name) : []
       if (data.provider_errors?.length) modelsError.value = `${data.provider_errors.length} provider${data.provider_errors.length === 1 ? '' : 's'} unavailable; fallback models are shown.`
       if (!selectedModel.value || !models.value.some(model => model.key === selectedModel.value)) {
-        selectedModel.value = models.value.find(model => model.provider === data.default_provider)?.key ?? models.value[0]?.key ?? ''
+        selectedModel.value = models.value.find(model => model.ai_coder === data.default_ai_coder && model.provider === data.default_provider)?.key ?? models.value[0]?.key ?? ''
       }
     } catch (error) {
       modelsError.value = error instanceof Error ? error.message : 'Unable to load models.'
@@ -125,7 +125,7 @@ export const useChatStore = defineStore('chat', () => {
         headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
         signal: currentController.signal,
         body: JSON.stringify({
-          ...(selected ? { provider: selected.provider, model: selected.id } : {}),
+          ...(selected ? { ai_coder: selected.ai_coder, provider: selected.provider, model: selected.key } : {}),
           temperature: preferences.settings.temperature,
           max_tokens: preferences.settings.maxTokens,
           messages: [
