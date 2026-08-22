@@ -40,13 +40,33 @@ function stopAll() {
 }
 
 try {
+  const configGuards = start('node', ['tests/config-guards.mjs'])
+  await new Promise((resolve, reject) => {
+    configGuards.once('exit', code => code === 0 ? resolve() : reject(new Error(logs.get(configGuards)?.join('') || `Configuration guards exited ${code}`)))
+    configGuards.once('error', reject)
+  })
+  process.stdout.write(logs.get(configGuards)?.join('') ?? '')
+
   const mock = start('node', ['tests/mock-provider.mjs'])
   await waitFor('http://127.0.0.1:41800/v1/models', mock, 10_000)
 
   const backend = start('cargo', ['run', '--manifest-path', 'backend/Cargo.toml'], {
     APP_BIND: '127.0.0.1:41788',
     AI_DEFAULT_CODER: 'hermes',
-    AI_DEFAULT_PROVIDER: 'openai',
+    AI_DEFAULT_PROVIDER: 'z.ai',
+    AI_CODER_WORKSPACE: cwd,
+    AI_CODER_HERMES_BIN: `${cwd}tests/mock-coder.mjs`,
+    AI_CODER_OPENCODE_BIN: `${cwd}tests/mock-coder.mjs`,
+    AI_CODER_KILOCODE_BIN: `${cwd}tests/mock-coder.mjs`,
+    AI_CODER_CLAUDE_BIN: `${cwd}tests/mock-coder.mjs`,
+    AI_CODER_CODEX_BIN: `${cwd}tests/mock-coder.mjs`,
+    AI_CODER_ROUTES_JSON: JSON.stringify([
+      { coder: 'hermes', provider: 'z.ai', provider_name: 'Z.AI', model: 'glm-5.2', model_name: 'GLM 5.2' },
+      { coder: 'opencode', provider: 'openrouter', provider_name: 'OpenRouter', model: 'qwen/test' },
+      { coder: 'kilocode', provider: 'kilocode', provider_name: 'KiloCode', model: 'kilo-test' },
+      { coder: 'claude', provider: 'claude', provider_name: 'Claude', model: 'sonnet-test' },
+      { coder: 'codex', provider: 'codex', provider_name: 'Codex', model: 'gpt-test' },
+    ]),
     OPENAI_API_KEY: 'test-openai-key',
     OPENAI_BASE_URL: 'http://127.0.0.1:41800/v1',
     OPENAI_MODEL: 'openai-test',
@@ -58,10 +78,7 @@ try {
     GEMINI_MODEL: 'gemini-test',
     OLLAMA_BASE_URL: 'http://127.0.0.1:41800/ollama/v1',
     OLLAMA_MODEL: 'ollama-test',
-    AI_ENDPOINTS_JSON: JSON.stringify([
-      { id: 'z-ai', name: 'Z.AI', ai_coder: 'hermes', ai_coder_name: 'Hermes', provider: 'z.ai', base_url: 'http://127.0.0.1:41800/zai/v1', model: 'glm-5.2' },
-      { id: 'codex', name: 'Codex', base_url: 'http://127.0.0.1:41800/codex/v1', model: 'gpt-5.6' },
-    ]),
+    OLLAMA_ENABLED: 'true',
   })
   await waitFor('http://127.0.0.1:41788/api/health', backend)
 

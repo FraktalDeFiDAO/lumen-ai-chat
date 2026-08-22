@@ -1,4 +1,9 @@
-use std::{collections::HashSet, env, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet, env, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc,
+    time::Duration,
+};
+
+mod coders;
 
 use async_stream::stream;
 use axum::{
@@ -15,6 +20,7 @@ use reqwest::{Client, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
+use tokio::sync::Semaphore;
 use tower_http::{
     cors::{Any, CorsLayer},
     limit::RequestBodyLimitLayer,
@@ -28,6 +34,8 @@ const MAX_TOTAL_CONTENT_BYTES: usize = 768 * 1024;
 const MAX_MODEL_BYTES: usize = 200;
 const MAX_ERROR_BYTES: usize = 64 * 1024;
 const MAX_CUSTOM_PROVIDERS: usize = 20;
+const DEFAULT_CODER_TIMEOUT_SECONDS: u64 = 300;
+const DEFAULT_CODER_CONCURRENCY: usize = 2;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -106,8 +114,14 @@ impl ProviderConfig {
 pub struct Config {
     pub bind: SocketAddr,
     pub providers: Vec<ProviderConfig>,
+    pub coders: Vec<coders::CoderRoute>,
     pub default_coder: String,
     pub default_provider: String,
+    pub coder_workspace: PathBuf,
+    pub coder_timeout: Duration,
+    pub coder_allow_writes: bool,
+    pub coder_allow_remote: bool,
+    pub coder_max_concurrency: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,9 +164,17 @@ pub enum ConfigError {
     #[error("AI_DEFAULT_CODER does not name a configured AI coder: {0}")]
     InvalidDefaultCoder(String),
     #[error(
-        "no AI providers are configured; set a hosted provider credential or explicitly enable a custom/local endpoint"
+        "no AI backends are configured; install an AI coder CLI or configure a hosted provider"
     )]
     NoProviders,
+    #[error("AI coder configuration is invalid: {0}")]
+    InvalidCoderConfig(String),
+    #[error("AI_CODER_WORKSPACE must name an existing directory: {0}")]
+    InvalidCoderWorkspace(String),
+    #[error(
+        "native AI coders require a loopback APP_BIND unless AI_CODER_ALLOW_REMOTE=true is explicitly set"
+    )]
+    RemoteCoderBind,
 }
 
 impl Config {
@@ -176,8 +198,8 @@ impl Config {
             providers.push(ProviderConfig {
                 id: "openai".into(),
                 name: "OpenAI".into(),
-                ai_coder: "hermes".into(),
-                ai_coder_name: "Hermes".into(),
+                ai_coder: "api".into(),
+                ai_coder_name: "Direct API".into(),
                 provider_id: "openai".into(),
                 kind: ProviderKind::Openai,
                 base_url: env::var("OPENAI_BASE_URL")
@@ -207,8 +229,8 @@ impl Config {
             providers.push(ProviderConfig {
                 id: "anthropic".into(),
                 name: "Anthropic".into(),
-                ai_coder: "hermes".into(),
-                ai_coder_name: "Hermes".into(),
+                ai_coder: "api".into(),
+                ai_coder_name: "Direct API".into(),
                 provider_id: "anthropic".into(),
                 kind: ProviderKind::Anthropic,
                 base_url: env::var("ANTHROPIC_BASE_URL")
@@ -241,8 +263,8 @@ impl Config {
             providers.push(ProviderConfig {
                 id: "gemini".into(),
                 name: "Google Gemini".into(),
-                ai_coder: "hermes".into(),
-                ai_coder_name: "Hermes".into(),
+                ai_coder: "api".into(),
+                ai_coder_name: "Direct API".into(),
                 provider_id: "gemini".into(),
                 kind: ProviderKind::Gemini,
                 base_url: env::var("GEMINI_BASE_URL")
@@ -266,17 +288,13 @@ impl Config {
         }
 
         let ollama_is_legacy = legacy_kind == Some(ProviderKind::OpenaiCompatible);
-        let ollama_enabled = ollama_is_legacy
-            || env_flag("OLLAMA_ENABLED")
-            || env::var_os("OLLAMA_BASE_URL").is_some()
-            || env::var_os("OLLAMA_MODEL").is_some()
-            || env::var_os("OLLAMA_API_KEY").is_some();
+        let ollama_enabled = ollama_is_legacy || env_flag("OLLAMA_ENABLED");
         if ollama_enabled {
             providers.push(ProviderConfig {
                 id: "ollama".into(),
                 name: "Ollama / Local".into(),
-                ai_coder: "ollama".into(),
-                ai_coder_name: "Ollama".into(),
+                ai_coder: "api".into(),
+                ai_coder_name: "Direct API".into(),
                 provider_id: "ollama".into(),
                 kind: ProviderKind::OpenaiCompatible,
                 base_url: env::var("OLLAMA_BASE_URL")
@@ -302,11 +320,15 @@ impl Config {
             }
             for item in custom {
                 let api_key = item.api_key_env.as_deref().and_then(env_key);
-                let ai_coder = item.ai_coder.unwrap_or_else(|| item.id.clone());
-                let ai_coder_name = item
-                    .ai_coder_name
-                    .unwrap_or_else(|| display_identifier(&ai_coder));
-                let provider_id = item.provider.unwrap_or_else(|| ai_coder.clone());
+                let ai_coder = item.ai_coder.unwrap_or_else(|| "api".into());
+                let ai_coder_name = item.ai_coder_name.unwrap_or_else(|| {
+                    if ai_coder == "api" {
+                        "Direct API".into()
+                    } else {
+                        display_identifier(&ai_coder)
+                    }
+                });
+                let provider_id = item.provider.unwrap_or_else(|| item.id.clone());
                 providers.push(ProviderConfig {
                     name: item.name.unwrap_or_else(|| provider_id.clone()),
                     id: item.id,
@@ -321,50 +343,95 @@ impl Config {
             }
         }
 
-        if providers.is_empty() {
+        let coders = coders::discover_routes().map_err(ConfigError::InvalidCoderConfig)?;
+        if providers.is_empty() && coders.is_empty() {
             return Err(ConfigError::NoProviders);
         }
         let default_coder = env::var("AI_DEFAULT_CODER").unwrap_or_else(|_| {
             if legacy_kind == Some(ProviderKind::OpenaiCompatible) {
-                "ollama".into()
+                "api".into()
             } else {
                 "hermes".into()
             }
         });
         let provider_hint = env::var("AI_DEFAULT_PROVIDER").ok();
-        let default_provider = providers
+        let default_provider = coders
             .iter()
-            .find(|provider| {
-                provider.ai_coder == default_coder
+            .find(|route| {
+                route.kind.id() == default_coder
                     && provider_hint
                         .as_ref()
-                        .is_none_or(|hint| provider.provider_id == *hint || provider.id == *hint)
+                        .is_none_or(|hint| route.provider == *hint)
             })
-            .map(|provider| provider.id.clone())
+            .map(|route| route.provider.clone())
+            .or_else(|| {
+                providers
+                    .iter()
+                    .find(|provider| {
+                        provider.ai_coder == default_coder
+                            && provider_hint.as_ref().is_none_or(|hint| {
+                                provider.provider_id == *hint || provider.id == *hint
+                            })
+                    })
+                    .map(|provider| provider.provider_id.clone())
+            })
             .ok_or_else(|| {
                 provider_hint.clone().map_or_else(
                     || ConfigError::InvalidDefaultCoder(default_coder.clone()),
                     ConfigError::InvalidDefaultProvider,
                 )
             })?;
+        let workspace_text = env::var("AI_CODER_WORKSPACE").ok();
+        let coder_workspace = workspace_text
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+            .canonicalize()
+            .map_err(|_| {
+                ConfigError::InvalidCoderWorkspace(workspace_text.unwrap_or_else(|| ".".into()))
+            })?;
+        if !coder_workspace.is_dir() {
+            return Err(ConfigError::InvalidCoderWorkspace(
+                coder_workspace.display().to_string(),
+            ));
+        }
+        let coder_timeout = Duration::from_secs(
+            env::var("AI_CODER_TIMEOUT_SECONDS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|value| (1..=900).contains(value))
+                .unwrap_or(DEFAULT_CODER_TIMEOUT_SECONDS),
+        );
+        let coder_max_concurrency = env::var("AI_CODER_MAX_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| (1..=16).contains(value))
+            .unwrap_or(DEFAULT_CODER_CONCURRENCY);
         let config = Self {
             bind,
             providers,
+            coders,
             default_coder,
             default_provider,
+            coder_workspace,
+            coder_timeout,
+            coder_allow_writes: env_flag("AI_CODER_ALLOW_WRITES"),
+            coder_allow_remote: env_flag("AI_CODER_ALLOW_REMOTE"),
+            coder_max_concurrency,
         };
         config.validate()?;
         Ok(config)
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.providers.is_empty() {
-            return Err(ConfigError::InvalidDefaultProvider(
-                self.default_provider.clone(),
-            ));
+        if self.providers.is_empty() && self.coders.is_empty() {
+            return Err(ConfigError::NoProviders);
+        }
+        if !self.coders.is_empty() && !self.bind.ip().is_loopback() && !self.coder_allow_remote {
+            return Err(ConfigError::RemoteCoderBind);
         }
         let mut ids = HashSet::new();
-        let mut routes = HashSet::new();
+        let mut provider_routes = HashSet::new();
         for provider in &self.providers {
             if !valid_provider_id(&provider.id)
                 || !valid_provider_id(&provider.ai_coder)
@@ -376,7 +443,7 @@ impl Config {
                 return Err(ConfigError::DuplicateProvider(provider.id.clone()));
             }
             let route = format!("{}/{}", provider.ai_coder, provider.provider_id);
-            if !routes.insert(route.clone()) {
+            if !provider_routes.insert(route.clone()) {
                 return Err(ConfigError::DuplicateRoute(route));
             }
             let url = reqwest::Url::parse(&provider.base_url)
@@ -391,21 +458,52 @@ impl Config {
                 return Err(ConfigError::InvalidModel(provider.id.clone()));
             }
         }
-        if !ids.contains(&self.default_provider) {
-            return Err(ConfigError::InvalidDefaultProvider(
-                self.default_provider.clone(),
-            ));
+        let mut coder_routes = HashSet::new();
+        for route in &self.coders {
+            if !valid_provider_id(route.kind.id())
+                || !valid_provider_id(&route.provider)
+                || route.model.trim().is_empty()
+                || route.model.len() > MAX_MODEL_BYTES
+                || route.model.chars().any(char::is_control)
+            {
+                return Err(ConfigError::InvalidCoderConfig(route.key()));
+            }
+            if provider_routes.contains(&format!("{}/{}", route.kind.id(), route.provider))
+                || !coder_routes.insert(route.key())
+            {
+                return Err(ConfigError::DuplicateRoute(route.key()));
+            }
         }
-        if !self.providers.iter().any(|provider| {
-            provider.ai_coder == self.default_coder && provider.id == self.default_provider
-        }) {
+        if self
+            .coder_route(&self.default_coder, &self.default_provider, None)
+            .is_none()
+            && self
+                .provider_route(&self.default_coder, &self.default_provider)
+                .is_none()
+        {
             return Err(ConfigError::InvalidDefaultCoder(self.default_coder.clone()));
         }
         Ok(())
     }
 
-    fn provider(&self, id: &str) -> Option<&ProviderConfig> {
-        self.providers.iter().find(|provider| provider.id == id)
+    fn provider_route(&self, coder: &str, provider: &str) -> Option<&ProviderConfig> {
+        self.providers.iter().find(|candidate| {
+            candidate.ai_coder == coder
+                && (candidate.provider_id == provider || candidate.id == provider)
+        })
+    }
+
+    fn coder_route(
+        &self,
+        coder: &str,
+        provider: &str,
+        model: Option<&str>,
+    ) -> Option<&coders::CoderRoute> {
+        self.coders.iter().find(|route| {
+            route.kind.id() == coder
+                && route.provider == provider
+                && model.is_none_or(|value| route.model == value)
+        })
     }
 }
 
@@ -459,10 +557,12 @@ fn encode_path_segment(value: &str) -> String {
 struct AppState {
     config: Arc<Config>,
     client: Client,
+    coder_slots: Arc<Semaphore>,
 }
 
 pub fn build_router(config: Config) -> Result<Router, BuildError> {
     config.validate()?;
+    let coder_slots = Arc::new(Semaphore::new(config.coder_max_concurrency));
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .read_timeout(Duration::from_secs(120))
@@ -476,10 +576,12 @@ pub fn build_router(config: Config) -> Result<Router, BuildError> {
     let state = AppState {
         config: Arc::new(config),
         client,
+        coder_slots,
     };
     Ok(Router::new()
         .route("/api/health", get(health))
         .route("/api/providers", get(providers))
+        .route("/api/coders", get(coder_statuses))
         .route("/api/models", get(models))
         .route("/api/chat", post(chat))
         .fallback(not_found)
@@ -516,12 +618,12 @@ struct ProviderInfo {
 }
 
 async fn health(State(state): State<AppState>) -> Json<Value> {
-    let default = state.config.provider(&state.config.default_provider);
     Json(json!({
         "status": "ok",
         "default_ai_coder": state.config.default_coder,
-        "default_provider": default.map(|provider| provider.provider_id.as_str()),
-        "provider_count": state.config.providers.len()
+        "default_provider": state.config.default_provider,
+        "provider_count": state.config.providers.len(),
+        "coder_count": state.config.coders.len()
     }))
 }
 async fn providers(State(state): State<AppState>) -> Json<Value> {
@@ -537,13 +639,24 @@ async fn providers(State(state): State<AppState>) -> Json<Value> {
             provider: provider.provider_id.clone(),
             kind: provider.kind.as_str().into(),
             default_model: provider.default_model.clone(),
-            is_default: provider.id == state.config.default_provider,
+            is_default: provider.ai_coder == state.config.default_coder
+                && provider.provider_id == state.config.default_provider,
         })
         .collect::<Vec<_>>();
-    let default = state.config.provider(&state.config.default_provider);
     Json(
-        json!({ "providers": providers, "default_ai_coder": state.config.default_coder, "default_provider": default.map(|provider| provider.provider_id.as_str()) }),
+        json!({ "providers": providers, "default_ai_coder": state.config.default_coder, "default_provider": state.config.default_provider }),
     )
+}
+
+async fn coder_statuses(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({
+        "coders": coders::statuses(&state.config.coders),
+        "allow_writes": state.config.coder_allow_writes,
+        "allow_remote": state.config.coder_allow_remote,
+        "workspace": state.config.coder_workspace,
+        "timeout_seconds": state.config.coder_timeout.as_secs(),
+        "max_concurrency": state.config.coder_max_concurrency,
+    }))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -565,7 +678,20 @@ async fn models(State(state): State<AppState>) -> Json<Value> {
             (provider, result)
         }
     });
-    let mut all_models = Vec::new();
+    let mut all_models = state
+        .config
+        .coders
+        .iter()
+        .map(|route| ModelInfo {
+            id: route.model.clone(),
+            key: route.key(),
+            name: route.model_name.clone(),
+            provider: route.provider.clone(),
+            provider_name: route.provider_name.clone(),
+            ai_coder: route.kind.id().into(),
+            ai_coder_name: route.kind.display_name().into(),
+        })
+        .collect::<Vec<_>>();
     let mut provider_errors = Vec::new();
     for (provider, result) in join_all(tasks).await {
         let discovered = match result {
@@ -605,7 +731,7 @@ async fn models(State(state): State<AppState>) -> Json<Value> {
             .then(a.name.cmp(&b.name))
     });
     Json(
-        json!({ "models": all_models, "provider_errors": provider_errors, "default_ai_coder": state.config.default_coder, "default_provider": state.config.provider(&state.config.default_provider).map(|provider| provider.provider_id.as_str()) }),
+        json!({ "models": all_models, "provider_errors": provider_errors, "default_ai_coder": state.config.default_coder, "default_provider": state.config.default_provider }),
     )
 }
 
@@ -721,21 +847,43 @@ async fn chat(
     let requested_provider = request
         .provider
         .as_deref()
-        .or_else(|| embedded.map(|(_, provider, _)| provider));
-    let provider = state
-        .config
-        .providers
-        .iter()
-        .find(|candidate| {
-            candidate.ai_coder == requested_coder
-                && requested_provider
-                    .is_none_or(|value| candidate.provider_id == value || candidate.id == value)
-        })
+        .or_else(|| embedded.map(|(_, provider, _)| provider))
         .or_else(|| {
-            (requested_coder == state.config.default_coder && requested_provider.is_none())
-                .then(|| state.config.provider(&state.config.default_provider))
-                .flatten()
+            (requested_coder == state.config.default_coder)
+                .then_some(state.config.default_provider.as_str())
         });
+    let requested_model = embedded
+        .map(|(_, _, model)| model)
+        .or(request.model.as_deref());
+    if let Some(provider_id) = requested_provider
+        && let Some(route) = state
+            .config
+            .coder_route(requested_coder, provider_id, requested_model)
+    {
+        let permit = match state.coder_slots.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => return sse_error("All AI coder execution slots are busy; try again shortly"),
+        };
+        let prompt = coder_prompt(&request.messages, state.config.coder_allow_writes);
+        let result = coders::execute(
+            route,
+            &prompt,
+            &state.config.coder_workspace,
+            state.config.coder_allow_writes,
+            state.config.coder_timeout,
+        )
+        .await;
+        drop(permit);
+        return match result {
+            Ok(execution) => sse_text(&execution.output),
+            Err(coders::CoderError::Timeout { .. }) => sse_error("The selected AI coder timed out"),
+            Err(_) => {
+                sse_error("The selected AI coder failed; verify its native CLI authentication")
+            }
+        };
+    }
+    let provider = requested_provider
+        .and_then(|provider_id| state.config.provider_route(requested_coder, provider_id));
     let Some(provider) = provider else {
         return json_error(
             StatusCode::BAD_REQUEST,
@@ -747,10 +895,7 @@ async fn chat(
             ),
         );
     };
-    let model = embedded
-        .map(|(_, _, model)| model)
-        .or(request.model.as_deref())
-        .unwrap_or(&provider.default_model);
+    let model = requested_model.unwrap_or(&provider.default_model);
     if model.trim().is_empty()
         || model.len() > MAX_MODEL_BYTES
         || model.chars().any(char::is_control)
@@ -1011,12 +1156,43 @@ async fn limited_error_body(response: reqwest::Response) -> String {
 fn error_payload(message: &str) -> Value {
     json!({"error": {"type": "upstream_error", "message": message}})
 }
+fn coder_prompt(messages: &[ChatMessage], allow_writes: bool) -> String {
+    let mut prompt = String::from(
+        "You are responding through the Lumen AI chat interface. Never read or expose .env files, credentials, tokens, or authentication data. Do not commit, push, or rewrite git history. ",
+    );
+    if allow_writes {
+        prompt.push_str("Workspace edits are explicitly enabled for this execution.\n\n");
+    } else {
+        prompt.push_str(
+            "This is a read-only execution: do not modify files or run destructive commands.\n\n",
+        );
+    }
+    for message in messages {
+        let role = match message.role {
+            Role::System => "SYSTEM",
+            Role::User => "USER",
+            Role::Assistant => "ASSISTANT",
+        };
+        prompt.push_str(role);
+        prompt.push_str(":\n");
+        prompt.push_str(&message.content);
+        prompt.push_str("\n\n");
+    }
+    prompt.push_str("ASSISTANT:\n");
+    prompt
+}
 fn json_error(status: StatusCode, kind: &str, message: impl Into<String>) -> Response {
     (
         status,
         Json(json!({"error": {"type": kind, "message": message.into()}})),
     )
         .into_response()
+}
+fn sse_text(text: &str) -> Response {
+    let body = format!("data: {}\n\ndata: [DONE]\n\n", openai_delta(text));
+    let mut response = Response::new(Body::from(body));
+    add_sse_headers(response.headers_mut());
+    response
 }
 fn sse_error(message: &str) -> Response {
     let body = format!("data: {}\n\ndata: [DONE]\n\n", error_payload(message));
@@ -1079,10 +1255,32 @@ mod tests {
                 provider("openai", ProviderKind::Openai),
                 provider("local", ProviderKind::OpenaiCompatible),
             ],
+            coders: Vec::new(),
             default_coder: "hermes".into(),
             default_provider: "local".into(),
+            coder_workspace: PathBuf::from("."),
+            coder_timeout: Duration::from_secs(30),
+            coder_allow_writes: false,
+            coder_allow_remote: false,
+            coder_max_concurrency: 2,
         };
         assert!(config.validate().is_ok());
+        let mut remote = config.clone();
+        remote.coders.push(coders::CoderRoute {
+            kind: coders::CoderKind::Codex,
+            provider: "codex".into(),
+            provider_name: "Codex".into(),
+            model: "default".into(),
+            model_name: "Default".into(),
+            executable: PathBuf::from("/usr/bin/false"),
+        });
+        remote.bind = "0.0.0.0:41788".parse().unwrap();
+        assert!(matches!(
+            remote.validate(),
+            Err(ConfigError::RemoteCoderBind)
+        ));
+        remote.coder_allow_remote = true;
+        assert!(remote.validate().is_ok());
         let duplicate = Config {
             providers: vec![
                 provider("same", ProviderKind::Openai),

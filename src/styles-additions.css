@@ -23,6 +23,15 @@
 .model-select-label select:hover:not(:disabled) { background:#f0efeb;color:#45433e; }
 .model-select-label select:disabled { opacity:.7; }
 .send-button:disabled { cursor:default; }
+.coder-status-list { align-items:stretch; }
+.coder-status { display:flex;align-items:center;justify-content:space-between;gap:20px;padding:12px 0;border-bottom:1px solid #ece9e2; }
+.coder-status:last-child { border-bottom:0; }
+.coder-status>span:first-child { display:flex;flex-direction:column;gap:3px; }
+.status-pill { padding:4px 8px;border-radius:999px;font-size:10px;font-weight:650;white-space:nowrap; }
+.status-pill.installed_unverified { background:#e6f1e8;color:#356544; }
+.status-pill.unavailable { background:#efede8;color:#77736b; }
+.coder-safety,.coder-error { color:#77736b;font-size:12px;line-height:1.5; }
+.coder-error { color:#a43d31; }
 .message-actions { opacity:1; }
 .message-actions button.selected { background:#eee1d9;color:#a65333; }
 .message-actions button:disabled { opacity:.45;cursor:default; }
@@ -45,4 +54,5 @@
 .theme-dark .app-shell,.theme-dark .main-panel,.theme-dark .welcome-composer,.theme-dark .conversation-composer { background:#23221f; }
 .theme-dark .sidebar { background:#292824;border-color:#403e38; }.theme-dark .brand,.theme-dark .profile-row strong { color:#f0eee8; }.theme-dark .new-chat,.theme-dark .composer-shell { background:#302f2b;border-color:#4a4841;color:#eee; }.theme-dark .search-input,.theme-dark .history-row,.theme-dark .profile-row { color:#bdb9af; }.theme-dark .search-input:hover,.theme-dark .search-input:focus,.theme-dark .history-row:hover,.theme-dark .history-row.active,.theme-dark .profile-row:hover { background:#393833;color:#fff; }.theme-dark .sidebar-footer,.theme-dark .topbar { border-color:#403e38; }.theme-dark .topbar { background:rgb(35 34 31 / .9);color:#eee; }.theme-dark .icon-button:hover { background:#3a3934;color:#fff; }
 .theme-dark .welcome h1,.theme-dark .message-content { color:#eee; }.theme-dark .welcome-inner>p,.theme-dark .disclaimer { color:#99958d; }.theme-dark .suggestion-card { background:#2d2c28;border-color:#46443e; }.theme-dark .suggestion-card:hover { background:#34332e;border-color:#5a574f; }.theme-dark .suggestion-card strong { color:#e5e2da; }.theme-dark .composer-shell textarea { color:#eee; }.theme-dark .model-select-label select,.theme-dark .composer-icon { color:#b7b3aa; }.theme-dark .message.user .message-body { background:#3a3934;color:#eee; }.theme-dark .message-actions button:hover,.theme-dark .model-select-label select:hover:not(:disabled),.theme-dark .composer-icon:hover { background:#3b3934;color:#fff; }.theme-dark .attachment-chip { background:#3a3934;border-color:#504e47;color:#ddd9d0; }.theme-dark .overflow-menu { background:#302f2b;border-color:#4a4841; }.theme-dark .settings-page { background:#23221f;color:#eee; }
+.theme-dark .coder-status { border-color:#45433d; }.theme-dark .status-pill.installed_unverified { background:#294333;color:#a9dbb7; }.theme-dark .status-pill.unavailable { background:#3a3934;color:#aaa69c; }.theme-dark .coder-safety { color:#aaa69c; }
 @media (max-width:640px){.settings-layout nav{display:flex;flex-direction:row;overflow-x:auto;margin-bottom:24px}.settings-layout nav button{flex:none}.profile-form{grid-template-columns:1fr}.profile-card{align-items:flex-start;flex-direction:column}.settings-card{align-items:flex-start}.share-status{display:none}.model-select-label select{max-width:180px}}
