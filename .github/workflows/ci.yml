@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install Rust components
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup component add rustfmt clippy
+      - name: Install Rust audit tools
+        run: |
+          cargo install cargo-audit --locked
+          cargo install cargo-deny --locked
+      - run: npm ci
+      - name: Resolve Chromium
+        run: |
+          CHROMIUM_PATH="$(command -v chromium || command -v google-chrome || command -v chromium-browser)"
+          test -n "$CHROMIUM_PATH"
+          echo "CHROMIUM_PATH=$CHROMIUM_PATH" >> "$GITHUB_ENV"
+      - run: npm run check:server
+      - run: npm run test
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm run test:e2e
+      - run: npm run audit
+      - name: Validate Compose
+        run: docker compose -f compose.yaml config
+      - name: Build production images
+        run: |
+          docker build -f Containerfile.backend -t lumen-ai-chat-api:ci .
+          docker build -f Containerfile.frontend -t lumen-ai-chat-web:ci .
+      - name: Smoke hardened production containers
+        run: |
+          set -euo pipefail
+          cleanup() { docker rm -f lumen-ci-web lumen-ci-api >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          docker run -d --name lumen-ci-api --network host --read-only \
+            --tmpfs /tmp:rw,exec,size=1g \
+            --tmpfs /run/lumen-home:rw,exec,mode=1777 \
+            --cap-drop ALL --security-opt no-new-privileges --pids-limit 512 \
+            -e HOME=/run/lumen-home -e APP_BIND=127.0.0.1:41788 \
+            -e AI_DEFAULT_CODER=api -e AI_DEFAULT_PROVIDER=ollama \
+            -e OLLAMA_ENABLED=true -e OLLAMA_MODEL=ci-smoke \
+            lumen-ai-chat-api:ci
+          for attempt in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:41788/api/ready >/dev/null && break
+            test "$attempt" -lt 60
+            sleep 1
+          done
+          docker run -d --name lumen-ci-web --network host --read-only \
+            --tmpfs /tmp:rw,size=32m --tmpfs /var/cache/nginx:rw,size=32m \
+            --tmpfs /var/run:rw,size=8m --cap-drop ALL \
+            --security-opt no-new-privileges --pids-limit 128 \
+            lumen-ai-chat-web:ci
+          for attempt in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:41789 >/dev/null && break
+            test "$attempt" -lt 60
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:41788/api/metrics | grep -q lumen_chat_requests_total
+          curl -fsSI http://127.0.0.1:41789 | grep -qi '^Content-Security-Policy:'

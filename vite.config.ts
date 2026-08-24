@@ -7,7 +7,7 @@ export default defineConfig({
   plugins: [vue(), tailwindcss()],
   resolve: { alias: { '@': fileURLToPath(new URL('./src', import.meta.url)) } },
   server: {
-    proxy: { '/api': { target: 'http://127.0.0.1:41788', changeOrigin: true } },
+    proxy: { '/api': { target: process.env.VITE_API_TARGET ?? 'http://127.0.0.1:41788', changeOrigin: true } },
   },
   test: { environment: 'jsdom', globals: true },
 })

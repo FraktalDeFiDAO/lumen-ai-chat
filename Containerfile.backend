@@ -1,4 +1,4 @@
-FROM docker.io/library/archlinux:latest AS builder
+FROM docker.io/library/archlinux@sha256:bf88f8143c3ef21b14d0ebb8140099f0bf75ecfc3699f357ff92317a73f5aba9 AS builder
 
 RUN pacman -Syu --noconfirm --needed ca-certificates cargo rust \
     && pacman -Scc --noconfirm
@@ -7,7 +7,7 @@ COPY backend/ ./
 RUN cargo build --release --locked \
     && strip target/release/ai-chatbot-gateway
 
-FROM docker.io/library/archlinux:latest
+FROM docker.io/library/archlinux@sha256:bf88f8143c3ef21b14d0ebb8140099f0bf75ecfc3699f357ff92317a73f5aba9
 RUN for attempt in 1 2 3; do \
       pacman -Syu --noconfirm --needed bash ca-certificates curl nodejs python && installed=1 && break; \
       sleep 5; \
@@ -16,7 +16,9 @@ RUN for attempt in 1 2 3; do \
     && update-ca-trust \
     && pacman -Scc --noconfirm
 COPY --from=builder /build/target/release/ai-chatbot-gateway /usr/local/bin/lumen-api
+COPY --chmod=0755 container/api-entrypoint.sh /usr/local/bin/lumen-entrypoint
 RUN chmod 0755 /usr/local/bin/lumen-api
+USER 1000:1000
 WORKDIR /workspace
 EXPOSE 41788
-ENTRYPOINT ["/usr/local/bin/lumen-api"]
+ENTRYPOINT ["/usr/local/bin/lumen-entrypoint"]

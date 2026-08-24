@@ -3,5 +3,17 @@ dist/
 target/
 .vite/
 coverage/
+graphify-out/
+.env
+.env.*
+!.env.example
+.claude/
+.claude-flow/
+.codex/
+.opencode/
+.kilo/
+.agents/
+.agent/
+.hermes/
 .DS_Store
 *.local

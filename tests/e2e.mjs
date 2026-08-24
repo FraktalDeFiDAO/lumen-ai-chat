@@ -2,7 +2,8 @@ import { chromium } from 'playwright-core'
 import assert from 'node:assert/strict'
 
 const baseURL = process.env.BASE_URL ?? 'http://127.0.0.1:41789'
-const browser = await chromium.launch({ executablePath: '/usr/bin/chromium', headless: true })
+const executablePath = process.env.CHROMIUM_PATH ?? '/usr/bin/chromium'
+const browser = await chromium.launch({ executablePath, headless: true })
 try {
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, permissions: ['clipboard-read', 'clipboard-write'] })
   const page = await context.newPage()

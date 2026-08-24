@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process'
+import { reservePort } from './ports.mjs'
 
 const cwd = new URL('..', import.meta.url).pathname
 const binaryOverrides = {
@@ -50,14 +51,16 @@ async function waitFor(url, process, output, timeoutMs = 30_000) {
   throw new Error(`Explicit Ollama guard timed out: ${output()}`)
 }
 
-const implicit = start({ APP_BIND: '127.0.0.1:41924', OLLAMA_MODEL: 'must-not-enable' })
+const port = await reservePort()
+const baseURL = `http://127.0.0.1:${port}`
+const implicit = start({ APP_BIND: `127.0.0.1:${port}`, OLLAMA_MODEL: 'must-not-enable' })
 const implicitCode = await exited(implicit.child)
 if (implicitCode === 0 || !implicit.output().includes('no AI backends are configured')) {
   throw new Error(`OLLAMA_MODEL implicitly enabled local inference: ${implicit.output()}`)
 }
 
 const explicit = start({
-  APP_BIND: '127.0.0.1:41924',
+  APP_BIND: `127.0.0.1:${port}`,
   AI_DEFAULT_CODER: 'api',
   AI_DEFAULT_PROVIDER: 'ollama',
   OLLAMA_ENABLED: 'true',
@@ -65,8 +68,8 @@ const explicit = start({
   OLLAMA_BASE_URL: 'http://127.0.0.1:9/v1',
 })
 try {
-  await waitFor('http://127.0.0.1:41924/api/health', explicit.child, explicit.output)
-  const payload = await (await fetch('http://127.0.0.1:41924/api/models')).json()
+  await waitFor(`${baseURL}/api/ready`, explicit.child, explicit.output)
+  const payload = await (await fetch(`${baseURL}/api/models`)).json()
   if (!payload.models?.some(model => model.key === 'api/ollama/explicit-test')) {
     throw new Error(`Explicit Ollama route was not configured: ${JSON.stringify(payload)}`)
   }

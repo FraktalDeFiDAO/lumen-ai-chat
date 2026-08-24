@@ -1,5 +1,6 @@
 .git
 .hermes
+graphify-out
 node_modules
 dist
 coverage

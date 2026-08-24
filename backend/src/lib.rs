@@ -1,5 +1,13 @@
 use std::{
-    collections::HashSet, env, net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc,
+    collections::HashSet,
+    env,
+    net::SocketAddr,
+    path::PathBuf,
+    str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -21,11 +29,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::sync::Semaphore;
-use tower_http::{
-    cors::{Any, CorsLayer},
-    limit::RequestBodyLimitLayer,
-    trace::TraceLayer,
-};
+use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_MESSAGES: usize = 100;
@@ -120,7 +124,6 @@ pub struct Config {
     pub coder_workspace: PathBuf,
     pub coder_timeout: Duration,
     pub coder_allow_writes: bool,
-    pub coder_allow_remote: bool,
     pub coder_max_concurrency: usize,
 }
 
@@ -171,10 +174,8 @@ pub enum ConfigError {
     InvalidCoderConfig(String),
     #[error("AI_CODER_WORKSPACE must name an existing directory: {0}")]
     InvalidCoderWorkspace(String),
-    #[error(
-        "native AI coders require a loopback APP_BIND unless AI_CODER_ALLOW_REMOTE=true is explicitly set"
-    )]
-    RemoteCoderBind,
+    #[error("APP_BIND must use a loopback address")]
+    RemoteBind,
 }
 
 impl Config {
@@ -416,7 +417,6 @@ impl Config {
             coder_workspace,
             coder_timeout,
             coder_allow_writes: env_flag("AI_CODER_ALLOW_WRITES"),
-            coder_allow_remote: env_flag("AI_CODER_ALLOW_REMOTE"),
             coder_max_concurrency,
         };
         config.validate()?;
@@ -427,8 +427,8 @@ impl Config {
         if self.providers.is_empty() && self.coders.is_empty() {
             return Err(ConfigError::NoProviders);
         }
-        if !self.coders.is_empty() && !self.bind.ip().is_loopback() && !self.coder_allow_remote {
-            return Err(ConfigError::RemoteCoderBind);
+        if !self.bind.ip().is_loopback() {
+            return Err(ConfigError::RemoteBind);
         }
         let mut ids = HashSet::new();
         let mut provider_routes = HashSet::new();
@@ -558,6 +558,13 @@ struct AppState {
     config: Arc<Config>,
     client: Client,
     coder_slots: Arc<Semaphore>,
+    metrics: Arc<AppMetrics>,
+}
+
+#[derive(Default)]
+struct AppMetrics {
+    chat_requests: AtomicU64,
+    coder_busy_rejections: AtomicU64,
 }
 
 pub fn build_router(config: Config) -> Result<Router, BuildError> {
@@ -577,9 +584,12 @@ pub fn build_router(config: Config) -> Result<Router, BuildError> {
         config: Arc::new(config),
         client,
         coder_slots,
+        metrics: Arc::new(AppMetrics::default()),
     };
     Ok(Router::new()
         .route("/api/health", get(health))
+        .route("/api/ready", get(ready))
+        .route("/api/metrics", get(metrics))
         .route("/api/providers", get(providers))
         .route("/api/coders", get(coder_statuses))
         .route("/api/models", get(models))
@@ -588,12 +598,6 @@ pub fn build_router(config: Config) -> Result<Router, BuildError> {
         .with_state(state)
         .layer(DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
-                .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]),
-        )
         .layer(TraceLayer::new_for_http()))
 }
 
@@ -626,6 +630,40 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
         "coder_count": state.config.coders.len()
     }))
 }
+async fn ready(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({
+        "status": "ready",
+        "default_ai_coder": state.config.default_coder,
+        "default_provider": state.config.default_provider,
+    }))
+}
+async fn metrics(State(state): State<AppState>) -> Response {
+    let body = format!(
+        concat!(
+            "# TYPE lumen_chat_requests_total counter\n",
+            "lumen_chat_requests_total {}\n",
+            "# TYPE lumen_coder_busy_rejections_total counter\n",
+            "lumen_coder_busy_rejections_total {}\n",
+            "# TYPE lumen_coder_slots_available gauge\n",
+            "lumen_coder_slots_available {}\n",
+            "# TYPE lumen_configured_coders gauge\n",
+            "lumen_configured_coders {}\n",
+            "# TYPE lumen_configured_providers gauge\n",
+            "lumen_configured_providers {}\n",
+        ),
+        state.metrics.chat_requests.load(Ordering::Relaxed),
+        state.metrics.coder_busy_rejections.load(Ordering::Relaxed),
+        state.coder_slots.available_permits(),
+        state.config.coders.len(),
+        state.config.providers.len(),
+    );
+    let mut response = Response::new(Body::from(body));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+    );
+    response
+}
 async fn providers(State(state): State<AppState>) -> Json<Value> {
     let providers = state
         .config
@@ -652,7 +690,6 @@ async fn coder_statuses(State(state): State<AppState>) -> Json<Value> {
     Json(json!({
         "coders": coders::statuses(&state.config.coders),
         "allow_writes": state.config.coder_allow_writes,
-        "allow_remote": state.config.coder_allow_remote,
         "workspace": state.config.coder_workspace,
         "timeout_seconds": state.config.coder_timeout.as_secs(),
         "max_concurrency": state.config.coder_max_concurrency,
@@ -822,6 +859,7 @@ async fn chat(
     if let Err(message) = validate_chat(&request) {
         return json_error(StatusCode::BAD_REQUEST, "invalid_request", message);
     }
+    state.metrics.chat_requests.fetch_add(1, Ordering::Relaxed);
     let embedded = request.model.as_deref().and_then(parse_model_path);
     if embedded.is_some_and(|(coder, provider, _)| {
         request
@@ -862,7 +900,13 @@ async fn chat(
     {
         let permit = match state.coder_slots.clone().try_acquire_owned() {
             Ok(permit) => permit,
-            Err(_) => return sse_error("All AI coder execution slots are busy; try again shortly"),
+            Err(_) => {
+                state
+                    .metrics
+                    .coder_busy_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                return sse_error("All AI coder execution slots are busy; try again shortly");
+            }
         };
         let prompt = coder_prompt(&request.messages, state.config.coder_allow_writes);
         let result = coders::execute(
@@ -1261,7 +1305,6 @@ mod tests {
             coder_workspace: PathBuf::from("."),
             coder_timeout: Duration::from_secs(30),
             coder_allow_writes: false,
-            coder_allow_remote: false,
             coder_max_concurrency: 2,
         };
         assert!(config.validate().is_ok());
@@ -1275,12 +1318,7 @@ mod tests {
             executable: PathBuf::from("/usr/bin/false"),
         });
         remote.bind = "0.0.0.0:41788".parse().unwrap();
-        assert!(matches!(
-            remote.validate(),
-            Err(ConfigError::RemoteCoderBind)
-        ));
-        remote.coder_allow_remote = true;
-        assert!(remote.validate().is_ok());
+        assert!(matches!(remote.validate(), Err(ConfigError::RemoteBind)));
         let duplicate = Config {
             providers: vec![
                 provider("same", ProviderKind::Openai),

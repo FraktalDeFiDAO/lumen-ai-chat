@@ -90,7 +90,7 @@ podman logs lumen-ai-chat-api
 podman logs lumen-ai-chat-web
 ```
 
-The API container runs rootlessly with dropped capabilities and a read-only project mount. The native coder executables and their existing per-user authentication/configuration directories are mounted from the host at their original paths so Hermes, OpenCode, KiloCode, Claude Code, and Codex retain their native login state. Coder source inspection still uses the temporary secret-filtered read-only snapshot described below. No `.env` file is mounted or loaded by Compose.
+The API container runs rootlessly with dropped capabilities, a read-only root filesystem, and a read-only project mount. Hermes configuration and its installed launcher tree are mounted read-only, with writable tmpfs overlays for cache, logs, and transient session files; its persistent child-session database remains intentionally read-only because Lumen invokes coders one request at a time. For other native coders, Compose mounts only explicit authentication/settings files as read-only seeds; the entrypoint copies those allowlisted files into a private tmpfs home. Package stores, histories, databases, and telemetry state are not mounted. Native CLIs can create transient runtime state without mutating host credentials; all container-side state disappears when the container is recreated. Coder source inspection still uses the temporary secret-filtered read-only snapshot described below. No project `.env` file is mounted or loaded by Compose.
 
 Stop the deployment with:
 
@@ -108,7 +108,7 @@ export AI_CODER_WORKSPACE="/absolute/path/to/project"
 
 The default is the gateway's startup directory. Child processes receive a scrubbed environment that excludes provider keys and application secrets while retaining standard OS paths needed to load native CLI credential files.
 
-Native coder routes require a loopback `APP_BIND` by default. A non-loopback bind is rejected unless the operator explicitly accepts that deployment risk with `AI_CODER_ALLOW_REMOTE=true` and places the gateway behind appropriate authentication.
+The gateway requires a loopback `APP_BIND`; every non-loopback bind is rejected. Remote access must be provided by a separately managed TLS and identity-aware reverse proxy rather than by exposing Lumen directly.
 
 Coder execution is read-only by default. The gateway first creates a temporary, secret-filtered workspace snapshot (excluding `.git`, `.env*`, credentials, dependency caches, and build output), runs the coder inside that snapshot, and deletes it afterward. This prevents CLI session metadata or attempted edits from touching the source workspace.
 
@@ -208,7 +208,6 @@ Ollama is added only when `OLLAMA_ENABLED=true` or legacy `AI_PROVIDER=openai-co
 | `AI_CODER_ROUTES_JSON` | one default route per installed CLI | Coder/provider/model catalog |
 | `AI_CODER_WORKSPACE` | startup directory | Fixed coder workspace |
 | `AI_CODER_ALLOW_WRITES` | `false` | Explicit workspace-write opt-in |
-| `AI_CODER_ALLOW_REMOTE` | `false` | Explicit non-loopback coder-route opt-in |
 | `AI_CODER_TIMEOUT_SECONDS` | `300` | Per-execution deadline |
 | `AI_CODER_MAX_CONCURRENCY` | `2` | Concurrent coder process limit |
 | `AI_CODER_HERMES_BIN` | discovered from `PATH` | Hermes executable override |
@@ -224,6 +223,8 @@ Legacy `AI_PROVIDER`, `AI_BASE_URL`, `AI_MODEL`, and `AI_API_KEY` remain support
 ## API
 
 - `GET /api/health` — gateway status and backend counts
+- `GET /api/ready` — readiness and selected default route
+- `GET /api/metrics` — Prometheus text metrics for request and coder capacity signals
 - `GET /api/coders` — installed coder status, routes, workspace mode, and limits
 - `GET /api/providers` — direct-provider metadata without credentials
 - `GET /api/models` — combined coder and direct-provider model catalog
@@ -255,6 +256,7 @@ npm run typecheck
 npm test
 npm run build
 npm run test:e2e
+npm run audit
 npm run test:podman  # while the Compose deployment is running
 ```
 

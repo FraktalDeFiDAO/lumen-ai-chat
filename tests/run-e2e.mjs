@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process'
+import { reservePorts } from './ports.mjs'
 
 const cwd = new URL('..', import.meta.url).pathname
 const children = []
@@ -31,15 +32,30 @@ async function waitFor(url, child, timeoutMs = 90_000) {
   throw new Error(`Timed out waiting for ${url}\n${logs.get(child)?.join('')}`)
 }
 
-function stopAll() {
-  for (const child of children.reverse()) {
+async function stopAll() {
+  const running = children.reverse().filter(child => child.pid && child.exitCode === null)
+  const exits = running.map(child => new Promise(resolve => child.once('exit', resolve)))
+  for (const child of running) {
     if (child.pid && child.exitCode === null) {
       try { process.kill(-child.pid, 'SIGTERM') } catch { /* already stopped */ }
+    }
+  }
+  await Promise.race([
+    Promise.all(exits),
+    new Promise(resolve => setTimeout(resolve, 5000)),
+  ])
+  for (const child of running) {
+    if (child.exitCode === null && child.pid) {
+      try { process.kill(-child.pid, 'SIGKILL') } catch { /* already stopped */ }
     }
   }
 }
 
 try {
+  const [mockPort, apiPort, webPort] = await reservePorts(3)
+  const mockURL = `http://127.0.0.1:${mockPort}`
+  const apiURL = `http://127.0.0.1:${apiPort}`
+  const webURL = `http://127.0.0.1:${webPort}`
   const configGuards = start('node', ['tests/config-guards.mjs'])
   await new Promise((resolve, reject) => {
     configGuards.once('exit', code => code === 0 ? resolve() : reject(new Error(logs.get(configGuards)?.join('') || `Configuration guards exited ${code}`)))
@@ -47,11 +63,11 @@ try {
   })
   process.stdout.write(logs.get(configGuards)?.join('') ?? '')
 
-  const mock = start('node', ['tests/mock-provider.mjs'])
-  await waitFor('http://127.0.0.1:41800/v1/models', mock, 10_000)
+  const mock = start('node', ['tests/mock-provider.mjs'], { MOCK_AI_PORT: String(mockPort) })
+  await waitFor(`${mockURL}/v1/models`, mock, 10_000)
 
   const backend = start('cargo', ['run', '--manifest-path', 'backend/Cargo.toml'], {
-    APP_BIND: '127.0.0.1:41788',
+    APP_BIND: `127.0.0.1:${apiPort}`,
     AI_DEFAULT_CODER: 'hermes',
     AI_DEFAULT_PROVIDER: 'z.ai',
     AI_CODER_WORKSPACE: cwd,
@@ -68,36 +84,38 @@ try {
       { coder: 'codex', provider: 'codex', provider_name: 'Codex', model: 'gpt-test' },
     ]),
     OPENAI_API_KEY: 'test-openai-key',
-    OPENAI_BASE_URL: 'http://127.0.0.1:41800/v1',
+    OPENAI_BASE_URL: `${mockURL}/v1`,
     OPENAI_MODEL: 'openai-test',
     ANTHROPIC_API_KEY: 'test-anthropic-key',
-    ANTHROPIC_BASE_URL: 'http://127.0.0.1:41800',
+    ANTHROPIC_BASE_URL: mockURL,
     ANTHROPIC_MODEL: 'anthropic-test',
     GEMINI_API_KEY: 'test-gemini-key',
-    GEMINI_BASE_URL: 'http://127.0.0.1:41800/v1beta',
+    GEMINI_BASE_URL: `${mockURL}/v1beta`,
     GEMINI_MODEL: 'gemini-test',
-    OLLAMA_BASE_URL: 'http://127.0.0.1:41800/ollama/v1',
+    OLLAMA_BASE_URL: `${mockURL}/ollama/v1`,
     OLLAMA_MODEL: 'ollama-test',
     OLLAMA_ENABLED: 'true',
   })
-  await waitFor('http://127.0.0.1:41788/api/health', backend)
+  await waitFor(`${apiURL}/api/ready`, backend)
 
-  const providerTest = start('node', ['tests/provider-contract.mjs'])
+  const providerTest = start('node', ['tests/provider-contract.mjs'], { API_URL: apiURL })
   await new Promise((resolve, reject) => {
     providerTest.once('exit', code => code === 0 ? resolve() : reject(new Error(logs.get(providerTest)?.join('') || `Provider tests exited ${code}`)))
     providerTest.once('error', reject)
   })
   process.stdout.write(logs.get(providerTest)?.join('') ?? '')
 
-  const web = start('npm', ['run', 'dev:web'])
-  await waitFor('http://127.0.0.1:41789', web, 30_000)
+  const web = start('npm', ['run', 'dev:web', '--', '--port', String(webPort), '--strictPort'], {
+    VITE_API_TARGET: apiURL,
+  })
+  await waitFor(webURL, web, 30_000)
 
-  const test = start('node', ['tests/e2e.mjs'])
+  const test = start('node', ['tests/e2e.mjs'], { BASE_URL: webURL })
   await new Promise((resolve, reject) => {
     test.once('exit', code => code === 0 ? resolve() : reject(new Error(logs.get(test)?.join('') || `E2E exited ${code}`)))
     test.once('error', reject)
   })
   process.stdout.write(logs.get(test)?.join('') ?? '')
 } finally {
-  stopAll()
+  await stopAll()
 }
