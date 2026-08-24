@@ -826,20 +826,65 @@ pub struct ChatRequest {
     pub temperature: Option<f32>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    /// Tools the model may call.
+    ///
+    /// Lumen never executes these. It translates them into whichever wire
+    /// format the selected provider speaks, and hands any resulting calls back
+    /// to the caller to run. That keeps this service stateless and free of any
+    /// knowledge of the caller's domain, and means a tool runs with the
+    /// caller's own permissions rather than Lumen's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<ToolDef>>,
     pub messages: Vec<ChatMessage>,
 }
+
+/// A tool offered to the model, described in provider-neutral terms.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ToolDef {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema for the arguments. Passed through to the provider as-is;
+    /// all three accept JSON Schema, they merely disagree about where it goes.
+    pub input_schema: Value,
+}
+
+/// A call the model wants made.
+///
+/// `arguments` is a parsed object rather than the JSON string OpenAI puts on
+/// the wire — callers should not have to parse a string out of a struct that
+/// already knows it is JSON.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub arguments: Value,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChatMessage {
     pub role: Role,
+    #[serde(default)]
     pub content: String,
+    /// Set on an assistant turn that asked for tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    /// Set on a `tool` turn, naming the call this is the result of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     System,
     User,
     Assistant,
+    /// The result of a tool the caller ran on the model's behalf.
+    Tool,
 }
 
 async fn chat(
@@ -898,6 +943,19 @@ async fn chat(
             .config
             .coder_route(requested_coder, provider_id, requested_model)
     {
+        // A CLI coder has no tool protocol. Flattening the tools into the
+        // prompt would let a model "call" something that never runs and whose
+        // result is never returned -- an answer built on a tool it believes
+        // executed. Refusing is the only honest option.
+        if request
+            .tools
+            .as_ref()
+            .is_some_and(|tools| !tools.is_empty())
+        {
+            return sse_error(
+                "Tool calling is not supported on AI coder routes; select a hosted provider",
+            );
+        }
         let permit = match state.coder_slots.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
@@ -956,6 +1014,7 @@ async fn chat(
         &request.messages,
         request.temperature,
         request.max_tokens,
+        request.tools.as_deref(),
     );
     let upstream_request = authenticated(
         state
@@ -1030,21 +1089,177 @@ fn authenticated(request: RequestBuilder, provider: &ProviderConfig) -> RequestB
         ProviderKind::Gemini => request.header("x-goog-api-key", key),
     }
 }
+/// Map a tool-call id back to the tool's name.
+///
+/// Gemini keys a function response by *name* while OpenAI and Anthropic key it
+/// by the id they issued, so a transcript that only carries ids has to be read
+/// backwards to serve Gemini. Built once per request rather than scanned per
+/// message.
+fn tool_names_by_id(messages: &[ChatMessage]) -> std::collections::HashMap<&str, &str> {
+    messages
+        .iter()
+        .filter_map(|m| m.tool_calls.as_ref())
+        .flatten()
+        .map(|c| (c.id.as_str(), c.name.as_str()))
+        .collect()
+}
+
+/// Arguments as the JSON *string* OpenAI puts on the wire.
+fn arguments_as_string(arguments: &Value) -> String {
+    match arguments {
+        Value::String(raw) => raw.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn openai_messages(messages: &[ChatMessage]) -> Vec<Value> {
+    messages
+        .iter()
+        .map(|m| match m.role {
+            Role::Tool => json!({
+                "role": "tool",
+                "tool_call_id": m.tool_call_id.clone().unwrap_or_default(),
+                "content": m.content,
+            }),
+            _ => {
+                let role = match m.role {
+                    Role::System => "system",
+                    Role::Assistant => "assistant",
+                    _ => "user",
+                };
+                let mut value = json!({"role": role, "content": m.content});
+                if let Some(calls) = &m.tool_calls {
+                    value["tool_calls"] = Value::Array(
+                        calls
+                            .iter()
+                            .map(|c| {
+                                json!({
+                                    "id": c.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": c.name,
+                                        "arguments": arguments_as_string(&c.arguments),
+                                    },
+                                })
+                            })
+                            .collect(),
+                    );
+                }
+                value
+            }
+        })
+        .collect()
+}
+
+fn anthropic_messages(messages: &[ChatMessage]) -> Vec<Value> {
+    messages
+        .iter()
+        .filter(|m| !matches!(m.role, Role::System))
+        .map(|m| match m.role {
+            // Anthropic carries a tool result as a user turn holding a
+            // tool_result block, not as a role of its own.
+            Role::Tool => json!({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": m.tool_call_id.clone().unwrap_or_default(),
+                    "content": m.content,
+                }],
+            }),
+            Role::Assistant if m.tool_calls.is_some() => {
+                let mut blocks: Vec<Value> = Vec::new();
+                if !m.content.is_empty() {
+                    blocks.push(json!({"type": "text", "text": m.content}));
+                }
+                for call in m.tool_calls.iter().flatten() {
+                    blocks.push(json!({
+                        "type": "tool_use",
+                        "id": call.id,
+                        "name": call.name,
+                        "input": call.arguments,
+                    }));
+                }
+                json!({"role": "assistant", "content": blocks})
+            }
+            Role::Assistant => json!({"role": "assistant", "content": m.content}),
+            _ => json!({"role": "user", "content": m.content}),
+        })
+        .collect()
+}
+
+fn gemini_contents(messages: &[ChatMessage]) -> Vec<Value> {
+    let names = tool_names_by_id(messages);
+    messages
+        .iter()
+        .filter(|m| !matches!(m.role, Role::System))
+        .map(|m| match m.role {
+            Role::Tool => {
+                let name = m
+                    .tool_call_id
+                    .as_deref()
+                    .and_then(|id| names.get(id).copied())
+                    .unwrap_or_default();
+                json!({
+                    "role": "user",
+                    "parts": [{"functionResponse": {
+                        "name": name,
+                        "response": {"content": m.content},
+                    }}],
+                })
+            }
+            Role::Assistant if m.tool_calls.is_some() => {
+                let mut parts: Vec<Value> = Vec::new();
+                if !m.content.is_empty() {
+                    parts.push(json!({"text": m.content}));
+                }
+                for call in m.tool_calls.iter().flatten() {
+                    parts.push(json!({"functionCall": {
+                        "name": call.name,
+                        "args": call.arguments,
+                    }}));
+                }
+                json!({"role": "model", "parts": parts})
+            }
+            Role::Assistant => json!({"role": "model", "parts": [{"text": m.content}]}),
+            _ => json!({"role": "user", "parts": [{"text": m.content}]}),
+        })
+        .collect()
+}
+
 fn provider_payload(
     kind: ProviderKind,
     model: &str,
     messages: &[ChatMessage],
     temperature: Option<f32>,
     max_tokens: Option<u32>,
+    tools: Option<&[ToolDef]>,
 ) -> Value {
     match kind {
         ProviderKind::Openai | ProviderKind::OpenaiCompatible => {
-            let mut payload = json!({"model": model, "messages": messages, "stream": true});
+            let mut payload = json!({
+                "model": model,
+                "messages": openai_messages(messages),
+                "stream": true,
+            });
             if let Some(value) = temperature {
                 payload["temperature"] = json!(value);
             }
             if let Some(value) = max_tokens {
                 payload["max_tokens"] = json!(value);
+            }
+            if let Some(tools) = tools.filter(|t| !t.is_empty()) {
+                payload["tools"] = Value::Array(
+                    tools
+                        .iter()
+                        .map(|tool| {
+                            json!({"type": "function", "function": {
+                                "name": tool.name,
+                                "description": tool.description,
+                                "parameters": tool.input_schema,
+                            }})
+                        })
+                        .collect(),
+                );
             }
             payload
         }
@@ -1055,14 +1270,31 @@ fn provider_payload(
                 .map(|m| m.content.as_str())
                 .collect::<Vec<_>>()
                 .join("\n\n");
-            let messages = messages.iter().filter(|m| !matches!(m.role, Role::System))
-                .map(|m| json!({"role": match m.role { Role::Assistant => "assistant", _ => "user" }, "content": m.content})).collect::<Vec<_>>();
-            let mut payload = json!({"model": model, "messages": messages, "max_tokens": max_tokens.unwrap_or(4096), "stream": true});
+            let mut payload = json!({
+                "model": model,
+                "messages": anthropic_messages(messages),
+                "max_tokens": max_tokens.unwrap_or(4096),
+                "stream": true,
+            });
             if !system.is_empty() {
                 payload["system"] = Value::String(system);
             }
             if let Some(value) = temperature {
                 payload["temperature"] = json!(value);
+            }
+            if let Some(tools) = tools.filter(|t| !t.is_empty()) {
+                payload["tools"] = Value::Array(
+                    tools
+                        .iter()
+                        .map(|tool| {
+                            json!({
+                                "name": tool.name,
+                                "description": tool.description,
+                                "input_schema": tool.input_schema,
+                            })
+                        })
+                        .collect(),
+                );
             }
             payload
         }
@@ -1073,8 +1305,7 @@ fn provider_payload(
                 .map(|m| m.content.as_str())
                 .collect::<Vec<_>>()
                 .join("\n\n");
-            let contents = messages.iter().filter(|m| !matches!(m.role, Role::System))
-                .map(|m| json!({"role": if matches!(m.role, Role::Assistant) { "model" } else { "user" }, "parts": [{"text": m.content}]})).collect::<Vec<_>>();
+            let contents = gemini_contents(messages);
             let mut generation = serde_json::Map::new();
             if let Some(value) = temperature {
                 generation.insert("temperature".into(), json!(value));
@@ -1088,6 +1319,18 @@ fn provider_payload(
             }
             if !generation.is_empty() {
                 payload["generationConfig"] = Value::Object(generation);
+            }
+            if let Some(tools) = tools.filter(|t| !t.is_empty()) {
+                payload["tools"] = json!([{
+                    "functionDeclarations": tools
+                        .iter()
+                        .map(|tool| json!({
+                            "name": tool.name,
+                            "description": tool.description,
+                            "parameters": tool.input_schema,
+                        }))
+                        .collect::<Vec<_>>(),
+                }]);
             }
             payload
         }
@@ -1104,11 +1347,42 @@ fn translate_event(kind: ProviderKind, event_type: &str, data: &str) -> Option<S
                 return Some("[DONE]".into());
             }
             let payload: Value = serde_json::from_str(data).ok()?;
+            // The block index is reused as the OpenAI tool_calls index. It
+            // counts text blocks too, so it may not start at zero -- harmless,
+            // because every accumulator treats it as an opaque grouping key
+            // rather than an offset.
+            let index = payload.get("index").and_then(Value::as_u64).unwrap_or(0);
             match payload.get("type").and_then(Value::as_str) {
-                Some("content_block_delta") => payload
-                    .pointer("/delta/text")
-                    .and_then(Value::as_str)
-                    .map(openai_delta),
+                // Anthropic announces a tool call before streaming its
+                // arguments, so the name arrives here and the arguments arrive
+                // as input_json_delta below.
+                Some("content_block_start")
+                    if payload
+                        .pointer("/content_block/type")
+                        .and_then(Value::as_str)
+                        == Some("tool_use") =>
+                {
+                    Some(openai_tool_start(
+                        index,
+                        payload
+                            .pointer("/content_block/id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                        payload
+                            .pointer("/content_block/name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    ))
+                }
+                Some("content_block_delta") => {
+                    if let Some(text) = payload.pointer("/delta/text").and_then(Value::as_str) {
+                        return Some(openai_delta(text));
+                    }
+                    payload
+                        .pointer("/delta/partial_json")
+                        .and_then(Value::as_str)
+                        .map(|partial| openai_tool_arguments(index, partial))
+                }
                 Some("message_stop") => Some("[DONE]".into()),
                 Some("error") => {
                     Some(error_payload("The Anthropic stream returned an error").to_string())
@@ -1131,6 +1405,18 @@ fn translate_event(kind: ProviderKind, event_type: &str, data: &str) -> Option<S
             let finish = payload
                 .pointer("/candidates/0/finishReason")
                 .and_then(Value::as_str);
+            // Gemini sends a complete functionCall rather than streaming its
+            // arguments, so one chunk carries both the name and the whole
+            // argument object.
+            if let Some(call) = payload
+                .pointer("/candidates/0/content/parts")
+                .and_then(Value::as_array)
+                .and_then(|parts| parts.iter().find_map(|part| part.get("functionCall")))
+            {
+                let name = call.get("name").and_then(Value::as_str).unwrap_or_default();
+                let args = call.get("args").cloned().unwrap_or_else(|| json!({}));
+                return Some(openai_tool_whole(0, name, &args.to_string()));
+            }
             text.as_deref()
                 .map(openai_delta)
                 .or_else(|| finish.map(|_| "[DONE]".into()))
@@ -1140,6 +1426,37 @@ fn translate_event(kind: ProviderKind, event_type: &str, data: &str) -> Option<S
 fn openai_delta(text: &str) -> String {
     json!({"choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]})
         .to_string()
+}
+
+/// Announce a tool call: id and name, arguments still to come.
+fn openai_tool_start(index: u64, id: &str, name: &str) -> String {
+    json!({"choices": [{"index": 0, "delta": {"tool_calls": [{
+        "index": index,
+        "id": id,
+        "type": "function",
+        "function": {"name": name, "arguments": ""},
+    }]}, "finish_reason": null}]})
+    .to_string()
+}
+
+/// A further slice of a tool call's arguments.
+fn openai_tool_arguments(index: u64, partial: &str) -> String {
+    json!({"choices": [{"index": 0, "delta": {"tool_calls": [{
+        "index": index,
+        "function": {"arguments": partial},
+    }]}, "finish_reason": null}]})
+    .to_string()
+}
+
+/// A tool call that arrived complete, for providers that do not stream them.
+fn openai_tool_whole(index: u64, name: &str, arguments: &str) -> String {
+    json!({"choices": [{"index": 0, "delta": {"tool_calls": [{
+        "index": index,
+        "id": format!("call_{index}"),
+        "type": "function",
+        "function": {"name": name, "arguments": arguments},
+    }]}, "finish_reason": null}]})
+    .to_string()
 }
 fn validate_chat(request: &ChatRequest) -> Result<(), &'static str> {
     if let Some(ai_coder) = &request.ai_coder
@@ -1216,9 +1533,23 @@ fn coder_prompt(messages: &[ChatMessage], allow_writes: bool) -> String {
             Role::System => "SYSTEM",
             Role::User => "USER",
             Role::Assistant => "ASSISTANT",
+            // A CLI coder has no tool protocol, so a transcript that already
+            // contains tool traffic is flattened into labelled text. That keeps
+            // a conversation readable if it moves between a provider and a
+            // coder mid-thread; it does not make tools work here, which is why
+            // offering them to a coder route is refused outright below.
+            Role::Tool => "TOOL RESULT",
         };
         prompt.push_str(role);
         prompt.push_str(":\n");
+        if let Some(calls) = &message.tool_calls {
+            for call in calls {
+                prompt.push_str(&format!(
+                    "(requested tool {} with {})\n",
+                    call.name, call.arguments
+                ));
+            }
+        }
         prompt.push_str(&message.content);
         prompt.push_str("\n\n");
     }
@@ -1284,9 +1615,12 @@ mod tests {
             model: None,
             temperature: None,
             max_tokens: None,
+            tools: None,
             messages: vec![ChatMessage {
                 role: Role::User,
                 content: "Hello".into(),
+                tool_calls: None,
+                tool_call_id: None,
             }],
         }
     }
@@ -1405,13 +1739,24 @@ mod tests {
             ChatMessage {
                 role: Role::System,
                 content: "Be concise".into(),
+                tool_calls: None,
+                tool_call_id: None,
             },
             ChatMessage {
                 role: Role::User,
                 content: "Hello".into(),
+                tool_calls: None,
+                tool_call_id: None,
             },
         ];
-        let openai = provider_payload(ProviderKind::Openai, "gpt", &messages, Some(0.4), Some(123));
+        let openai = provider_payload(
+            ProviderKind::Openai,
+            "gpt",
+            &messages,
+            Some(0.4),
+            Some(123),
+            None,
+        );
         assert!((openai["temperature"].as_f64().unwrap() - 0.4).abs() < 0.0001);
         assert_eq!(openai["max_tokens"], 123);
         let anthropic = provider_payload(
@@ -1420,6 +1765,7 @@ mod tests {
             &messages,
             Some(0.4),
             Some(123),
+            None,
         );
         assert_eq!(anthropic["system"], "Be concise");
         assert_eq!(anthropic["max_tokens"], 123);
@@ -1429,6 +1775,7 @@ mod tests {
             &messages,
             Some(0.4),
             Some(123),
+            None,
         );
         assert_eq!(gemini["generationConfig"]["maxOutputTokens"], 123);
     }
@@ -1475,5 +1822,253 @@ mod tests {
             parse_model_path("codex/codex/gpt-5.6"),
             Some(("codex", "codex", "gpt-5.6"))
         );
+    }
+
+    fn msg(role: Role, content: &str) -> ChatMessage {
+        ChatMessage {
+            role,
+            content: content.into(),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    fn tool() -> ToolDef {
+        ToolDef {
+            name: "search_feed".into(),
+            description: "Search opportunities".into(),
+            input_schema: json!({"type": "object", "properties": {"q": {"type": "string"}}}),
+        }
+    }
+
+    /// A transcript that has already been through one round of tool use.
+    fn transcript() -> Vec<ChatMessage> {
+        vec![
+            msg(Role::User, "any IT work in Virginia?"),
+            ChatMessage {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".into(),
+                    name: "search_feed".into(),
+                    arguments: json!({"q": "IT Virginia"}),
+                }]),
+                tool_call_id: None,
+            },
+            ChatMessage {
+                role: Role::Tool,
+                content: "3 results".into(),
+                tool_calls: None,
+                tool_call_id: Some("call_1".into()),
+            },
+        ]
+    }
+
+    #[test]
+    fn openai_sends_tools_and_a_tool_role() {
+        let tools = [tool()];
+        let payload = provider_payload(
+            ProviderKind::Openai,
+            "gpt",
+            &transcript(),
+            None,
+            None,
+            Some(&tools),
+        );
+        assert_eq!(payload.pointer("/tools/0/type").unwrap(), "function");
+        assert_eq!(
+            payload.pointer("/tools/0/function/name").unwrap(),
+            "search_feed"
+        );
+        // OpenAI wants arguments as a JSON string, not an object.
+        let args = payload
+            .pointer("/messages/1/tool_calls/0/function/arguments")
+            .unwrap();
+        assert!(args.is_string(), "arguments must be a string, got {args}");
+        assert_eq!(payload.pointer("/messages/2/role").unwrap(), "tool");
+        assert_eq!(
+            payload.pointer("/messages/2/tool_call_id").unwrap(),
+            "call_1"
+        );
+    }
+
+    /// Anthropic has no tool role: a result is a user turn holding a
+    /// tool_result block, and the arguments stay an object.
+    #[test]
+    fn anthropic_carries_a_tool_result_as_a_user_block() {
+        let tools = [tool()];
+        let payload = provider_payload(
+            ProviderKind::Anthropic,
+            "claude",
+            &transcript(),
+            None,
+            None,
+            Some(&tools),
+        );
+        assert_eq!(payload.pointer("/tools/0/name").unwrap(), "search_feed");
+        assert!(payload.pointer("/tools/0/input_schema").is_some());
+        assert_eq!(
+            payload.pointer("/messages/1/content/0/type").unwrap(),
+            "tool_use"
+        );
+        assert!(
+            payload
+                .pointer("/messages/1/content/0/input")
+                .unwrap()
+                .is_object()
+        );
+        assert_eq!(payload.pointer("/messages/2/role").unwrap(), "user");
+        assert_eq!(
+            payload.pointer("/messages/2/content/0/type").unwrap(),
+            "tool_result"
+        );
+        assert_eq!(
+            payload
+                .pointer("/messages/2/content/0/tool_use_id")
+                .unwrap(),
+            "call_1"
+        );
+    }
+
+    /// Gemini keys a response by function *name* while the transcript only
+    /// carries the id, so the name has to be recovered from the earlier turn.
+    #[test]
+    fn gemini_recovers_the_function_name_from_the_call_id() {
+        let tools = [tool()];
+        let payload = provider_payload(
+            ProviderKind::Gemini,
+            "gemini",
+            &transcript(),
+            None,
+            None,
+            Some(&tools),
+        );
+        assert_eq!(
+            payload
+                .pointer("/tools/0/functionDeclarations/0/name")
+                .unwrap(),
+            "search_feed"
+        );
+        assert_eq!(
+            payload
+                .pointer("/contents/1/parts/0/functionCall/name")
+                .unwrap(),
+            "search_feed"
+        );
+        assert_eq!(
+            payload
+                .pointer("/contents/2/parts/0/functionResponse/name")
+                .unwrap(),
+            "search_feed",
+            "the id must resolve back to the name"
+        );
+    }
+
+    #[test]
+    fn tools_are_omitted_when_none_are_offered() {
+        let payload = provider_payload(
+            ProviderKind::Openai,
+            "gpt",
+            &[msg(Role::User, "hi")],
+            None,
+            None,
+            None,
+        );
+        assert!(payload.get("tools").is_none());
+        let empty: [ToolDef; 0] = [];
+        let payload = provider_payload(
+            ProviderKind::Anthropic,
+            "claude",
+            &[msg(Role::User, "hi")],
+            None,
+            None,
+            Some(&empty),
+        );
+        assert!(
+            payload.get("tools").is_none(),
+            "an empty list is not a tool offer"
+        );
+    }
+
+    #[test]
+    fn anthropic_streams_a_tool_call_in_two_parts() {
+        let start = translate_event(
+            ProviderKind::Anthropic,
+            "content_block_start",
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_9","name":"search_feed","input":{}}}"#,
+        )
+        .expect("a tool_use block must not be dropped");
+        let start: Value = serde_json::from_str(&start).unwrap();
+        assert_eq!(
+            start.pointer("/choices/0/delta/tool_calls/0/id").unwrap(),
+            "toolu_9"
+        );
+        assert_eq!(
+            start
+                .pointer("/choices/0/delta/tool_calls/0/function/name")
+                .unwrap(),
+            "search_feed"
+        );
+
+        let args = translate_event(
+            ProviderKind::Anthropic,
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"q\":"}}"#,
+        )
+        .expect("argument deltas must not be dropped");
+        let args: Value = serde_json::from_str(&args).unwrap();
+        assert_eq!(
+            args.pointer("/choices/0/delta/tool_calls/0/function/arguments")
+                .unwrap(),
+            "{\"q\":"
+        );
+        // Both halves must land on the same index so an accumulator joins them.
+        assert_eq!(
+            start.pointer("/choices/0/delta/tool_calls/0/index"),
+            args.pointer("/choices/0/delta/tool_calls/0/index")
+        );
+    }
+
+    #[test]
+    fn gemini_streams_a_whole_tool_call_at_once() {
+        let chunk = translate_event(
+            ProviderKind::Gemini,
+            "message",
+            r#"{"candidates":[{"content":{"parts":[{"functionCall":{"name":"search_feed","args":{"q":"IT"}}}]}}]}"#,
+        )
+        .expect("a functionCall must not be dropped");
+        let chunk: Value = serde_json::from_str(&chunk).unwrap();
+        assert_eq!(
+            chunk
+                .pointer("/choices/0/delta/tool_calls/0/function/name")
+                .unwrap(),
+            "search_feed"
+        );
+        let args = chunk
+            .pointer("/choices/0/delta/tool_calls/0/function/arguments")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(args.contains("\"q\""), "arguments arrive whole, got {args}");
+    }
+
+    /// The reason the normaliser was text-only is that text still has to work.
+    #[test]
+    fn plain_text_streaming_is_unchanged() {
+        for (kind, event, data) in [
+            (
+                ProviderKind::Anthropic,
+                "content_block_delta",
+                r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"Hi"}}"#,
+            ),
+            (
+                ProviderKind::Gemini,
+                "message",
+                r#"{"candidates":[{"content":{"parts":[{"text":"Hi"}]}}]}"#,
+            ),
+        ] {
+            let chunk = translate_event(kind, event, data).expect("text must survive");
+            let chunk: Value = serde_json::from_str(&chunk).unwrap();
+            assert_eq!(chunk.pointer("/choices/0/delta/content").unwrap(), "Hi");
+        }
     }
 }
