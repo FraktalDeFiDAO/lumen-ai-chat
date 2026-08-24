@@ -567,7 +567,13 @@ struct AppMetrics {
     coder_busy_rejections: AtomicU64,
 }
 
-pub fn build_router(config: Config) -> Result<Router, BuildError> {
+/// The API routes, mounted bare.
+///
+/// A composable router should not decide where it lives. `build_router` mounts
+/// these at `/api` for standalone use; an embedding host nests them wherever it
+/// keeps its own API, and applies its own authentication on the way in --
+/// nothing here authenticates anything.
+pub fn build_api_router(config: Config) -> Result<Router, BuildError> {
     config.validate()?;
     let coder_slots = Arc::new(Semaphore::new(config.coder_max_concurrency));
     let client = Client::builder()
@@ -587,18 +593,24 @@ pub fn build_router(config: Config) -> Result<Router, BuildError> {
         metrics: Arc::new(AppMetrics::default()),
     };
     Ok(Router::new()
-        .route("/api/health", get(health))
-        .route("/api/ready", get(ready))
-        .route("/api/metrics", get(metrics))
-        .route("/api/providers", get(providers))
-        .route("/api/coders", get(coder_statuses))
-        .route("/api/models", get(models))
-        .route("/api/chat", post(chat))
-        .fallback(not_found)
+        .route("/health", get(health))
+        .route("/ready", get(ready))
+        .route("/metrics", get(metrics))
+        .route("/providers", get(providers))
+        .route("/coders", get(coder_statuses))
+        .route("/models", get(models))
+        .route("/chat", post(chat))
         .with_state(state)
         .layer(DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES))
         .layer(TraceLayer::new_for_http()))
+}
+
+/// The standalone service: the API at `/api`, and a JSON 404 for anything else.
+pub fn build_router(config: Config) -> Result<Router, BuildError> {
+    Ok(Router::new()
+        .nest("/api", build_api_router(config)?)
+        .fallback(not_found))
 }
 
 #[derive(Debug, Error)]
