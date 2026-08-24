@@ -348,12 +348,15 @@ impl Config {
         if providers.is_empty() && coders.is_empty() {
             return Err(ConfigError::NoProviders);
         }
+        // Hosted providers win unless the operator explicitly selects a coder.
+        // Discovering a native CLI must not silently reroute an API-configured
+        // deployment through that CLI (and, for callers offering tools, coder
+        // routes cannot satisfy the request at all).
         let default_coder = env::var("AI_DEFAULT_CODER").unwrap_or_else(|_| {
-            if legacy_kind == Some(ProviderKind::OpenaiCompatible) {
-                "api".into()
-            } else {
-                "hermes".into()
-            }
+            providers
+                .first()
+                .map(|provider| provider.ai_coder.clone())
+                .unwrap_or_else(|| "hermes".into())
         });
         let provider_hint = env::var("AI_DEFAULT_PROVIDER").ok();
         let default_provider = coders
@@ -574,6 +577,22 @@ struct AppMetrics {
 /// keeps its own API, and applies its own authentication on the way in --
 /// nothing here authenticates anything.
 pub fn build_api_router(config: Config) -> Result<Router, BuildError> {
+    let state = gateway_state(config)?;
+    Ok(Router::new()
+        .route("/health", get(health))
+        .route("/ready", get(ready))
+        .route("/metrics", get(metrics))
+        .route("/providers", get(providers))
+        .route("/coders", get(coder_statuses))
+        .route("/models", get(models))
+        .route("/chat", post(chat))
+        .with_state(state)
+        .layer(DefaultBodyLimit::disable())
+        .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES))
+        .layer(TraceLayer::new_for_http()))
+}
+
+fn gateway_state(config: Config) -> Result<AppState, BuildError> {
     config.validate()?;
     let coder_slots = Arc::new(Semaphore::new(config.coder_max_concurrency));
     let client = Client::builder()
@@ -592,18 +611,7 @@ pub fn build_api_router(config: Config) -> Result<Router, BuildError> {
         coder_slots,
         metrics: Arc::new(AppMetrics::default()),
     };
-    Ok(Router::new()
-        .route("/health", get(health))
-        .route("/ready", get(ready))
-        .route("/metrics", get(metrics))
-        .route("/providers", get(providers))
-        .route("/coders", get(coder_statuses))
-        .route("/models", get(models))
-        .route("/chat", post(chat))
-        .with_state(state)
-        .layer(DefaultBodyLimit::disable())
-        .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES))
-        .layer(TraceLayer::new_for_http()))
+    Ok(state)
 }
 
 /// The standalone service: the API at `/api`, and a JSON 404 for anything else.
@@ -996,72 +1004,12 @@ async fn chat(
             }
         };
     }
-    let provider = requested_provider
-        .and_then(|provider_id| state.config.provider_route(requested_coder, provider_id));
-    let Some(provider) = provider else {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "unknown_route",
-            format!(
-                "AI coder/provider route `{}/{}` is not configured",
-                requested_coder,
-                requested_provider.unwrap_or("*")
-            ),
-        );
+    let (provider_kind, upstream) = match open_upstream(&state, &request).await {
+        Ok(pair) => pair,
+        Err(error) => return sse_error(&error.to_string()),
     };
-    let model = requested_model.unwrap_or(&provider.default_model);
-    if model.trim().is_empty()
-        || model.len() > MAX_MODEL_BYTES
-        || model.chars().any(char::is_control)
-    {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_request",
-            "model is invalid",
-        );
-    }
-    let upstream_payload = provider_payload(
-        provider.kind,
-        model,
-        &request.messages,
-        request.temperature,
-        request.max_tokens,
-        request.tools.as_deref(),
-    );
-    let upstream_request = authenticated(
-        state
-            .client
-            .post(provider.chat_endpoint(model))
-            .header(header::ACCEPT, "text/event-stream")
-            .json(&upstream_payload),
-        provider,
-    );
-    let upstream = match tokio::time::timeout(Duration::from_secs(30), upstream_request.send())
-        .await
-    {
-        Ok(Ok(response)) => response,
-        Ok(Err(error)) => {
-            tracing::warn!(provider = provider.id, error = %error, "chat upstream request failed");
-            return sse_error("The selected AI provider is unavailable");
-        }
-        Err(_) => return sse_error("The selected AI provider timed out"),
-    };
-    if !upstream.status().is_success() {
-        let status = upstream.status();
-        let detail = limited_error_body(upstream).await;
-        tracing::warn!(provider = provider.id, %status, upstream_detail = %detail, "chat upstream rejected request");
-        return sse_error(&format!("The selected AI provider returned {status}"));
-    }
-    let is_sse = upstream
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.to_ascii_lowercase().starts_with("text/event-stream"));
-    if !is_sse {
-        return sse_error("The selected AI provider returned an invalid stream");
-    }
 
-    let kind = provider.kind;
+    let kind = provider_kind;
     let source = upstream.bytes_stream().eventsource();
     let output = stream! {
         pin_mut!(source);
@@ -1087,6 +1035,252 @@ async fn chat(
     let mut response = Response::new(Body::from_stream(output));
     add_sse_headers(response.headers_mut());
     response
+}
+
+/// Why a completion could not be produced.
+#[derive(Debug, thiserror::Error)]
+pub enum CompletionError {
+    #[error("invalid chat request: {0}")]
+    InvalidRequest(&'static str),
+    #[error("ai_coder/provider fields conflict with the canonical model path")]
+    ConflictingRoute,
+    #[error("AI coder/provider route `{0}` is not configured")]
+    UnknownRoute(String),
+    #[error("model is invalid")]
+    InvalidModel,
+    #[error("The selected AI provider is unavailable")]
+    Unavailable,
+    #[error("The selected AI provider timed out")]
+    TimedOut,
+    #[error("The selected AI provider returned {0}")]
+    Upstream(StatusCode),
+    #[error("The selected AI provider returned an invalid stream")]
+    NotStreaming,
+    #[error("The selected AI provider stream was interrupted")]
+    StreamInterrupted,
+    #[error("The selected AI provider returned invalid arguments for tool `{0}`")]
+    InvalidToolArguments(String),
+    #[error("Tool calling is not supported on AI coder routes; select a hosted provider")]
+    ToolsOnCoderRoute,
+}
+
+/// Resolve the route, build the payload and open the upstream stream.
+///
+/// Shared by the streaming endpoint and [`Gateway::complete`] so the two cannot
+/// disagree about which provider a request reaches or what it is sent.
+async fn open_upstream(
+    state: &AppState,
+    request: &ChatRequest,
+) -> Result<(ProviderKind, reqwest::Response), CompletionError> {
+    let embedded = request.model.as_deref().and_then(parse_model_path);
+    let requested_coder = embedded
+        .map(|(coder, _, _)| coder)
+        .or(request.ai_coder.as_deref())
+        .unwrap_or(&state.config.default_coder);
+    let requested_provider = embedded
+        .map(|(_, provider, _)| provider)
+        .or(request.provider.as_deref())
+        .or(Some(state.config.default_provider.as_str()));
+    let requested_model = embedded
+        .map(|(_, _, model)| model)
+        .or(request.model.as_deref());
+
+    let provider = requested_provider
+        .and_then(|provider_id| state.config.provider_route(requested_coder, provider_id))
+        .ok_or_else(|| {
+            CompletionError::UnknownRoute(format!(
+                "{requested_coder}/{}",
+                requested_provider.unwrap_or("*")
+            ))
+        })?;
+
+    let model = requested_model.unwrap_or(&provider.default_model);
+    if model.trim().is_empty()
+        || model.len() > MAX_MODEL_BYTES
+        || model.chars().any(char::is_control)
+    {
+        return Err(CompletionError::InvalidModel);
+    }
+
+    let payload = provider_payload(
+        provider.kind,
+        model,
+        &request.messages,
+        request.temperature,
+        request.max_tokens,
+        request.tools.as_deref(),
+    );
+    let upstream_request = authenticated(
+        state
+            .client
+            .post(provider.chat_endpoint(model))
+            .header(header::ACCEPT, "text/event-stream")
+            .json(&payload),
+        provider,
+    );
+    let upstream = match tokio::time::timeout(Duration::from_secs(30), upstream_request.send())
+        .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            tracing::warn!(provider = provider.id, error = %error, "chat upstream request failed");
+            return Err(CompletionError::Unavailable);
+        }
+        Err(_) => return Err(CompletionError::TimedOut),
+    };
+    if !upstream.status().is_success() {
+        let status = upstream.status();
+        let detail = limited_error_body(upstream).await;
+        tracing::warn!(provider = provider.id, %status, upstream_detail = %detail, "chat upstream rejected request");
+        return Err(CompletionError::Upstream(status));
+    }
+    let is_sse = upstream
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().starts_with("text/event-stream"));
+    if !is_sse {
+        return Err(CompletionError::NotStreaming);
+    }
+    Ok((provider.kind, upstream))
+}
+
+/// One model turn, assembled.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Completion {
+    pub text: String,
+    /// Empty when the model answered rather than asking for a tool.
+    pub tool_calls: Vec<ToolCall>,
+}
+
+/// A programmatic handle on the gateway.
+///
+/// The HTTP endpoint streams, which is right for a person watching text appear
+/// and wrong for an agent loop that has to see a whole turn before deciding
+/// what to run. This assembles the stream and returns the finished turn.
+pub struct Gateway {
+    state: AppState,
+}
+
+impl Gateway {
+    pub fn new(config: Config) -> Result<Self, BuildError> {
+        Ok(Self {
+            state: gateway_state(config)?,
+        })
+    }
+
+    /// Run one turn to completion, returning the text and any tool calls.
+    pub async fn complete(&self, request: ChatRequest) -> Result<Completion, CompletionError> {
+        validate_chat(&request).map_err(CompletionError::InvalidRequest)?;
+        let embedded = request.model.as_deref().and_then(parse_model_path);
+        if embedded.is_some_and(|(coder, provider, _)| {
+            request
+                .ai_coder
+                .as_deref()
+                .is_some_and(|value| value != coder)
+                || request
+                    .provider
+                    .as_deref()
+                    .is_some_and(|value| value != provider)
+        }) {
+            return Err(CompletionError::ConflictingRoute);
+        }
+
+        let requested_coder = request
+            .ai_coder
+            .as_deref()
+            .or_else(|| embedded.map(|(coder, _, _)| coder))
+            .unwrap_or(&self.state.config.default_coder);
+        let requested_provider = request
+            .provider
+            .as_deref()
+            .or_else(|| embedded.map(|(_, provider, _)| provider))
+            .or_else(|| {
+                (requested_coder == self.state.config.default_coder)
+                    .then_some(self.state.config.default_provider.as_str())
+            });
+        let requested_model = embedded
+            .map(|(_, _, model)| model)
+            .or(request.model.as_deref());
+        if request.tools.as_ref().is_some_and(|t| !t.is_empty())
+            && let Some(provider_id) = requested_provider
+            && self
+                .state
+                .config
+                .coder_route(requested_coder, provider_id, requested_model)
+                .is_some()
+        {
+            return Err(CompletionError::ToolsOnCoderRoute);
+        }
+
+        let (kind, upstream) = open_upstream(&self.state, &request).await?;
+        let source = upstream.bytes_stream().eventsource();
+        pin_mut!(source);
+
+        let mut text = String::new();
+        // Arguments arrive in pieces keyed by index, so calls are assembled
+        // rather than read: id and name land once, the JSON accumulates.
+        let mut calls: std::collections::BTreeMap<u64, (String, String, String)> =
+            std::collections::BTreeMap::new();
+
+        let mut saw_done = false;
+        while let Some(event) = source.next().await {
+            let event = event.map_err(|_| CompletionError::StreamInterrupted)?;
+            let Some(data) = translate_event(kind, &event.event, &event.data) else {
+                continue;
+            };
+            if data == "[DONE]" {
+                saw_done = true;
+                break;
+            }
+            let Ok(chunk) = serde_json::from_str::<Value>(&data) else {
+                continue;
+            };
+            if let Some(part) = chunk
+                .pointer("/choices/0/delta/content")
+                .and_then(Value::as_str)
+            {
+                text.push_str(part);
+            }
+            for call in chunk
+                .pointer("/choices/0/delta/tool_calls")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
+                let entry = calls.entry(index).or_default();
+                if let Some(id) = call.get("id").and_then(Value::as_str) {
+                    entry.0 = id.to_string();
+                }
+                if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
+                    entry.1 = name.to_string();
+                }
+                if let Some(args) = call.pointer("/function/arguments").and_then(Value::as_str) {
+                    entry.2.push_str(args);
+                }
+            }
+        }
+
+        if !saw_done {
+            return Err(CompletionError::StreamInterrupted);
+        }
+
+        let tool_calls = calls
+            .into_values()
+            .filter(|(_, name, _)| !name.is_empty())
+            .map(|(id, name, arguments)| {
+                let arguments = serde_json::from_str(&arguments)
+                    .map_err(|_| CompletionError::InvalidToolArguments(name.clone()))?;
+                Ok(ToolCall {
+                    id,
+                    name,
+                    arguments,
+                })
+            })
+            .collect::<Result<Vec<_>, CompletionError>>()?;
+        Ok(Completion { text, tool_calls })
+    }
 }
 
 fn authenticated(request: RequestBuilder, provider: &ProviderConfig) -> RequestBuilder {
@@ -1499,8 +1693,29 @@ fn validate_chat(request: &ChatRequest) -> Result<(), &'static str> {
     }
     let mut total = 0usize;
     for message in &request.messages {
-        if message.content.trim().is_empty() {
+        let has_tool_calls = message
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| !calls.is_empty());
+        if message.content.trim().is_empty() && !(message.role == Role::Assistant && has_tool_calls)
+        {
             return Err("message content must not be empty");
+        }
+        if message.role == Role::Tool && message.tool_call_id.as_deref().is_none_or(str::is_empty) {
+            return Err("tool messages must identify their tool call");
+        }
+        if message.role != Role::Tool && message.tool_call_id.is_some() {
+            return Err("only tool messages may identify a tool call");
+        }
+        if message.role != Role::Assistant && message.tool_calls.is_some() {
+            return Err("only assistant messages may contain tool calls");
+        }
+        if let Some(calls) = &message.tool_calls {
+            for call in calls {
+                if call.id.is_empty() || !valid_provider_id(&call.name) {
+                    return Err("tool call is invalid");
+                }
+            }
         }
         if message.content.len() > MAX_CONTENT_BYTES {
             return Err("a message is too large");
@@ -2061,6 +2276,57 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap();
         assert!(args.contains("\"q\""), "arguments arrive whole, got {args}");
+    }
+
+    #[tokio::test]
+    async fn gateway_assembles_a_streamed_tool_call() {
+        use axum::body::Body;
+        use axum::http::Response as HttpResponse;
+
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                let body = concat!(
+                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"search_feed\",\"arguments\":\"{\\\"q\\\":\"}}]}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"IT\\\"}\"}}]}}]}\n\n",
+                    "data: [DONE]\n\n"
+                );
+                HttpResponse::builder()
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from(body))
+                    .unwrap()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut config = Config {
+            bind: "127.0.0.1:41788".parse().unwrap(),
+            providers: vec![provider("openai", ProviderKind::Openai)],
+            coders: Vec::new(),
+            default_coder: "hermes".into(),
+            default_provider: "openai".into(),
+            coder_workspace: PathBuf::from("."),
+            coder_timeout: Duration::from_secs(30),
+            coder_allow_writes: false,
+            coder_max_concurrency: 2,
+        };
+        config.providers[0].base_url = format!("http://{address}/v1");
+        let gateway = Gateway::new(config).unwrap();
+        let mut request = request();
+        request.tools = Some(vec![tool()]);
+
+        let completion = gateway.complete(request).await.unwrap();
+        assert_eq!(completion.text, "");
+        assert_eq!(
+            completion.tool_calls,
+            vec![ToolCall {
+                id: "call_1".into(),
+                name: "search_feed".into(),
+                arguments: json!({"q": "IT"}),
+            }]
+        );
     }
 
     /// The reason the normaliser was text-only is that text still has to work.
