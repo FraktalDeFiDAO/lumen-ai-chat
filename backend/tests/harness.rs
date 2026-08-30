@@ -20,6 +20,8 @@ use ai_chatbot_gateway::{
         transcript::Budget, workspace::Workspace,
     },
     identity::Identity,
+    quota::Limits,
+    workspaces::WorkspaceMode,
 };
 use axum::{
     Router,
@@ -140,6 +142,9 @@ fn config(address: SocketAddr, workspace: &std::path::Path) -> Config {
         coder_timeout: std::time::Duration::from_secs(30),
         coder_allow_writes: true,
         coder_max_concurrency: 2,
+        workspace_mode: WorkspaceMode::Shared,
+        quotas: Limits::default(),
+        trusted_proxy: false,
         harness: HarnessSettings::default(),
         store: StoreSettings {
             enabled: false,

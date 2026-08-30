@@ -11,6 +11,8 @@ use ai_chatbot_gateway::{
     Config, HarnessSettings, ProviderConfig, ProviderKind, StoreSettings, build_api_router,
     build_router,
     identity::{Identity, ProxyHeaders},
+    quota::Limits,
+    workspaces::WorkspaceMode,
 };
 use axum::{
     Router,
@@ -79,6 +81,9 @@ fn configured(address: SocketAddr, workspace: &Path, identity: Option<Identity>)
         coder_timeout: Duration::from_secs(30),
         coder_allow_writes: false,
         coder_max_concurrency: 2,
+        workspace_mode: WorkspaceMode::Shared,
+        quotas: Limits::default(),
+        trusted_proxy: false,
         harness: HarnessSettings {
             memory_dir: None,
             ..HarnessSettings::default()
@@ -913,4 +918,343 @@ async fn a_conversation_keeps_the_tool_activity_the_client_put_on_it() {
         read["messages"][1]["extra"],
         payload["messages"][1]["extra"]
     );
+}
+
+// ---------------------------------------------------------------------------
+// Per-user workspaces
+// ---------------------------------------------------------------------------
+
+fn per_user_router(base: &Path, memory: Option<&Path>) -> Router {
+    let address = "127.0.0.1:1".parse().unwrap();
+    let mut settings = configured(
+        address,
+        base,
+        Some(Identity::proxy(ProxyHeaders::default())),
+    );
+    settings.workspace_mode = WorkspaceMode::PerUser;
+    settings.coder_allow_writes = true;
+    settings.harness.memory_dir = memory.map(|path| path.to_path_buf());
+    build_api_router(settings).unwrap()
+}
+
+async fn harness_for(router: Router, user: &str) -> Value {
+    let (status, body) = as_user(router, user, get_request("/harness")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    serde_json::from_str(&body).unwrap()
+}
+
+#[tokio::test]
+async fn each_user_is_served_a_workspace_of_their_own() {
+    let base = tempfile::tempdir().unwrap();
+
+    let riley = harness_for(per_user_router(base.path(), None), "riley").await;
+    let sam = harness_for(per_user_router(base.path(), None), "sam").await;
+
+    let riley_root = riley["workspace"].as_str().unwrap();
+    let sam_root = sam["workspace"].as_str().unwrap();
+    assert_ne!(riley_root, sam_root);
+    assert!(riley_root.ends_with("/riley"), "{riley_root}");
+    assert!(sam_root.ends_with("/sam"), "{sam_root}");
+    assert_eq!(riley["writes_enabled"], true);
+}
+
+/// The point of the whole arrangement: a file one user's agent wrote is not
+/// something another user's agent can read.
+#[tokio::test]
+async fn a_file_written_in_one_workspace_is_unreachable_from_another() {
+    let base = tempfile::tempdir().unwrap();
+    let router = per_user_router(base.path(), None);
+
+    let riley = harness_for(router, "riley").await;
+    let riley_root = Path::new(riley["workspace"].as_str().unwrap());
+    std::fs::write(riley_root.join("secret.txt"), "private").unwrap();
+
+    // Sam's workspace resolves paths against Sam's root, so neither a relative
+    // climb nor Riley's absolute path reaches it.
+    let sam = harness_for(per_user_router(base.path(), None), "sam").await;
+    let sam_root = Path::new(sam["workspace"].as_str().unwrap());
+    assert!(!sam_root.join("secret.txt").exists());
+    assert!(!sam_root.starts_with(riley_root));
+}
+
+#[tokio::test]
+async fn each_user_indexes_only_their_own_files() {
+    let base = tempfile::tempdir().unwrap();
+    let indexes = tempfile::tempdir().unwrap();
+
+    let riley = harness_for(per_user_router(base.path(), Some(indexes.path())), "riley").await;
+    let riley_root = Path::new(riley["workspace"].as_str().unwrap());
+    std::fs::write(
+        riley_root.join("notes.md"),
+        "# Riley\nthe passphrase is hunter2\n",
+    )
+    .unwrap();
+
+    let (status, body) = as_user(
+        per_user_router(base.path(), Some(indexes.path())),
+        "riley",
+        post_json("/harness/index", json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let indexed: Value = serde_json::from_str(&body).unwrap();
+    assert!(indexed["records"].as_i64().unwrap() > 0, "{body}");
+
+    // Sam's index is a different index over a different tree, so it has nothing.
+    let (status, body) = as_user(
+        per_user_router(base.path(), Some(indexes.path())),
+        "sam",
+        post_json("/harness/index", json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let sam_indexed: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        sam_indexed["records"], 0,
+        "another user's files were indexed: {body}"
+    );
+
+    let sam = harness_for(per_user_router(base.path(), Some(indexes.path())), "sam").await;
+    assert_eq!(sam["memory"]["records"], 0);
+}
+
+#[tokio::test]
+async fn a_shared_deployment_still_serves_everyone_the_one_workspace() {
+    let workspace = tempfile::tempdir().unwrap();
+    let address = upstream().await;
+    let mut settings = configured(
+        address,
+        workspace.path(),
+        Some(Identity::proxy(ProxyHeaders::default())),
+    );
+    settings.workspace_mode = WorkspaceMode::Shared;
+
+    let riley = harness_for(build_api_router(settings.clone()).unwrap(), "riley").await;
+    let sam = harness_for(build_api_router(settings).unwrap(), "sam").await;
+    assert_eq!(riley["workspace"], sam["workspace"]);
+}
+
+/// No runtime check makes this safe, so it is refused before the service is
+/// listening rather than served and hoped about.
+#[tokio::test]
+async fn a_shared_writable_workspace_is_refused_for_a_multi_user_deployment() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut settings = configured(
+        "127.0.0.1:1".parse().unwrap(),
+        workspace.path(),
+        Some(Identity::proxy(ProxyHeaders::default())),
+    );
+    settings.workspace_mode = WorkspaceMode::Shared;
+    settings.coder_allow_writes = true;
+
+    let error = build_api_router(settings).unwrap_err().to_string();
+    assert!(
+        error.contains("shared writable workspace"),
+        "the refusal should explain itself: {error}"
+    );
+
+    // The same configuration for one person is exactly what it always was.
+    let mut single = configured("127.0.0.1:1".parse().unwrap(), workspace.path(), None);
+    single.workspace_mode = WorkspaceMode::Shared;
+    single.coder_allow_writes = true;
+    assert!(build_api_router(single).is_ok());
+}
+
+#[tokio::test]
+async fn the_harness_endpoints_need_an_identity_when_one_is_configured() {
+    let base = tempfile::tempdir().unwrap();
+
+    for request in [
+        get_request("/harness"),
+        post_json("/harness/index", json!({})),
+    ] {
+        let (status, _) = call(per_user_router(base.path(), None), request).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Quotas
+// ---------------------------------------------------------------------------
+
+fn metered_router(address: SocketAddr, workspace: &Path, limits: Limits) -> Router {
+    let mut settings = configured(
+        address,
+        workspace,
+        Some(Identity::proxy(ProxyHeaders::default())),
+    );
+    settings.quotas = limits;
+    build_api_router(settings).unwrap()
+}
+
+fn chat_request() -> Value {
+    json!({"messages": [{"role": "user", "content": "hello"}]})
+}
+
+#[tokio::test]
+async fn nothing_is_metered_until_a_quota_is_configured() {
+    let workspace = tempfile::tempdir().unwrap();
+    let address = upstream().await;
+
+    for _ in 0..5 {
+        let (status, body) = as_user(
+            metered_router(address, workspace.path(), Limits::default()),
+            "riley",
+            post_json("/chat", chat_request()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+}
+
+#[tokio::test]
+async fn a_request_budget_is_enforced_and_says_when_to_come_back() {
+    let workspace = tempfile::tempdir().unwrap();
+    let address = upstream().await;
+    let limits = Limits {
+        requests: 2,
+        tokens: 0,
+        window: Duration::from_secs(3600),
+    };
+    // One router, so the windows are shared the way they are in a real process.
+    let router = metered_router(address, workspace.path(), limits);
+
+    for _ in 0..2 {
+        let (status, _) =
+            as_user(router.clone(), "riley", post_json("/chat", chat_request())).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/chat")
+                .header("content-type", "application/json")
+                .header("x-forwarded-user", "riley")
+                .body(Body::from(chat_request().to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        response.headers().contains_key(header::RETRY_AFTER),
+        "a refusal a caller can retry should say when"
+    );
+    let body = String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+        .into_owned();
+    let value: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["error"]["type"], "quota_exceeded");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("2 of 2 requests"),
+        "{body}"
+    );
+}
+
+/// One person spending their budget must not stop anybody else working.
+#[tokio::test]
+async fn one_users_budget_does_not_refuse_another_user() {
+    let workspace = tempfile::tempdir().unwrap();
+    let address = upstream().await;
+    let router = metered_router(
+        address,
+        workspace.path(),
+        Limits {
+            requests: 1,
+            tokens: 0,
+            window: Duration::from_secs(3600),
+        },
+    );
+
+    let (first, _) = as_user(router.clone(), "riley", post_json("/chat", chat_request())).await;
+    assert_eq!(first, StatusCode::OK);
+    let (second, _) = as_user(router.clone(), "riley", post_json("/chat", chat_request())).await;
+    assert_eq!(second, StatusCode::TOO_MANY_REQUESTS);
+
+    let (other, body) = as_user(router, "sam", post_json("/chat", chat_request())).await;
+    assert_eq!(
+        other,
+        StatusCode::OK,
+        "sam was charged for riley's spending: {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_agent_endpoint_is_metered_from_the_same_budget() {
+    let workspace = tempfile::tempdir().unwrap();
+    let address = upstream().await;
+    let router = metered_router(
+        address,
+        workspace.path(),
+        Limits {
+            requests: 1,
+            tokens: 0,
+            window: Duration::from_secs(3600),
+        },
+    );
+
+    let (first, _) = as_user(router.clone(), "riley", post_json("/chat", chat_request())).await;
+    assert_eq!(first, StatusCode::OK);
+
+    let (second, body) = as_user(router, "riley", post_json("/agent", chat_request())).await;
+    assert_eq!(
+        second,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the agent loop spends from the same budget: {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_client_is_told_what_it_has_spent() {
+    let workspace = tempfile::tempdir().unwrap();
+    let address = upstream().await;
+    let limits = Limits {
+        requests: 10,
+        tokens: 5_000,
+        window: Duration::from_secs(1800),
+    };
+    let router = metered_router(address, workspace.path(), limits);
+
+    as_user(router.clone(), "riley", post_json("/chat", chat_request())).await;
+    let (status, body) = as_user(router, "riley", get_request("/me")).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let value: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["quota"]["requests_used"], 1);
+    assert_eq!(value["quota"]["requests_limit"], 10);
+    assert_eq!(value["quota"]["tokens_limit"], 5_000);
+    assert_eq!(value["quota"]["window_seconds"], 1800);
+}
+
+#[tokio::test]
+async fn an_unmetered_deployment_reports_no_quota_at_all() {
+    let (_, body) = me(None, &[]).await;
+    assert!(body["quota"].is_null(), "{body}");
+}
+
+#[tokio::test]
+async fn refusals_are_counted_for_an_operator_to_see() {
+    let workspace = tempfile::tempdir().unwrap();
+    let address = upstream().await;
+    let router = metered_router(
+        address,
+        workspace.path(),
+        Limits {
+            requests: 1,
+            tokens: 0,
+            window: Duration::from_secs(3600),
+        },
+    );
+
+    as_user(router.clone(), "riley", post_json("/chat", chat_request())).await;
+    as_user(router.clone(), "riley", post_json("/chat", chat_request())).await;
+
+    let (_, body) = as_user(router, "riley", get_request("/metrics")).await;
+    assert!(body.contains("lumen_quota_rejections_total 1"), "{body}");
 }

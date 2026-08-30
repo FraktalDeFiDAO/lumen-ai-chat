@@ -358,6 +358,64 @@ Note that the store is the deployment's first piece of persistent state: the API
 container currently runs entirely on tmpfs with a read-only root, so a hosted
 deployment needs a real volume for it.
 
+## Serving more than one person
+
+Three things have to be true together, and each is refused rather than assumed.
+
+**Files.** The harness confines its tools to one root. With one person that was
+the whole answer. With several it is not: a shared root anyone can write to is a
+channel between them, and `search_memory` will retrieve whatever was left there.
+
+```bash
+export AI_WORKSPACE_MODE=per_user      # default: shared
+```
+
+`per_user` gives each person a subtree of their own, created on first use, and
+an index of their own over it. `shared` stays correct for a read-only workspace —
+one project, everyone reading the same files, nobody able to leave anything for
+anyone. The combination that cannot be made safe, several people writing to one
+root, is refused at startup.
+
+**Spending.** An agent run is up to twelve model turns, each of which may call
+tools whose output comes back as more input. Step count was the only ceiling,
+and step count is not a budget.
+
+```bash
+export AI_QUOTA_REQUESTS_PER_WINDOW=200
+export AI_QUOTA_TOKENS_PER_WINDOW=2000000
+export AI_QUOTA_WINDOW_SECONDS=3600     # default: 3600
+```
+
+Both are per user and off by default. A refusal is `429` with `Retry-After`, and
+`GET /api/me` reports what the caller has spent. Tokens are counted only where a
+provider reports them — OpenAI-compatible providers are asked to include usage,
+Anthropic reports input and output separately, Gemini repeats a running total —
+and a run that reports nothing is charged nothing. A native coder CLI reports no
+usage, so token budgets do not constrain those routes; request budgets do.
+
+**The network.** Identity is asserted by a header, which is worth something only
+if nothing but the proxy can set it. On loopback that is a property of the
+machine; off it, it is a property of the network, which this process cannot
+check.
+
+```bash
+export APP_BIND=0.0.0.0:41788
+export AI_IDENTITY_MODE=proxy
+export AI_TRUSTED_PROXY=true
+```
+
+All three, or the service refuses to start. Neither switch works without the
+other, and relaxing the bind relaxes nothing else: a remote deployment with
+several users still cannot share a writable workspace.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `AI_WORKSPACE_MODE` | `shared` | `per_user` for a subtree and index per person |
+| `AI_QUOTA_REQUESTS_PER_WINDOW` | `0` (unlimited) | Requests one person may make per window |
+| `AI_QUOTA_TOKENS_PER_WINDOW` | `0` (unlimited) | Tokens one person may spend per window |
+| `AI_QUOTA_WINDOW_SECONDS` | `3600` | Window length, 60–86400 |
+| `AI_TRUSTED_PROXY` | off | Assert that a proxy authenticates in front |
+
 ## Quality gates
 
 ```bash
