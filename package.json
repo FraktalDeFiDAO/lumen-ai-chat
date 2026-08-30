@@ -10,7 +10,7 @@
     "build": "vue-tsc -b && vite build",
     "build:server": "cargo build --manifest-path backend/Cargo.toml --workspace",
     "check:server": "cargo fmt --manifest-path backend/Cargo.toml --all --check && cargo clippy --manifest-path backend/Cargo.toml --workspace --all-targets -- -D warnings && cargo test --manifest-path backend/Cargo.toml --workspace",
-    "typecheck": "vue-tsc -b",
+    "typecheck": "vue-tsc -b && vue-tsc -b tsconfig.test.json",
     "test": "vitest run",
     "test:e2e": "node tests/run-e2e.mjs",
     "test:podman": "playwright test --config playwright.podman.config.ts",
