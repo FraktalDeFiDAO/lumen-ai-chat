@@ -80,7 +80,79 @@ const conflict = await fetch(`${baseURL}/api/chat`, {
 })
 assert.equal(conflict.status, 400)
 assert.equal((await conflict.json()).error.type, 'conflicting_route')
+// ---------------------------------------------------------------------------
+// The agent harness
+// ---------------------------------------------------------------------------
+
+const harnessResponse = await fetch(`${baseURL}/api/harness`)
+assert.equal(harnessResponse.ok, true)
+const harness = await harnessResponse.json()
+assert.equal(harness.writes_enabled, false)
+assert.ok(harness.max_steps >= 1)
+// A read-only workspace must not advertise tools that can only fail.
+assert.deepEqual(new Set(harness.tools), new Set(['read_file', 'list_directory', 'search_text', 'search_memory']))
+assert.equal(harness.memory.records, 0, 'a fresh index holds nothing')
+
+// Indexing is what makes search_memory answer anything at all.
+const indexResponse = await fetch(`${baseURL}/api/harness/index`, { method: 'POST' })
+assert.equal(indexResponse.ok, true)
+const indexed = await indexResponse.json()
+assert.ok(indexed.files > 0, `Expected the workspace to yield files, received ${indexed.files}`)
+assert.ok(indexed.records > 0, `Expected the workspace to yield records, received ${indexed.records}`)
+assert.equal((await (await fetch(`${baseURL}/api/harness`)).json()).memory.records, indexed.records)
+
+/// Read one agent run, returning every frame it emitted.
+async function agent(body) {
+  const response = await fetch(`${baseURL}/api/agent`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'text/event-stream' },
+    body: JSON.stringify(body),
+  })
+  assert.equal(response.ok, true, `Agent request failed with ${response.status}`)
+  const frames = []
+  for (const block of (await response.text()).split(/\r?\n\r?\n/)) {
+    const line = block.split(/\r?\n/).find(value => value.startsWith('data:'))
+    if (!line) continue
+    const data = line.slice(5).trim()
+    if (data === '[DONE]') { frames.push({ event: 'done' }); continue }
+    frames.push(JSON.parse(data))
+  }
+  return frames
+}
+
+// A hosted provider: the harness drives the loop and terminates it.
+for (const [aiCoder, provider, model] of [
+  ['api', 'openai', 'openai-test'],
+  ['api', 'anthropic', 'anthropic-test'],
+  ['api', 'gemini', 'gemini-test'],
+  ['api', 'ollama', 'ollama-test'],
+]) {
+  const frames = await agent({
+    ai_coder: aiCoder,
+    provider,
+    model: `${aiCoder}/${provider}/${model}`,
+    messages: [{ role: 'user', content: 'Summarise the repository.' }],
+  })
+  assert.deepEqual(frames.at(-1), { event: 'done' }, `${provider} stream must terminate`)
+  const outcome = frames.find(frame => frame.event === 'outcome')
+  assert.ok(outcome, `${provider} produced no outcome: ${JSON.stringify(frames)}`)
+  assert.match(outcome.text, /Mock response received:/, `${provider} lost the model's answer`)
+  assert.equal(outcome.stopped_at_step_limit, false, `${provider} did not finish`)
+}
+
+// A native CLI coder: already an agent, so the harness delegates one pass.
+const delegated = await agent({
+  ai_coder: 'hermes',
+  provider: 'z.ai',
+  model: 'hermes/z.ai/glm-5.2',
+  messages: [{ role: 'user', content: 'Summarise the repository.' }],
+})
+assert.ok(delegated.some(frame => frame.event === 'delegated'), `Expected delegation: ${JSON.stringify(delegated)}`)
+const delegatedOutcome = delegated.find(frame => frame.event === 'outcome')
+assert.match(delegatedOutcome.text, /Mock coder response: hermes read-only/)
+assert.equal(delegatedOutcome.tool_calls, 0, 'a delegated run runs no tools of its own')
+
 const finalMetrics = await (await fetch(`${baseURL}/api/metrics`)).text()
 const requestCount = Number(finalMetrics.match(/lumen_chat_requests_total (\d+)/)?.[1] ?? 0)
 assert.ok(requestCount >= 10, `Expected chat request metric to mutate, received ${requestCount}`)
-console.log('Contracts passed: five native AI coder CLIs plus four direct provider protocols')
+console.log('Contracts passed: five native AI coder CLIs, four direct provider protocols, and the agent harness over both')

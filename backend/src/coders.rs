@@ -431,10 +431,17 @@ fn copy_directory(source: &Path, destination: &Path, copied: &mut u64) -> Result
     Ok(())
 }
 
-fn excluded_workspace_entry(name: &str) -> bool {
+pub(crate) fn excluded_workspace_entry(name: &str) -> bool {
     matches!(
         name,
-        ".git" | ".claude-flow" | ".venv" | "coverage" | "dist" | "node_modules" | "target"
+        ".git"
+            | ".claude-flow"
+            | ".venv"
+            | "coverage"
+            | "data"
+            | "dist"
+            | "node_modules"
+            | "target"
     ) || name == ".env"
         || name.starts_with(".env.")
         || matches!(name, ".netrc" | ".npmrc" | ".pypirc" | "credentials.json")
@@ -608,10 +615,13 @@ mod tests {
         std::fs::write(source.path().join(".env"), "SECRET=do-not-copy\n").unwrap();
         std::fs::create_dir(source.path().join("node_modules")).unwrap();
         std::fs::write(source.path().join("node_modules/package.js"), "ignored").unwrap();
+        std::fs::create_dir(source.path().join("data")).unwrap();
+        std::fs::write(source.path().join("data/application.db"), "private state").unwrap();
 
         let copy = prepare_read_only_workspace(source.path()).unwrap();
         assert!(copy.path().join("main.rs").is_file());
         assert!(!copy.path().join(".env").exists());
         assert!(!copy.path().join("node_modules").exists());
+        assert!(!copy.path().join("data").exists());
     }
 }

@@ -1,6 +1,15 @@
 export type Role = 'user' | 'assistant'
 export type Feedback = 'up' | 'down' | null
 
+/// One tool the agent harness ran, from the call to its result.
+export interface ToolActivity {
+  id: string
+  name: string
+  arguments?: unknown
+  output?: string
+  failed?: boolean
+}
+
 export interface Message {
   id: string
   role: Role
@@ -8,6 +17,12 @@ export interface Message {
   createdAt: number
   error?: string
   feedback?: Feedback
+  /// Present only for answers produced by the agent harness.
+  tools?: ToolActivity[]
+  /// Records the harness retrieved from the codebase index before answering.
+  contextRecords?: number
+  /// The harness hit its step limit, so the answer above is incomplete.
+  incomplete?: boolean
 }
 
 export interface Conversation {

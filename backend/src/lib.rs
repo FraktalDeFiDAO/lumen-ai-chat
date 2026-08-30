@@ -11,7 +11,15 @@ use std::{
     time::Duration,
 };
 
-mod coders;
+pub mod coders;
+pub mod harness;
+
+use crate::harness::{
+    Harness, HarnessConfig, HarnessEvent,
+    memory::HarnessMemory,
+    tools::{ToolContext, ToolRegistry},
+    workspace::{Workspace, WorkspaceError},
+};
 
 use async_stream::stream;
 use axum::{
@@ -28,7 +36,7 @@ use reqwest::{Client, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc};
 use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
@@ -40,6 +48,8 @@ const MAX_ERROR_BYTES: usize = 64 * 1024;
 const MAX_CUSTOM_PROVIDERS: usize = 20;
 const DEFAULT_CODER_TIMEOUT_SECONDS: u64 = 300;
 const DEFAULT_CODER_CONCURRENCY: usize = 2;
+const DEFAULT_HARNESS_MAX_STEPS: usize = 12;
+const DEFAULT_HARNESS_MEMORY_HITS: usize = 6;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -114,6 +124,43 @@ impl ProviderConfig {
     }
 }
 
+/// How the agent harness behaves for this deployment.
+///
+/// Separate from the coder settings above because they answer a different
+/// question: those decide how a *native CLI* is invoked, these decide how the
+/// gateway itself drives a hosted model through a tool loop.
+#[derive(Clone, Debug)]
+pub struct HarnessSettings {
+    /// Where the codebase index lives. `None` disables retrieval, and the
+    /// harness then does not advertise `search_memory` at all.
+    pub memory_dir: Option<PathBuf>,
+    /// Whether failing to open the index should stop the service.
+    ///
+    /// True when an operator named the directory: they asked for retrieval, and
+    /// silently starting without it would hide the misconfiguration. False for
+    /// the default location, which is a guess -- and a wrong guess is routine,
+    /// since the standard deployment mounts the workspace read-only.
+    pub memory_required: bool,
+    /// Build the index at startup rather than leaving it to a later request.
+    pub index_on_start: bool,
+    /// Model turns before the loop gives up, however many tools each one calls.
+    pub max_steps: usize,
+    /// Records retrieved before the first turn. Zero waits to be asked.
+    pub memory_hits: usize,
+}
+
+impl Default for HarnessSettings {
+    fn default() -> Self {
+        Self {
+            memory_dir: None,
+            memory_required: false,
+            index_on_start: false,
+            max_steps: DEFAULT_HARNESS_MAX_STEPS,
+            memory_hits: DEFAULT_HARNESS_MEMORY_HITS,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub bind: SocketAddr,
@@ -125,6 +172,7 @@ pub struct Config {
     pub coder_timeout: Duration,
     pub coder_allow_writes: bool,
     pub coder_max_concurrency: usize,
+    pub harness: HarnessSettings,
 }
 
 #[derive(Debug, Deserialize)]
@@ -352,12 +400,8 @@ impl Config {
         // Discovering a native CLI must not silently reroute an API-configured
         // deployment through that CLI (and, for callers offering tools, coder
         // routes cannot satisfy the request at all).
-        let default_coder = env::var("AI_DEFAULT_CODER").unwrap_or_else(|_| {
-            providers
-                .first()
-                .map(|provider| provider.ai_coder.clone())
-                .unwrap_or_else(|| "hermes".into())
-        });
+        let default_coder = env::var("AI_DEFAULT_CODER")
+            .unwrap_or_else(|_| default_coder_for_backends(&providers, &coders));
         let provider_hint = env::var("AI_DEFAULT_PROVIDER").ok();
         let default_provider = coders
             .iter()
@@ -411,6 +455,32 @@ impl Config {
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| (1..=16).contains(value))
             .unwrap_or(DEFAULT_CODER_CONCURRENCY);
+        // The index lives under `data/`, which the workspace exclusion list
+        // already hides: without that the indexer would walk its own segments
+        // and the read-only workspace copy would carry them into every CLI run.
+        let (memory_dir, memory_required) = if env_disabled("AI_HARNESS_MEMORY") {
+            (None, false)
+        } else {
+            match env::var("AI_HARNESS_MEMORY_DIR") {
+                Ok(configured) => (Some(PathBuf::from(configured)), true),
+                Err(_) => (Some(coder_workspace.join("data/memory")), false),
+            }
+        };
+        let harness = HarnessSettings {
+            memory_dir,
+            memory_required,
+            index_on_start: env_flag("AI_HARNESS_INDEX_ON_START"),
+            max_steps: env::var("AI_HARNESS_MAX_STEPS")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|value| (1..=50).contains(value))
+                .unwrap_or(DEFAULT_HARNESS_MAX_STEPS),
+            memory_hits: env::var("AI_HARNESS_MEMORY_HITS")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|value| *value <= 25)
+                .unwrap_or(DEFAULT_HARNESS_MEMORY_HITS),
+        };
         let config = Self {
             bind,
             providers,
@@ -421,6 +491,7 @@ impl Config {
             coder_timeout,
             coder_allow_writes: env_flag("AI_CODER_ALLOW_WRITES"),
             coder_max_concurrency,
+            harness,
         };
         config.validate()?;
         Ok(config)
@@ -496,6 +567,36 @@ impl Config {
         })
     }
 
+    /// The route a request names, applying every default in one place.
+    fn route_for<'a>(&'a self, request: &'a ChatRequest) -> Route<'a> {
+        let embedded = request.model.as_deref().and_then(parse_model_path);
+        let coder = request
+            .ai_coder
+            .as_deref()
+            .or_else(|| embedded.map(|(coder, _, _)| coder))
+            .unwrap_or(&self.default_coder);
+        Route {
+            coder,
+            provider: request
+                .provider
+                .as_deref()
+                .or_else(|| embedded.map(|(_, provider, _)| provider))
+                .or_else(|| {
+                    (coder == self.default_coder).then_some(self.default_provider.as_str())
+                }),
+            model: embedded
+                .map(|(_, _, model)| model)
+                .or(request.model.as_deref()),
+        }
+    }
+
+    /// The native CLI serving this route, if one does.
+    fn native_route(&self, route: &Route<'_>) -> Option<&coders::CoderRoute> {
+        route
+            .provider
+            .and_then(|provider| self.coder_route(route.coder, provider, route.model))
+    }
+
     fn coder_route(
         &self,
         coder: &str,
@@ -508,6 +609,41 @@ impl Config {
                 && model.is_none_or(|value| route.model == value)
         })
     }
+}
+
+/// The route a request selects, before any decision about how to serve it.
+///
+/// Resolving this once is what keeps `complete` and `execution_for` from
+/// disagreeing about where a request would have gone — a disagreement the
+/// harness would experience as the gateway refusing tools it had just been
+/// told the route accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Route<'a> {
+    coder: &'a str,
+    provider: Option<&'a str>,
+    model: Option<&'a str>,
+}
+
+/// How a request will actually be served.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Execution {
+    /// A hosted provider API. The harness offers tools and runs them itself.
+    Hosted,
+    /// A native coder CLI, which runs its own agent loop with its own tools.
+    /// The harness delegates the turn rather than driving it.
+    Native,
+}
+
+fn default_coder_for_backends(
+    providers: &[ProviderConfig],
+    coders: &[coders::CoderRoute],
+) -> String {
+    providers
+        .first()
+        .map(|provider| provider.ai_coder.clone())
+        .or_else(|| coders.first().map(|route| route.kind.id().to_string()))
+        .unwrap_or_else(|| "hermes".into())
 }
 
 fn valid_provider_id(id: &str) -> bool {
@@ -534,6 +670,18 @@ fn parse_model_path(value: &str) -> Option<(&str, &str, &str)> {
 }
 fn env_key(name: &str) -> Option<String> {
     env::var(name).ok().filter(|key| !key.is_empty())
+}
+/// Whether an opt-out flag is set. Distinct from `env_flag`: this feature is on
+/// by default, so an unset variable must not read as "off".
+fn env_disabled(name: &str) -> bool {
+    env::var(name)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "off" | "false" | "no" | "disabled"
+            )
+        })
+        .unwrap_or(false)
 }
 fn env_flag(name: &str) -> bool {
     env::var(name).ok().is_some_and(|value| {
@@ -562,11 +710,45 @@ struct AppState {
     client: Client,
     coder_slots: Arc<Semaphore>,
     metrics: Arc<AppMetrics>,
+    /// The canonical root every harness tool is confined to.
+    workspace: Workspace,
+    /// `None` when retrieval is disabled or the index could not be opened; the
+    /// harness then simply does not offer `search_memory`.
+    memory: Option<Arc<HarnessMemory>>,
+}
+
+impl AppState {
+    /// A harness over this state.
+    ///
+    /// Built per request rather than held in the state, because a `Harness`
+    /// owns an `Arc<Gateway>` and a `Gateway` owns this state: keeping one here
+    /// would be a reference cycle that never drops. Construction is cheap --
+    /// the index and the HTTP client are shared, not rebuilt.
+    fn harness(&self) -> Harness {
+        let context = ToolContext {
+            workspace: self.workspace.clone(),
+            memory: self.memory.clone(),
+        };
+        Harness::new(
+            Arc::new(Gateway {
+                state: self.clone(),
+            }),
+            context,
+            HarnessConfig {
+                max_steps: self.config.harness.max_steps,
+                budget: harness::transcript::Budget::default(),
+                memory_hits: self.config.harness.memory_hits,
+                inject_memory: self.config.harness.memory_hits > 0,
+            },
+        )
+    }
 }
 
 #[derive(Default)]
 struct AppMetrics {
     chat_requests: AtomicU64,
+    agent_requests: AtomicU64,
+    tool_calls: AtomicU64,
     coder_busy_rejections: AtomicU64,
 }
 
@@ -586,6 +768,9 @@ pub fn build_api_router(config: Config) -> Result<Router, BuildError> {
         .route("/coders", get(coder_statuses))
         .route("/models", get(models))
         .route("/chat", post(chat))
+        .route("/agent", post(agent))
+        .route("/harness", get(harness_status))
+        .route("/harness/index", post(reindex))
         .with_state(state)
         .layer(DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES))
@@ -605,13 +790,76 @@ fn gateway_state(config: Config) -> Result<AppState, BuildError> {
             env!("CARGO_PKG_VERSION")
         ))
         .build()?;
+    let workspace = Workspace::new(&config.coder_workspace, config.coder_allow_writes)?;
+    let memory = open_memory(&config, &workspace)?;
     let state = AppState {
         config: Arc::new(config),
         client,
         coder_slots,
         metrics: Arc::new(AppMetrics::default()),
+        workspace,
+        memory,
     };
     Ok(state)
+}
+
+/// Open the codebase index, and start building it if asked to.
+///
+/// Opening is cheap enough to do inline -- it maps the segments and rebuilds the
+/// graph from rows already committed. Indexing a whole tree is not, so it runs
+/// on a blocking thread and the service starts serving immediately: an index
+/// that is still filling answers fewer queries, which is a better failure than
+/// a gateway that will not start.
+fn open_memory(
+    config: &Config,
+    workspace: &Workspace,
+) -> Result<Option<Arc<HarnessMemory>>, BuildError> {
+    let Some(directory) = &config.harness.memory_dir else {
+        return Ok(None);
+    };
+    let memory = match HarnessMemory::open(directory, workspace.root()) {
+        Ok(memory) => Arc::new(memory),
+        // The default location is a guess, and the standard deployment mounts
+        // the workspace read-only, so a failure there is a reason to run
+        // without retrieval rather than a reason not to start. Say so loudly:
+        // `/harness` will report no memory, and `/harness/index` will explain.
+        Err(error) if !config.harness.memory_required => {
+            tracing::warn!(
+                %error,
+                directory = %directory.display(),
+                "codebase memory unavailable; the harness will run without retrieval. \
+                 Set AI_HARNESS_MEMORY_DIR to a writable path to enable it"
+            );
+            return Ok(None);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    tracing::info!(
+        records = memory.live_count(),
+        directory = %directory.display(),
+        "codebase memory opened"
+    );
+
+    if config.harness.index_on_start {
+        let memory = Arc::clone(&memory);
+        // `spawn_blocking` panics with no reactor, and `Config` is usable
+        // outside one -- a test constructing a gateway directly, for instance.
+        match tokio::runtime::Handle::try_current() {
+            Ok(_) => {
+                tokio::task::spawn_blocking(move || match memory.index_workspace() {
+                    Ok(stats) => tracing::info!(
+                        files = stats.files,
+                        records = stats.records,
+                        skipped = stats.skipped,
+                        "codebase index built"
+                    ),
+                    Err(error) => tracing::warn!(%error, "codebase indexing failed"),
+                });
+            }
+            Err(_) => tracing::warn!("no reactor available; skipping startup indexing"),
+        }
+    }
+    Ok(Some(memory))
 }
 
 /// The standalone service: the API at `/api`, and a JSON 404 for anything else.
@@ -627,6 +875,10 @@ pub enum BuildError {
     Config(#[from] ConfigError),
     #[error("failed to build HTTP client: {0}")]
     Http(#[from] reqwest::Error),
+    #[error("the harness workspace is unusable: {0}")]
+    Workspace(#[from] WorkspaceError),
+    #[error("codebase memory is unusable: {0}")]
+    Memory(#[from] harness::memory::HarnessMemoryError),
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -662,6 +914,12 @@ async fn metrics(State(state): State<AppState>) -> Response {
         concat!(
             "# TYPE lumen_chat_requests_total counter\n",
             "lumen_chat_requests_total {}\n",
+            "# TYPE lumen_agent_requests_total counter\n",
+            "lumen_agent_requests_total {}\n",
+            "# TYPE lumen_agent_tool_calls_total counter\n",
+            "lumen_agent_tool_calls_total {}\n",
+            "# TYPE lumen_memory_records gauge\n",
+            "lumen_memory_records {}\n",
             "# TYPE lumen_coder_busy_rejections_total counter\n",
             "lumen_coder_busy_rejections_total {}\n",
             "# TYPE lumen_coder_slots_available gauge\n",
@@ -672,6 +930,12 @@ async fn metrics(State(state): State<AppState>) -> Response {
             "lumen_configured_providers {}\n",
         ),
         state.metrics.chat_requests.load(Ordering::Relaxed),
+        state.metrics.agent_requests.load(Ordering::Relaxed),
+        state.metrics.tool_calls.load(Ordering::Relaxed),
+        state
+            .memory
+            .as_ref()
+            .map_or(0, |memory| memory.live_count()),
         state.metrics.coder_busy_rejections.load(Ordering::Relaxed),
         state.coder_slots.available_permits(),
         state.config.coders.len(),
@@ -1037,6 +1301,143 @@ async fn chat(
     response
 }
 
+/// Run the agent harness, streaming what it does as it does it.
+///
+/// `/chat` streams a model's text and hands any tool calls back for the caller
+/// to run. This runs them, which is the whole difference: the response is a
+/// record of an agent working, not a transcript of one asking.
+///
+/// The frames are JSON objects tagged by `event`, terminated by `[DONE]` like
+/// every other stream this service produces, so a client that only knows how to
+/// read text can still follow the `text` frames and ignore the rest.
+async fn agent(
+    State(state): State<AppState>,
+    payload: Result<Json<ChatRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(error) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                error.body_text(),
+            );
+        }
+    };
+    if let Err(message) = validate_chat(&request) {
+        return json_error(StatusCode::BAD_REQUEST, "invalid_request", message);
+    }
+    state.metrics.agent_requests.fetch_add(1, Ordering::Relaxed);
+
+    let metrics = Arc::clone(&state.metrics);
+    let harness = state.harness();
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    // The run owns the sender, so the channel closes when the run ends and the
+    // loop below terminates without needing a sentinel.
+    let run = tokio::spawn(async move { harness.run(request, Some(sender)).await });
+
+    let output = stream! {
+        while let Some(event) = receiver.recv().await {
+            if matches!(event, HarnessEvent::ToolResult { .. }) {
+                metrics.tool_calls.fetch_add(1, Ordering::Relaxed);
+            }
+            yield Ok::<Bytes, std::io::Error>(frame(&event));
+        }
+        let closing = match run.await {
+            Ok(Ok(outcome)) => json!({
+                "event": "outcome",
+                "text": outcome.text,
+                "steps": outcome.steps,
+                "tool_calls": outcome.tool_calls,
+                "stopped_at_step_limit": outcome.stopped_at_step_limit,
+            }),
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "harness run failed");
+                error_payload(&error.to_string())
+            }
+            Err(error) => {
+                tracing::error!(%error, "harness task did not finish");
+                error_payload("The agent harness stopped unexpectedly")
+            }
+        };
+        yield Ok(frame(&closing));
+        yield Ok(Bytes::from_static(b"data: [DONE]\n\n"));
+    };
+
+    let mut response = Response::new(Body::from_stream(output));
+    add_sse_headers(response.headers_mut());
+    response
+}
+
+/// What the harness can do here, so a client can show it rather than guess.
+async fn harness_status(State(state): State<AppState>) -> Json<Value> {
+    let context = ToolContext {
+        workspace: state.workspace.clone(),
+        memory: state.memory.clone(),
+    };
+    Json(json!({
+        "workspace": state.workspace.root().display().to_string(),
+        "writes_enabled": state.workspace.allows_writes(),
+        "max_steps": state.config.harness.max_steps,
+        "memory": state.memory.as_ref().map(|memory| json!({
+            "records": memory.live_count(),
+            "retrieved_per_turn": state.config.harness.memory_hits,
+        })),
+        "tools": ToolRegistry::builtin(&context).names(),
+    }))
+}
+
+/// Rebuild the codebase index.
+///
+/// Idempotent: `index_file` tombstones a path's old rows before writing new
+/// ones, so running this twice replaces rows rather than duplicating them.
+async fn reindex(State(state): State<AppState>) -> Response {
+    let Some(memory) = state.memory.clone() else {
+        return json_error(
+            StatusCode::CONFLICT,
+            "memory_disabled",
+            "codebase memory is disabled; set AI_HARNESS_MEMORY_DIR to enable it",
+        );
+    };
+    // A whole-tree index is minutes of CPU on a large repository, and the
+    // reactor is also serving every other request on this process.
+    match tokio::task::spawn_blocking(move || memory.index_workspace()).await {
+        Ok(Ok(stats)) => Json(json!({
+            "files": stats.files,
+            "records": stats.records,
+            "skipped": stats.skipped,
+        }))
+        .into_response(),
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "codebase indexing failed");
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "index_failed",
+                "codebase indexing failed",
+            )
+        }
+        Err(error) => {
+            tracing::error!(%error, "indexing task did not finish");
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "index_failed",
+                "codebase indexing did not finish",
+            )
+        }
+    }
+}
+
+/// One SSE frame carrying a JSON value.
+fn frame(value: &impl Serialize) -> Bytes {
+    match serde_json::to_string(value) {
+        Ok(json) => Bytes::from(format!("data: {json}\n\n")),
+        Err(error) => Bytes::from(format!(
+            "data: {}\n\n",
+            error_payload(&format!("failed to encode a harness event: {error}"))
+        )),
+    }
+}
+
 /// Why a completion could not be produced.
 #[derive(Debug, thiserror::Error)]
 pub enum CompletionError {
@@ -1060,8 +1461,16 @@ pub enum CompletionError {
     StreamInterrupted,
     #[error("The selected AI provider returned invalid arguments for tool `{0}`")]
     InvalidToolArguments(String),
+    #[error("The selected AI provider named a tool that cannot be routed: `{0}`")]
+    InvalidToolName(String),
     #[error("Tool calling is not supported on AI coder routes; select a hosted provider")]
     ToolsOnCoderRoute,
+    #[error("All AI coder execution slots are busy; try again shortly")]
+    CoderBusy,
+    #[error("The selected AI coder timed out")]
+    CoderTimedOut,
+    #[error("The selected AI coder failed; verify its native CLI authentication")]
+    CoderFailed,
 }
 
 /// Resolve the route, build the payload and open the upstream stream.
@@ -1169,6 +1578,23 @@ impl Gateway {
         })
     }
 
+    pub fn config(&self) -> &Config {
+        &self.state.config
+    }
+
+    /// Whether this request would be served by a hosted API or by a native CLI.
+    ///
+    /// The harness asks before it decides whether to offer tools: a CLI coder
+    /// is already an agent, and handing it a tool registry it cannot use would
+    /// be rejected here and would be the wrong shape anyway.
+    pub fn execution_for(&self, request: &ChatRequest) -> Execution {
+        let route = self.state.config.route_for(request);
+        match self.state.config.native_route(&route) {
+            Some(_) => Execution::Native,
+            None => Execution::Hosted,
+        }
+    }
+
     /// Run one turn to completion, returning the text and any tool calls.
     pub async fn complete(&self, request: ChatRequest) -> Result<Completion, CompletionError> {
         validate_chat(&request).map_err(CompletionError::InvalidRequest)?;
@@ -1186,31 +1612,40 @@ impl Gateway {
             return Err(CompletionError::ConflictingRoute);
         }
 
-        let requested_coder = request
-            .ai_coder
-            .as_deref()
-            .or_else(|| embedded.map(|(coder, _, _)| coder))
-            .unwrap_or(&self.state.config.default_coder);
-        let requested_provider = request
-            .provider
-            .as_deref()
-            .or_else(|| embedded.map(|(_, provider, _)| provider))
-            .or_else(|| {
-                (requested_coder == self.state.config.default_coder)
-                    .then_some(self.state.config.default_provider.as_str())
-            });
-        let requested_model = embedded
-            .map(|(_, _, model)| model)
-            .or(request.model.as_deref());
-        if request.tools.as_ref().is_some_and(|t| !t.is_empty())
-            && let Some(provider_id) = requested_provider
-            && self
-                .state
-                .config
-                .coder_route(requested_coder, provider_id, requested_model)
-                .is_some()
-        {
+        let route = self.state.config.route_for(&request);
+        let native = self.state.config.native_route(&route);
+        if request.tools.as_ref().is_some_and(|t| !t.is_empty()) && native.is_some() {
             return Err(CompletionError::ToolsOnCoderRoute);
+        }
+
+        if let Some(route) = native {
+            let permit = self
+                .state
+                .coder_slots
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| CompletionError::CoderBusy)?;
+            let prompt = coder_prompt(&request.messages, self.state.config.coder_allow_writes);
+            let result = coders::execute(
+                route,
+                &prompt,
+                &self.state.config.coder_workspace,
+                self.state.config.coder_allow_writes,
+                self.state.config.coder_timeout,
+            )
+            .await;
+            drop(permit);
+            let execution = match result {
+                Ok(execution) => execution,
+                Err(coders::CoderError::Timeout { .. }) => {
+                    return Err(CompletionError::CoderTimedOut);
+                }
+                Err(_) => return Err(CompletionError::CoderFailed),
+            };
+            return Ok(Completion {
+                text: execution.output,
+                tool_calls: Vec::new(),
+            });
         }
 
         let (kind, upstream) = open_upstream(&self.state, &request).await?;
@@ -1270,6 +1705,13 @@ impl Gateway {
             .into_values()
             .filter(|(_, name, _)| !name.is_empty())
             .map(|(id, name, arguments)| {
+                // Caught here rather than on the next turn: this transcript is
+                // handed straight back to the provider by an agent loop, and a
+                // name that cannot round-trip would fail validation there with
+                // no indication that upstream was what produced it.
+                if !valid_provider_id(&name) {
+                    return Err(CompletionError::InvalidToolName(display_identifier(&name)));
+                }
                 let arguments = serde_json::from_str(&arguments)
                     .map_err(|_| CompletionError::InvalidToolArguments(name.clone()))?;
                 Ok(ToolCall {
@@ -1867,6 +2309,7 @@ mod tests {
             coder_timeout: Duration::from_secs(30),
             coder_allow_writes: false,
             coder_max_concurrency: 2,
+            harness: HarnessSettings::default(),
         };
         assert!(config.validate().is_ok());
         let mut remote = config.clone();
@@ -1906,6 +2349,75 @@ mod tests {
             Err(ConfigError::DuplicateRoute(route)) if route == "hermes/openai"
         ));
     }
+
+    #[test]
+    fn defaults_to_the_first_installed_coder_when_no_hosted_provider_exists() {
+        let coders = vec![coders::CoderRoute {
+            kind: coders::CoderKind::Claude,
+            provider: "claude".into(),
+            provider_name: "Claude".into(),
+            model: "default".into(),
+            model_name: "Default".into(),
+            executable: PathBuf::from("/usr/bin/claude"),
+        }];
+
+        assert_eq!(default_coder_for_backends(&[], &coders), "claude");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn programmatic_gateway_executes_a_cli_coder_route() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let executable = workspace.path().join("hermes");
+        std::fs::write(&executable, "#!/bin/sh\nprintf native-answer\n").unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        let gateway = Gateway::new(Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            providers: Vec::new(),
+            coders: vec![coders::CoderRoute {
+                kind: coders::CoderKind::Hermes,
+                provider: "auto".into(),
+                provider_name: "Auto".into(),
+                model: "default".into(),
+                model_name: "Default".into(),
+                executable,
+            }],
+            default_coder: "hermes".into(),
+            default_provider: "auto".into(),
+            coder_workspace: workspace.path().to_owned(),
+            coder_timeout: Duration::from_secs(5),
+            coder_allow_writes: true,
+            coder_max_concurrency: 1,
+            harness: HarnessSettings::default(),
+        })
+        .unwrap();
+
+        let completion = gateway
+            .complete(ChatRequest {
+                ai_coder: Some("hermes".into()),
+                provider: Some("auto".into()),
+                model: Some("default".into()),
+                temperature: None,
+                max_tokens: None,
+                tools: None,
+                messages: vec![ChatMessage {
+                    role: Role::User,
+                    content: "hello".into(),
+                    tool_call_id: None,
+                    tool_calls: None,
+                }],
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(completion.text, "native-answer");
+        assert!(completion.tool_calls.is_empty());
+    }
+
     #[test]
     fn translates_all_native_streams() {
         let anthropic = translate_event(
@@ -2311,6 +2823,7 @@ mod tests {
             coder_timeout: Duration::from_secs(30),
             coder_allow_writes: false,
             coder_max_concurrency: 2,
+            harness: HarnessSettings::default(),
         };
         config.providers[0].base_url = format!("http://{address}/v1");
         let gateway = Gateway::new(config).unwrap();

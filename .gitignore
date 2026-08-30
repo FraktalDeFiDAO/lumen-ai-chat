@@ -1,6 +1,8 @@
 node_modules/
 dist/
 target/
+# The default codebase-index location under the coder workspace.
+data/
 .vite/
 coverage/
 graphify-out/

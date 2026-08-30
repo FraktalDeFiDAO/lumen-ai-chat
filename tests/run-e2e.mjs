@@ -1,4 +1,7 @@
 import { spawn } from 'node:child_process'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { reservePorts } from './ports.mjs'
 
 const cwd = new URL('..', import.meta.url).pathname
@@ -51,8 +54,11 @@ async function stopAll() {
   }
 }
 
+let memoryDir = ''
+
 try {
   const [mockPort, apiPort, webPort] = await reservePorts(3)
+  memoryDir = await mkdtemp(join(tmpdir(), 'lumen-memory-'))
   const mockURL = `http://127.0.0.1:${mockPort}`
   const apiURL = `http://127.0.0.1:${apiPort}`
   const webURL = `http://127.0.0.1:${webPort}`
@@ -71,6 +77,9 @@ try {
     AI_DEFAULT_CODER: 'hermes',
     AI_DEFAULT_PROVIDER: 'z.ai',
     AI_CODER_WORKSPACE: cwd,
+    // Outside the repository on purpose: the default lives under the workspace,
+    // and a test run must not leave an index behind in the tree it indexed.
+    AI_HARNESS_MEMORY_DIR: memoryDir,
     AI_CODER_HERMES_BIN: `${cwd}tests/mock-coder.mjs`,
     AI_CODER_OPENCODE_BIN: `${cwd}tests/mock-coder.mjs`,
     AI_CODER_KILOCODE_BIN: `${cwd}tests/mock-coder.mjs`,
@@ -118,4 +127,5 @@ try {
   process.stdout.write(logs.get(test)?.join('') ?? '')
 } finally {
   await stopAll()
+  if (memoryDir) await rm(memoryDir, { recursive: true, force: true })
 }

@@ -16,9 +16,10 @@ interface Settings {
   temperature: number
   maxTokens: number
   systemPrompt: string
+  agentMode: boolean
 }
 
-const defaults: Settings = { displayName: 'Alex Morgan', email: 'alex@example.com', responseStyle: 'Balanced', language: 'English', theme: 'System', notifications: true, temperature: 0.7, maxTokens: 4096, systemPrompt: '' }
+const defaults: Settings = { displayName: 'Alex Morgan', email: 'alex@example.com', responseStyle: 'Balanced', language: 'English', theme: 'System', notifications: true, temperature: 0.7, maxTokens: 4096, systemPrompt: '', agentMode: false }
 function load(): Settings {
   try { return { ...defaults, ...JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') } }
   catch { return { ...defaults } }

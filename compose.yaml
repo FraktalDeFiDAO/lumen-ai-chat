@@ -17,6 +17,12 @@ services:
       AI_CODER_ALLOW_WRITES: "false"
       AI_CODER_TIMEOUT_SECONDS: "300"
       AI_CODER_MAX_CONCURRENCY: "2"
+      # The workspace is mounted read-only, so the index cannot live under it.
+      # This tmpfs is rebuilt on start, which costs one pass over the tree and
+      # keeps a stale index from outliving the code it describes.
+      AI_HARNESS_MEMORY_DIR: /run/lumen-home/memory
+      AI_HARNESS_INDEX_ON_START: "true"
+      AI_HARNESS_MAX_STEPS: "12"
       HOME: /run/lumen-home
       USER: "${USER:-admministrator}"
       PATH: "${HOME}/.local/bin:${HOME}/.local/share/pnpm/bin:/usr/local/sbin:/usr/local/bin:/usr/bin"
@@ -44,6 +50,7 @@ services:
       - /run/lumen-home/.hermes/cache:rw,size=256m,exec,mode=1777,notmpcopyup
       - /run/lumen-home/.hermes/logs:rw,size=64m,noexec,mode=1777,notmpcopyup
       - /run/lumen-home/.hermes/sessions:rw,size=256m,noexec,mode=1777,notmpcopyup
+      - /run/lumen-home/memory:rw,size=512m,noexec,mode=1777,notmpcopyup
     read_only: true
     security_opt:
       - no-new-privileges:true

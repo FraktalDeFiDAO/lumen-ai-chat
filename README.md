@@ -2,6 +2,8 @@
 
 Lumen is a Vue 3 + Rust/Axum chat application that invokes real AI coding agents and also supports direct hosted-model APIs. Selections use the canonical route `<aiCoder>/<provider>/<model>`, for example `hermes/z.ai/glm-5.2` or `codex/codex/gpt-5.6`.
 
+It ships an [agent harness](#agent-harness): a provider-neutral tool loop that reads and edits the workspace, searches an indexed codebase, and works the same way over every hosted provider protocol — delegating to a native coder CLI when that CLI is the agent.
+
 ## AI coder support
 
 Lumen detects these native CLIs on `PATH` and executes the selected program—not a relabeled generic HTTP request:
@@ -125,6 +127,50 @@ export AI_CODER_ALLOW_WRITES=true
 
 Even with writes enabled, the gateway prompt prohibits reading `.env`/credentials and prohibits commits, pushes, or history rewrites. Configure execution limits with `AI_CODER_TIMEOUT_SECONDS` (1–900, default 300) and `AI_CODER_MAX_CONCURRENCY` (1–16, default 2).
 
+## Agent harness
+
+`/api/chat` translates tools between provider dialects and hands any calls back to the caller. The harness runs them.
+
+Turn it on in **Settings → Agent harness**, or call `POST /api/agent` directly. A request is answered by the same loop whichever backend serves it:
+
+- **A hosted provider** (OpenAI, Anthropic, Gemini, or any OpenAI-compatible endpoint) is offered the tool registry. The harness executes each call, feeds the result back, and goes round again until the model answers or hits `AI_HARNESS_MAX_STEPS`.
+- **A native coder CLI** already runs its own agent loop with its own tools. The harness delegates the turn to it rather than pretending to drive tools it does not control, and reports that it did so with a `delegated` frame.
+
+### Tools
+
+Every tool is confined to `AI_CODER_WORKSPACE`. Paths are normalised, checked against the same secret-file policy the CLI coders use, and re-checked after symlink resolution, so a path that reads clean but points outside the root is refused rather than followed.
+
+| Tool | Purpose |
+| --- | --- |
+| `read_file` | Numbered lines, with `offset`/`limit` paging |
+| `list_directory` | Entries, excluding anything a read would refuse |
+| `search_text` | Literal, case-insensitive match across the workspace |
+| `search_memory` | Semantic and symbol search over the codebase index |
+| `write_file` | Create or replace a file (write mode only) |
+| `edit_file` | Exact string replacement, refusing an ambiguous match (write mode only) |
+
+`write_file` and `edit_file` appear only when `AI_CODER_ALLOW_WRITES=true`, and `search_memory` only when an index is available. A tool that could only fail is never advertised.
+
+A tool error is returned to the model as a tool result, not raised as a failure: told that a path does not exist, a model lists the directory and tries again.
+
+### Codebase index
+
+`search_memory` is backed by [`harness-memory`](backend/harness-memory/README.md), a vector store with int8-quantised rows, an HNSW graph, and hybrid retrieval that fuses embedding similarity with exact symbol-name matching.
+
+The indexer cuts each file into records a coding agent would want back — a function, a type, a Markdown heading — and falls back to fixed windows for files with no detectable definitions, so a README is retrievable rather than invisible. A successful `write_file` or `edit_file` re-indexes that file immediately, which is what stops the agent from reading its own stale work back.
+
+```bash
+export AI_HARNESS_MEMORY_DIR=/var/lib/lumen/memory   # must be writable
+export AI_HARNESS_INDEX_ON_START=true
+curl -X POST http://127.0.0.1:41788/api/harness/index
+```
+
+The default location is `$AI_CODER_WORKSPACE/data/memory`. Because the standard deployment mounts the workspace read-only, a failure to open the default location is logged and the harness runs without retrieval; naming the directory explicitly makes the same failure fatal at startup, since an operator who asked for retrieval should not get a service that silently lacks it.
+
+### Transcript compaction
+
+An assistant `tool_use` and the `tool_result` answering it are indivisible on every provider, and splitting them is a 400. The compactor therefore prunes whole turns — a user message and everything answering it — rather than individual messages, and the note recording what it dropped is a system message, so a later pass updates it instead of discarding the summary it just paid for.
+
 ## Direct provider APIs
 
 Direct APIs remain available under the `api` coder namespace:
@@ -215,6 +261,11 @@ Ollama is added only when `OLLAMA_ENABLED=true` or legacy `AI_PROVIDER=openai-co
 | `AI_CODER_KILOCODE_BIN` | discovered from `PATH` | KiloCode executable override |
 | `AI_CODER_CLAUDE_BIN` | discovered from `PATH` | Claude executable override |
 | `AI_CODER_CODEX_BIN` | discovered from `PATH` | Codex executable override |
+| `AI_HARNESS_MEMORY` | enabled | Set `off` to disable codebase retrieval entirely |
+| `AI_HARNESS_MEMORY_DIR` | `$AI_CODER_WORKSPACE/data/memory` | Index location; naming it makes open failures fatal |
+| `AI_HARNESS_INDEX_ON_START` | `false` | Build the index at startup |
+| `AI_HARNESS_MAX_STEPS` | `12` | Model turns per agent run (1–50) |
+| `AI_HARNESS_MEMORY_HITS` | `6` | Records retrieved before each run (0 disables pre-turn retrieval) |
 | `AI_ENDPOINTS_JSON` | unset | Additional compatible APIs |
 | `OLLAMA_ENABLED` | `false` | Explicit local inference opt-in |
 
@@ -224,11 +275,14 @@ Legacy `AI_PROVIDER`, `AI_BASE_URL`, `AI_MODEL`, and `AI_API_KEY` remain support
 
 - `GET /api/health` — gateway status and backend counts
 - `GET /api/ready` — readiness and selected default route
-- `GET /api/metrics` — Prometheus text metrics for request and coder capacity signals
+- `GET /api/metrics` — Prometheus text metrics for chat and agent requests, executed tool calls, indexed records, and coder capacity
 - `GET /api/coders` — installed coder status, routes, workspace mode, and limits
 - `GET /api/providers` — direct-provider metadata without credentials
 - `GET /api/models` — combined coder and direct-provider model catalog
 - `POST /api/chat` — selected CLI execution or provider-routed SSE stream
+- `POST /api/agent` — agent harness run, streaming tool activity and the finished answer
+- `GET /api/harness` — workspace, write mode, step limit, available tools, and index size
+- `POST /api/harness/index` — rebuild the codebase index
 
 Chat request shape:
 
@@ -246,6 +300,16 @@ Chat request shape:
 }
 ```
 
+`POST /api/agent` takes the same body and streams JSON frames terminated by `[DONE]`. Each frame is tagged by `event`: `context`, `delegated`, `text`, `tool_call`, `tool_result`, `compacted`, and a final `outcome` carrying the answer, the step count, and whether the step limit was reached. A client that only understands text can read the `text` frames and ignore the rest.
+
+```
+data: {"event":"tool_call","step":1,"id":"call_1","name":"read_file","arguments":{"path":"README.md"}}
+data: {"event":"tool_result","step":1,"id":"call_1","name":"read_file","output":"     1| # Lumen…","failed":false}
+data: {"event":"text","step":2,"text":"Lumen routes chat through native coder CLIs."}
+data: {"event":"outcome","text":"Lumen routes chat…","steps":2,"tool_calls":1,"stopped_at_step_limit":false}
+data: [DONE]
+```
+
 Open http://127.0.0.1:41789. The Rust API binds to http://127.0.0.1:41788 and Vite proxies `/api` to it.
 
 ## Quality gates
@@ -260,4 +324,6 @@ npm run audit
 npm run test:podman  # while the Compose deployment is running
 ```
 
-The E2E gate invokes isolated executable mocks through all five CLI adapters, validates read-only command construction and output normalization, exercises all native direct-provider protocols, and verifies the complete desktop/mobile UI in Chromium.
+The E2E gate invokes isolated executable mocks through all five CLI adapters, validates read-only command construction and output normalization, exercises all native direct-provider protocols, runs the agent harness over every hosted protocol and over a delegated CLI route, indexes the workspace, and verifies the complete desktop/mobile UI in Chromium.
+
+`npm run check:server` covers the whole Cargo workspace, which is the gateway plus the `harness-memory` crate.
