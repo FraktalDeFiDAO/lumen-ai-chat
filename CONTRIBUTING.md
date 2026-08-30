@@ -39,9 +39,10 @@ What holds the line instead:
 | Promotions only go `dev → staging → main` | `.github/workflows/promotion.yml` | Only by merging without the check, which requires deliberate action |
 | A promoted commit already passed CI where it came from | `.github/workflows/promotion.yml` | Same |
 
-That second check reads the run history, which needs `actions: read` on the
-workflow. Without it the API answers `403` and the gate fails for the wrong
-reason — indistinguishable, from the outside, from a commit that never passed.
+That second check waits for CI on the head commit rather than looking once. A
+promotion opens at the same moment the source branch starts building, so a single
+look always lands before CI could have finished — and a gate that always fails the
+first time is one people learn to merge past. It gives up after 35 minutes.
 | No direct commits to `dev`, `staging` or `main` | `githooks/pre-push`, opt-in per clone | Yes, `--no-verify` |
 
 Install the local guard once per clone:

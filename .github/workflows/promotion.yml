@@ -46,27 +46,54 @@ jobs:
   verified:
     name: The commit being promoted already passed CI
     runs-on: ubuntu-latest
+    # Long enough to outlast a full CI run, which is about twenty minutes.
+    timeout-minutes: 40
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Look for a successful CI run on this exact commit
+      - name: Wait for CI on this commit, then check how it went
         env:
           GH_TOKEN: ${{ github.token }}
           SHA: ${{ github.event.pull_request.head.sha }}
           REPO: ${{ github.repository }}
+          HEAD_REF: ${{ github.head_ref }}
         run: |
           set -euo pipefail
-          # A hotfix has no prior run to find; CI on the pull request itself is
+
+          # A hotfix branch has no prior run to find; CI on this pull request is
           # what covers it.
-          if [[ "${{ github.head_ref }}" == hotfix/* ]]; then
+          if [[ "$HEAD_REF" == hotfix/* ]]; then
             echo "Hotfix: verified by this pull request's own CI run."
             exit 0
           fi
-          runs=$(gh api "repos/$REPO/actions/runs?head_sha=$SHA&status=success" \
-                   --jq '[.workflow_runs[] | select(.name == "CI")] | length')
-          if [[ "$runs" -eq 0 ]]; then
-            echo "::error::No successful CI run for $SHA."
-            echo "The commit at the head of this branch has not passed CI on the"
-            echo "branch it came from. Push it there first and let it go green."
-            exit 1
-          fi
-          echo "Found $runs successful CI run(s) for $SHA."
+
+          # Waiting rather than sampling once. A promotion opens at the same
+          # moment the source branch starts building, so a single look always
+          # lands before CI could possibly have finished -- and a gate that
+          # always fails the first time is one people learn to merge past.
+          deadline=$(( SECONDS + 2100 ))
+          while true; do
+            runs=$(gh api "repos/$REPO/actions/runs?head_sha=$SHA&per_page=100" \
+                     --jq '[.workflow_runs[] | select(.name == "CI")]')
+
+            if [[ $(jq 'map(select(.conclusion == "success")) | length' <<<"$runs") -gt 0 ]]; then
+              echo "CI passed on $SHA."
+              exit 0
+            fi
+
+            finished=$(jq 'map(select(.status == "completed")) | length' <<<"$runs")
+            total=$(jq 'length' <<<"$runs")
+            if [[ "$total" -gt 0 && "$finished" -eq "$total" ]]; then
+              echo "::error::CI ran on $SHA and did not pass."
+              jq -r '.[] | "  \(.name): \(.conclusion) \(.html_url)"' <<<"$runs"
+              exit 1
+            fi
+
+            if [[ "$SECONDS" -ge "$deadline" ]]; then
+              echo "::error::Gave up waiting for CI on $SHA."
+              echo "Found $total run(s), $finished finished. Check the branch this"
+              echo "came from and re-run this job once it is green."
+              exit 1
+            fi
+
+            echo "Waiting for CI on $SHA ($finished of $total finished)..."
+            sleep 30
+          done
