@@ -1,0 +1,17 @@
+# Ownership, for review routing.
+#
+# GitHub cannot require these reviews on a private repository on a Free account,
+# so this is a statement of who should look at what rather than a gate. See
+# CONTRIBUTING.md.
+
+*                       @FraktalDeFiDAO
+
+# The parts where a mistake is a security incident rather than a bug.
+/backend/src/identity.rs        @FraktalDeFiDAO
+/backend/src/store.rs           @FraktalDeFiDAO
+/backend/src/workspaces.rs      @FraktalDeFiDAO
+/backend/src/harness/workspace.rs @FraktalDeFiDAO
+/compose*.yaml                  @FraktalDeFiDAO
+/Containerfile.*                @FraktalDeFiDAO
+/.github/workflows/             @FraktalDeFiDAO
+/deny.toml                      @FraktalDeFiDAO

@@ -1,0 +1,79 @@
+name: Release
+
+# A tag is the claim that a commit is shippable. This checks the claim before
+# publishing anything: the same gate CI runs, plus both production images built
+# from the tagged tree, plus the version agreeing everywhere.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install Rust components
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup component add rustfmt clippy
+      - run: npm ci
+
+      - name: The version agrees with the tag
+        run: npm run version:check
+
+      - name: Resolve Chromium
+        run: |
+          CHROMIUM_PATH="$(command -v chromium || command -v google-chrome || command -v chromium-browser)"
+          test -n "$CHROMIUM_PATH"
+          echo "CHROMIUM_PATH=$CHROMIUM_PATH" >> "$GITHUB_ENV"
+      - run: npm run check:server
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - run: npm run test:e2e
+
+      - name: Build the production images from the tagged tree
+        run: |
+          docker build -f Containerfile.backend -t lumen-ai-chat-api:${{ github.ref_name }} .
+          docker build -f Containerfile.frontend -t lumen-ai-chat-web:${{ github.ref_name }} .
+
+      - name: Notes from the commits since the last tag
+        id: notes
+        run: |
+          set -euo pipefail
+          previous=$(git describe --tags --abbrev=0 "${{ github.ref_name }}^" 2>/dev/null || true)
+          {
+            echo "notes<<EOFNOTES"
+            if [ -n "$previous" ]; then
+              echo "Changes since $previous:"
+              echo
+              git log --no-merges --format='- %s' "$previous..${{ github.ref_name }}"
+            else
+              echo "First tagged release."
+            fi
+            echo "EOFNOTES"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "${{ github.ref_name }}" \
+            --notes "${{ steps.notes.outputs.notes }}"

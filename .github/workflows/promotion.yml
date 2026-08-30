@@ -1,0 +1,99 @@
+name: Promotion
+
+# Promotions move a commit that already passed CI to the next environment; they
+# must not be a way to move one that did not.
+#
+# GitHub cannot enforce this here — branch protection and rulesets both require
+# Pro or a public repository, and this is a private repository on Free. So the
+# rule is enforced as a job that fails the pull request instead: the same
+# outcome, arriving by a different route.
+
+on:
+  pull_request:
+    branches: [staging, main]
+
+permissions:
+  contents: read
+  # Reading the run history is the whole point of the second job below.
+  # `contents: read` alone answers `403 Resource not accessible by integration`,
+  # which fails the gate for the wrong reason: indistinguishable, from the
+  # outside, from a commit that never passed CI.
+  actions: read
+
+jobs:
+  direction:
+    name: Promotions only go one way
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the source branch
+        env:
+          BASE: ${{ github.base_ref }}
+          HEAD: ${{ github.head_ref }}
+        run: |
+          set -euo pipefail
+          case "$BASE:$HEAD" in
+            staging:dev|main:staging)
+              echo "$HEAD -> $BASE is a promotion." ;;
+            main:hotfix/*|staging:hotfix/*)
+              echo "$HEAD -> $BASE is a hotfix, which is allowed to skip ahead." ;;
+            *)
+              echo "::error::$HEAD cannot be merged into $BASE."
+              echo "Work flows dev -> staging -> main. Open this against dev, or"
+              echo "name it hotfix/* if it is an urgent fix that must skip ahead."
+              exit 1 ;;
+          esac
+
+  verified:
+    name: The commit being promoted already passed CI
+    runs-on: ubuntu-latest
+    # Long enough to outlast a full CI run, which is about twenty minutes.
+    timeout-minutes: 40
+    steps:
+      - name: Wait for CI on this commit, then check how it went
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          REPO: ${{ github.repository }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          set -euo pipefail
+
+          # A hotfix branch has no prior run to find; CI on this pull request is
+          # what covers it.
+          if [[ "$HEAD_REF" == hotfix/* ]]; then
+            echo "Hotfix: verified by this pull request's own CI run."
+            exit 0
+          fi
+
+          # Waiting rather than sampling once. A promotion opens at the same
+          # moment the source branch starts building, so a single look always
+          # lands before CI could possibly have finished -- and a gate that
+          # always fails the first time is one people learn to merge past.
+          deadline=$(( SECONDS + 2100 ))
+          while true; do
+            runs=$(gh api "repos/$REPO/actions/runs?head_sha=$SHA&per_page=100" \
+                     --jq '[.workflow_runs[] | select(.name == "CI")]')
+
+            if [[ $(jq 'map(select(.conclusion == "success")) | length' <<<"$runs") -gt 0 ]]; then
+              echo "CI passed on $SHA."
+              exit 0
+            fi
+
+            finished=$(jq 'map(select(.status == "completed")) | length' <<<"$runs")
+            total=$(jq 'length' <<<"$runs")
+            if [[ "$total" -gt 0 && "$finished" -eq "$total" ]]; then
+              echo "::error::CI ran on $SHA and did not pass."
+              jq -r '.[] | "  \(.name): \(.conclusion) \(.html_url)"' <<<"$runs"
+              exit 1
+            fi
+
+            if [[ "$SECONDS" -ge "$deadline" ]]; then
+              echo "::error::Gave up waiting for CI on $SHA."
+              echo "Found $total run(s), $finished finished. Check the branch this"
+              echo "came from and re-run this job once it is green."
+              exit 1
+            fi
+
+            echo "Waiting for CI on $SHA ($finished of $total finished)..."
+            sleep 30
+          done
