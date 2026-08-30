@@ -119,12 +119,15 @@ try {
   })
   await waitFor(webURL, web, 30_000)
 
-  const test = start('node', ['tests/e2e.mjs'], { BASE_URL: webURL })
+  // Playwright drives the browser suite. It never starts a server itself: the
+  // stack above is already up, and the specs address it through BASE_URL.
+  const test = start('./node_modules/.bin/playwright', ['test', ...process.argv.slice(2)], { BASE_URL: webURL })
+  test.stdout.on('data', data => process.stdout.write(data))
+  test.stderr.on('data', data => process.stderr.write(data))
   await new Promise((resolve, reject) => {
-    test.once('exit', code => code === 0 ? resolve() : reject(new Error(logs.get(test)?.join('') || `E2E exited ${code}`)))
+    test.once('exit', code => code === 0 ? resolve() : reject(new Error(`Playwright exited ${code}`)))
     test.once('error', reject)
   })
-  process.stdout.write(logs.get(test)?.join('') ?? '')
 } finally {
   await stopAll()
   if (memoryDir) await rm(memoryDir, { recursive: true, force: true })

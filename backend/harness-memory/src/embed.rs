@@ -92,3 +92,77 @@ impl Embedder for HashEmbedder {
         Ok(out)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cosine(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b).map(|(x, y)| x * y).sum()
+    }
+
+    #[test]
+    fn every_vector_has_the_requested_width() {
+        let embedder = HashEmbedder::new(384);
+        assert_eq!(embedder.dimension(), 384);
+        assert_eq!(embedder.embed("fn main() {}").unwrap().len(), 384);
+    }
+
+    #[test]
+    fn the_same_text_always_embeds_the_same_way() {
+        let embedder = HashEmbedder::new(64);
+        assert_eq!(
+            embedder.embed("pub fn compact_transcript()").unwrap(),
+            embedder.embed("pub fn compact_transcript()").unwrap()
+        );
+    }
+
+    #[test]
+    fn a_vector_is_normalised_so_cosine_is_a_dot_product() {
+        let embedder = HashEmbedder::new(128);
+        let vector = embedder.embed("the harness compacts a transcript").unwrap();
+        let norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5, "norm was {norm}");
+    }
+
+    #[test]
+    fn shared_tokens_score_higher_than_unrelated_text() {
+        let embedder = HashEmbedder::new(512);
+        let query = embedder.embed("compact the transcript budget").unwrap();
+        let related = embedder
+            .embed("fn compact transcript within a budget")
+            .unwrap();
+        let unrelated = embedder.embed("quantise vectors into int8 rows").unwrap();
+
+        assert!(
+            cosine(&query, &related) > cosine(&query, &unrelated),
+            "related {} should beat unrelated {}",
+            cosine(&query, &related),
+            cosine(&query, &unrelated)
+        );
+    }
+
+    #[test]
+    fn an_empty_text_embeds_to_zeroes_rather_than_failing() {
+        let embedder = HashEmbedder::new(32);
+        let vector = embedder.embed("   ").unwrap();
+        assert_eq!(vector.len(), 32);
+        assert!(vector.iter().all(|value| *value == 0.0));
+    }
+
+    #[test]
+    fn a_batch_is_the_same_as_embedding_each_text_on_its_own() {
+        let embedder = HashEmbedder::new(64);
+        let texts = vec!["first text".to_string(), "second text".to_string()];
+        let batch = embedder.embed_batch(&texts).unwrap();
+
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0], embedder.embed("first text").unwrap());
+        assert_eq!(batch[1], embedder.embed("second text").unwrap());
+    }
+
+    #[test]
+    fn the_input_budget_matches_a_minilm_context() {
+        assert_eq!(HashEmbedder::new(8).max_input_chars(), 2000);
+    }
+}

@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
 
+env:
+  # Chromium comes from the runner image; the suite points Playwright at it, so
+  # `npm ci` must not pull a second copy.
+  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true

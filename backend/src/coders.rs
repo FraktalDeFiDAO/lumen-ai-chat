@@ -608,6 +608,403 @@ mod tests {
         );
     }
 
+    fn route(kind: CoderKind, provider: &str, model: &str) -> CoderRoute {
+        CoderRoute {
+            kind,
+            provider: provider.into(),
+            provider_name: display_identifier(provider),
+            model: model.into(),
+            model_name: model.into(),
+            executable: PathBuf::from("/usr/bin/true"),
+        }
+    }
+
+    fn args(command: &Command) -> Vec<String> {
+        command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn every_coder_is_invoked_in_its_own_read_only_mode() {
+        let workspace = Path::new("/workspace");
+        let expectations = [
+            (CoderKind::Hermes, vec!["-t", "safe"], vec!["--yolo"]),
+            (CoderKind::Opencode, vec![], vec!["--auto"]),
+            (CoderKind::Kilocode, vec![], vec!["--auto"]),
+            (
+                CoderKind::Claude,
+                vec!["--permission-mode", "plan"],
+                vec!["acceptEdits"],
+            ),
+            (
+                CoderKind::Codex,
+                vec!["--sandbox", "read-only"],
+                vec!["--full-auto"],
+            ),
+        ];
+        for (kind, required, forbidden) in expectations {
+            let command = build_command(&route(kind, "auto", "default"), "hello", workspace, false);
+            let arguments = args(&command);
+            for needle in required {
+                assert!(
+                    arguments.iter().any(|argument| argument == needle),
+                    "{kind:?} read-only invocation is missing {needle}: {arguments:?}"
+                );
+            }
+            for needle in forbidden {
+                assert!(
+                    !arguments.iter().any(|argument| argument == needle),
+                    "{kind:?} read-only invocation must not pass {needle}: {arguments:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn allowing_writes_switches_every_coder_into_its_writing_mode() {
+        let workspace = Path::new("/workspace");
+        let expectations = [
+            (CoderKind::Hermes, "--yolo"),
+            (CoderKind::Opencode, "--auto"),
+            (CoderKind::Kilocode, "--auto"),
+            (CoderKind::Claude, "acceptEdits"),
+            (CoderKind::Codex, "--full-auto"),
+        ];
+        for (kind, needle) in expectations {
+            let command = build_command(&route(kind, "auto", "default"), "hello", workspace, true);
+            let arguments = args(&command);
+            assert!(
+                arguments.iter().any(|argument| argument == needle),
+                "{kind:?} writing invocation is missing {needle}: {arguments:?}"
+            );
+        }
+        let codex = build_command(
+            &route(CoderKind::Codex, "codex", "default"),
+            "hello",
+            workspace,
+            true,
+        );
+        assert!(
+            args(&codex)
+                .iter()
+                .any(|argument| argument == "workspace-write")
+        );
+    }
+
+    #[test]
+    fn the_prompt_and_the_workspace_reach_every_coder() {
+        let workspace = Path::new("/tmp/lumen-workspace");
+        for kind in CoderKind::ALL {
+            let command = build_command(
+                &route(kind, "auto", "default"),
+                "explain this",
+                workspace,
+                false,
+            );
+            let arguments = args(&command);
+            assert!(
+                arguments.iter().any(|argument| argument == "explain this"),
+                "{kind:?} never receives the prompt: {arguments:?}"
+            );
+        }
+        for kind in [CoderKind::Hermes, CoderKind::Opencode, CoderKind::Kilocode] {
+            let command = build_command(
+                &route(kind, "auto", "default"),
+                "explain this",
+                workspace,
+                false,
+            );
+            assert!(
+                args(&command)
+                    .iter()
+                    .any(|argument| argument.as_str() == workspace.to_string_lossy()),
+                "{kind:?} never receives the workspace"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_model_is_left_for_the_coder_to_choose() {
+        for kind in CoderKind::ALL {
+            let command = build_command(
+                &route(kind, "auto", "default"),
+                "hi",
+                Path::new("/w"),
+                false,
+            );
+            let arguments = args(&command);
+            assert!(
+                !arguments
+                    .iter()
+                    .any(|argument| argument == "--model" || argument == "-m"),
+                "{kind:?} pinned a model when the route asked for the default: {arguments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_model_is_passed_in_each_coders_own_spelling() {
+        let workspace = Path::new("/w");
+        let hermes = args(&build_command(
+            &route(CoderKind::Hermes, "z.ai", "glm-5.2"),
+            "hi",
+            workspace,
+            false,
+        ));
+        assert!(hermes.windows(2).any(|pair| pair == ["-m", "z.ai/glm-5.2"]));
+        assert!(hermes.windows(2).any(|pair| pair == ["--provider", "z.ai"]));
+
+        let opencode = args(&build_command(
+            &route(CoderKind::Opencode, "openrouter", "qwen/test"),
+            "hi",
+            workspace,
+            false,
+        ));
+        assert!(
+            opencode
+                .windows(2)
+                .any(|pair| pair == ["--model", "openrouter/qwen/test"])
+        );
+
+        let claude = args(&build_command(
+            &route(CoderKind::Claude, "claude", "sonnet-test"),
+            "hi",
+            workspace,
+            false,
+        ));
+        assert!(
+            claude
+                .windows(2)
+                .any(|pair| pair == ["--model", "sonnet-test"])
+        );
+
+        let codex = args(&build_command(
+            &route(CoderKind::Codex, "codex", "gpt-test"),
+            "hi",
+            workspace,
+            false,
+        ));
+        assert!(codex.windows(2).any(|pair| pair == ["--model", "gpt-test"]));
+    }
+
+    #[test]
+    fn an_auto_provider_is_not_forwarded_as_one() {
+        let hermes = args(&build_command(
+            &route(CoderKind::Hermes, "auto", "glm-5.2"),
+            "hi",
+            Path::new("/w"),
+            false,
+        ));
+        assert!(hermes.windows(2).any(|pair| pair == ["-m", "auto/glm-5.2"]));
+        assert!(!hermes.iter().any(|argument| argument == "--provider"));
+    }
+
+    #[test]
+    fn a_route_key_is_the_canonical_triple() {
+        assert_eq!(
+            route(CoderKind::Hermes, "z.ai", "glm-5.2").key(),
+            "hermes/z.ai/glm-5.2"
+        );
+        assert_eq!(
+            route(CoderKind::Claude, "claude", "default").key(),
+            "claude/claude/default"
+        );
+    }
+
+    #[test]
+    fn statuses_cover_every_coder_and_count_only_its_own_routes() {
+        let routes = vec![
+            route(CoderKind::Hermes, "z.ai", "glm-5.2"),
+            route(CoderKind::Hermes, "z.ai", "glm-5.1"),
+            route(CoderKind::Codex, "codex", "gpt-test"),
+        ];
+        let statuses = statuses(&routes);
+
+        assert_eq!(statuses.len(), CoderKind::ALL.len());
+        let counts: Vec<(String, usize)> = statuses
+            .iter()
+            .map(|status| (status.id.clone(), status.route_count))
+            .collect();
+        assert_eq!(
+            counts,
+            vec![
+                ("hermes".to_string(), 2),
+                ("opencode".to_string(), 0),
+                ("kilocode".to_string(), 0),
+                ("claude".to_string(), 0),
+                ("codex".to_string(), 1),
+            ]
+        );
+        for status in &statuses {
+            assert!(
+                status.status == "installed_unverified" || status.status == "unavailable",
+                "unexpected status {}",
+                status.status
+            );
+            assert_eq!(
+                status.executable.is_some(),
+                status.status == "installed_unverified"
+            );
+        }
+    }
+
+    #[test]
+    fn the_last_non_empty_candidate_wins_and_raw_text_is_the_fallback() {
+        assert_eq!(
+            normalize_output(
+                CoderKind::Claude,
+                br#"{"result":"first"}
+{"result":"  "}
+{"result":"last"}"#
+            ),
+            Some("last".into())
+        );
+        assert_eq!(
+            normalize_output(
+                CoderKind::Codex,
+                b"not json at all
+"
+            ),
+            Some("not json at all".into())
+        );
+        assert_eq!(
+            normalize_output(
+                CoderKind::Codex,
+                b"   
+"
+            ),
+            None
+        );
+        assert_eq!(
+            normalize_output(
+                CoderKind::Hermes,
+                b"
+
+"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn an_error_message_keeps_the_last_line_and_stays_bounded() {
+        assert_eq!(
+            safe_error_message(
+                b"warming up
+real failure here
+",
+                Some(2)
+            ),
+            "exit code 2: real failure here"
+        );
+        assert_eq!(
+            safe_error_message(b"", Some(1)),
+            "exit code 1: process exited without an error message"
+        );
+        assert_eq!(
+            safe_error_message(
+                b"killed
+", None
+            ),
+            "killed"
+        );
+
+        let long = vec![b'x'; 900];
+        let message = safe_error_message(&long, None);
+        assert_eq!(message.chars().count(), 500);
+    }
+
+    #[test]
+    fn secrets_and_build_output_never_enter_a_coder_workspace() {
+        for name in [
+            ".git",
+            ".env",
+            ".env.local",
+            "node_modules",
+            "target",
+            "dist",
+            "data",
+            "coverage",
+            ".venv",
+            ".claude-flow",
+            ".netrc",
+            ".npmrc",
+            ".pypirc",
+            "credentials.json",
+            "auth.json",
+            "server.pem",
+            "id.key",
+            "bundle.p12",
+            "bundle.pfx",
+        ] {
+            assert!(excluded_workspace_entry(name), "{name} should be excluded");
+        }
+        for name in [
+            "src",
+            "main.rs",
+            "README.md",
+            "environment.md",
+            "package.json",
+        ] {
+            assert!(!excluded_workspace_entry(name), "{name} should be copied");
+        }
+    }
+
+    #[test]
+    fn a_workspace_copy_follows_no_symlinks() {
+        let source = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "private").unwrap();
+        std::fs::write(source.path().join("kept.txt"), "public").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.txt"),
+            source.path().join("link.txt"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(outside.path(), source.path().join("linked-dir")).unwrap();
+
+        let copy = prepare_read_only_workspace(source.path()).unwrap();
+        assert!(copy.path().join("kept.txt").is_file());
+        assert!(!copy.path().join("link.txt").exists());
+        assert!(!copy.path().join("linked-dir").exists());
+    }
+
+    #[test]
+    fn nested_directories_are_copied_whole() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(source.path().join("src/inner")).unwrap();
+        std::fs::write(source.path().join("src/inner/deep.rs"), "fn deep() {}").unwrap();
+
+        let copy = prepare_read_only_workspace(source.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(copy.path().join("src/inner/deep.rs")).unwrap(),
+            "fn deep() {}"
+        );
+    }
+
+    #[tokio::test]
+    async fn output_past_the_limit_is_refused_rather_than_truncated() {
+        assert_eq!(
+            read_limited(&b"abcd"[..], 8).await.unwrap(),
+            b"abcd".to_vec()
+        );
+        assert_eq!(
+            read_limited(&b"abcdefgh"[..], 8).await.unwrap(),
+            b"abcdefgh".to_vec()
+        );
+        assert!(read_limited(&b"abcdefghi"[..], 8).await.is_err());
+    }
+
+    #[test]
+    fn a_provider_identifier_is_capitalised_for_display() {
+        assert_eq!(display_identifier("openrouter"), "Openrouter");
+        assert_eq!(display_identifier("z.ai"), "Z.ai");
+        assert_eq!(display_identifier(""), "");
+    }
+
     #[test]
     fn creates_secret_free_read_only_workspace_copy() {
         let source = tempfile::tempdir().unwrap();

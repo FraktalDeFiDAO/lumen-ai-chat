@@ -324,6 +324,30 @@ npm run audit
 npm run test:podman  # while the Compose deployment is running
 ```
 
-The E2E gate invokes isolated executable mocks through all five CLI adapters, validates read-only command construction and output normalization, exercises all native direct-provider protocols, runs the agent harness over every hosted protocol and over a delegated CLI route, indexes the workspace, and verifies the complete desktop/mobile UI in Chromium.
+`npm run check:server` covers the whole Cargo workspace — the gateway plus the `harness-memory` crate — as rustfmt, clippy at `-D warnings`, and every Rust test:
 
-`npm run check:server` covers the whole Cargo workspace, which is the gateway plus the `harness-memory` crate.
+| Suite | Covers |
+| --- | --- |
+| `backend/src/**` unit tests | Configuration validation, route selection, provider protocol translation in both directions, generation bounds, CLI command construction and output normalization for all five coders, the read-only workspace copy, transcript compaction, path containment, tool behaviour, and the memory bridge |
+| `backend/tests/api.rs` | The HTTP surface: health, readiness, Prometheus metrics, the provider and coder lists, the model catalog with its degraded-provider fallback, streamed chat, request refusals, the JSON 404, the body limit, and that the bare router carries no `/api` prefix |
+| `backend/tests/harness.rs` | The agent loop end to end against a scripted upstream: a tool call becoming real work, a failed tool being reported rather than ending the run, the step limit, retrieval, delegation to a native coder, every provider protocol, and the `/agent`, `/harness`, `/harness/index` endpoints |
+| `harness-memory` | Row payload round trips, crash-tail recovery, reopen, tombstones, HNSW recall against brute force, quantization, SIMD kernels, and the embedder |
+
+`npm test` runs the Vitest unit suite over the frontend: the chat store (SSE and harness frame parsing, streaming, abort, regeneration, persistence), the settings store, and each component — `AppSidebar`, `ChatComposer`, `MessageBubble` — in isolation.
+
+`npm run test:e2e` starts a full stack (mock provider, the real gateway with mock coder executables, Vite) and runs, in order: the configuration guards, the provider contract suite against all five CLI adapters and every hosted protocol, and then the Playwright suite in Chromium.
+
+The Playwright specs live in `tests/e2e/` and cover both pages in full:
+
+| Spec | Covers |
+| --- | --- |
+| `chat-view.spec.ts` | The empty state and its suggestions, sending, streaming, titling, the thinking indicator, stopping, share, the overflow menu, keyboard shortcuts, deep links, and reload |
+| `chat-composer.spec.ts` | Model grouping and selection, what the request carries, an unavailable catalog, degraded providers, attachment acceptance and refusal, and the growing textarea |
+| `message-bubble.spec.ts` | Copy, feedback, regeneration, failures, and every agent-mode surface: retrieval counts, tool activity, failed and pending tools, and the step-limit notice |
+| `app-sidebar.spec.ts` | History ordering, search, opening, deleting, new chats, and the profile row |
+| `settings-general.spec.ts` | Navigation, the profile form, preferences and generation settings — including that they reach the wire — appearance and system theme, notifications, and data controls |
+| `settings-harness.spec.ts` | The coder list and the harness report, both asserted against the live gateway, plus reindexing, an index that is unavailable, and agent mode changing which endpoint the chat calls |
+| `routing.spec.ts` | Every route, the unknown-path redirect, and browser history |
+| `mobile.spec.ts` | The phone layout: the sidebar overlay, its backdrop, and sending from a phone |
+
+Chromium is resolved from the system rather than downloaded (`CHROMIUM_PATH`, defaulting to `/usr/bin/chromium`), so `npm ci` runs with `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1`. To run the browser suite against a stack you already have up, use `BASE_URL=http://127.0.0.1:41789 npm run test:e2e:only`; `npm run test:e2e -- --grep <pattern>` passes arguments through to Playwright.
