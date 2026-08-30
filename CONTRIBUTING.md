@@ -38,6 +38,10 @@ What holds the line instead:
 | Every push and pull request is built and tested | `.github/workflows/ci.yml` | No |
 | Promotions only go `dev → staging → main` | `.github/workflows/promotion.yml` | Only by merging without the check, which requires deliberate action |
 | A promoted commit already passed CI where it came from | `.github/workflows/promotion.yml` | Same |
+
+That second check reads the run history, which needs `actions: read` on the
+workflow. Without it the API answers `403` and the gate fails for the wrong
+reason — indistinguishable, from the outside, from a commit that never passed.
 | No direct commits to `dev`, `staging` or `main` | `githooks/pre-push`, opt-in per clone | Yes, `--no-verify` |
 
 Install the local guard once per clone:
