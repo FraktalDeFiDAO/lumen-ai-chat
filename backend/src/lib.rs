@@ -11,7 +11,15 @@ use std::{
     time::Duration,
 };
 
-mod coders;
+pub mod coders;
+pub mod harness;
+
+use crate::harness::{
+    Harness, HarnessConfig, HarnessEvent,
+    memory::HarnessMemory,
+    tools::{ToolContext, ToolRegistry},
+    workspace::{Workspace, WorkspaceError},
+};
 
 use async_stream::stream;
 use axum::{
@@ -28,7 +36,7 @@ use reqwest::{Client, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc};
 use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
@@ -40,6 +48,8 @@ const MAX_ERROR_BYTES: usize = 64 * 1024;
 const MAX_CUSTOM_PROVIDERS: usize = 20;
 const DEFAULT_CODER_TIMEOUT_SECONDS: u64 = 300;
 const DEFAULT_CODER_CONCURRENCY: usize = 2;
+const DEFAULT_HARNESS_MAX_STEPS: usize = 12;
+const DEFAULT_HARNESS_MEMORY_HITS: usize = 6;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -114,6 +124,43 @@ impl ProviderConfig {
     }
 }
 
+/// How the agent harness behaves for this deployment.
+///
+/// Separate from the coder settings above because they answer a different
+/// question: those decide how a *native CLI* is invoked, these decide how the
+/// gateway itself drives a hosted model through a tool loop.
+#[derive(Clone, Debug)]
+pub struct HarnessSettings {
+    /// Where the codebase index lives. `None` disables retrieval, and the
+    /// harness then does not advertise `search_memory` at all.
+    pub memory_dir: Option<PathBuf>,
+    /// Whether failing to open the index should stop the service.
+    ///
+    /// True when an operator named the directory: they asked for retrieval, and
+    /// silently starting without it would hide the misconfiguration. False for
+    /// the default location, which is a guess -- and a wrong guess is routine,
+    /// since the standard deployment mounts the workspace read-only.
+    pub memory_required: bool,
+    /// Build the index at startup rather than leaving it to a later request.
+    pub index_on_start: bool,
+    /// Model turns before the loop gives up, however many tools each one calls.
+    pub max_steps: usize,
+    /// Records retrieved before the first turn. Zero waits to be asked.
+    pub memory_hits: usize,
+}
+
+impl Default for HarnessSettings {
+    fn default() -> Self {
+        Self {
+            memory_dir: None,
+            memory_required: false,
+            index_on_start: false,
+            max_steps: DEFAULT_HARNESS_MAX_STEPS,
+            memory_hits: DEFAULT_HARNESS_MEMORY_HITS,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub bind: SocketAddr,
@@ -125,6 +172,7 @@ pub struct Config {
     pub coder_timeout: Duration,
     pub coder_allow_writes: bool,
     pub coder_max_concurrency: usize,
+    pub harness: HarnessSettings,
 }
 
 #[derive(Debug, Deserialize)]
@@ -348,13 +396,12 @@ impl Config {
         if providers.is_empty() && coders.is_empty() {
             return Err(ConfigError::NoProviders);
         }
-        let default_coder = env::var("AI_DEFAULT_CODER").unwrap_or_else(|_| {
-            if legacy_kind == Some(ProviderKind::OpenaiCompatible) {
-                "api".into()
-            } else {
-                "hermes".into()
-            }
-        });
+        // Hosted providers win unless the operator explicitly selects a coder.
+        // Discovering a native CLI must not silently reroute an API-configured
+        // deployment through that CLI (and, for callers offering tools, coder
+        // routes cannot satisfy the request at all).
+        let default_coder = env::var("AI_DEFAULT_CODER")
+            .unwrap_or_else(|_| default_coder_for_backends(&providers, &coders));
         let provider_hint = env::var("AI_DEFAULT_PROVIDER").ok();
         let default_provider = coders
             .iter()
@@ -408,6 +455,32 @@ impl Config {
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| (1..=16).contains(value))
             .unwrap_or(DEFAULT_CODER_CONCURRENCY);
+        // The index lives under `data/`, which the workspace exclusion list
+        // already hides: without that the indexer would walk its own segments
+        // and the read-only workspace copy would carry them into every CLI run.
+        let (memory_dir, memory_required) = if env_disabled("AI_HARNESS_MEMORY") {
+            (None, false)
+        } else {
+            match env::var("AI_HARNESS_MEMORY_DIR") {
+                Ok(configured) => (Some(PathBuf::from(configured)), true),
+                Err(_) => (Some(coder_workspace.join("data/memory")), false),
+            }
+        };
+        let harness = HarnessSettings {
+            memory_dir,
+            memory_required,
+            index_on_start: env_flag("AI_HARNESS_INDEX_ON_START"),
+            max_steps: env::var("AI_HARNESS_MAX_STEPS")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|value| (1..=50).contains(value))
+                .unwrap_or(DEFAULT_HARNESS_MAX_STEPS),
+            memory_hits: env::var("AI_HARNESS_MEMORY_HITS")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|value| *value <= 25)
+                .unwrap_or(DEFAULT_HARNESS_MEMORY_HITS),
+        };
         let config = Self {
             bind,
             providers,
@@ -418,6 +491,7 @@ impl Config {
             coder_timeout,
             coder_allow_writes: env_flag("AI_CODER_ALLOW_WRITES"),
             coder_max_concurrency,
+            harness,
         };
         config.validate()?;
         Ok(config)
@@ -493,6 +567,36 @@ impl Config {
         })
     }
 
+    /// The route a request names, applying every default in one place.
+    fn route_for<'a>(&'a self, request: &'a ChatRequest) -> Route<'a> {
+        let embedded = request.model.as_deref().and_then(parse_model_path);
+        let coder = request
+            .ai_coder
+            .as_deref()
+            .or_else(|| embedded.map(|(coder, _, _)| coder))
+            .unwrap_or(&self.default_coder);
+        Route {
+            coder,
+            provider: request
+                .provider
+                .as_deref()
+                .or_else(|| embedded.map(|(_, provider, _)| provider))
+                .or_else(|| {
+                    (coder == self.default_coder).then_some(self.default_provider.as_str())
+                }),
+            model: embedded
+                .map(|(_, _, model)| model)
+                .or(request.model.as_deref()),
+        }
+    }
+
+    /// The native CLI serving this route, if one does.
+    fn native_route(&self, route: &Route<'_>) -> Option<&coders::CoderRoute> {
+        route
+            .provider
+            .and_then(|provider| self.coder_route(route.coder, provider, route.model))
+    }
+
     fn coder_route(
         &self,
         coder: &str,
@@ -505,6 +609,41 @@ impl Config {
                 && model.is_none_or(|value| route.model == value)
         })
     }
+}
+
+/// The route a request selects, before any decision about how to serve it.
+///
+/// Resolving this once is what keeps `complete` and `execution_for` from
+/// disagreeing about where a request would have gone — a disagreement the
+/// harness would experience as the gateway refusing tools it had just been
+/// told the route accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Route<'a> {
+    coder: &'a str,
+    provider: Option<&'a str>,
+    model: Option<&'a str>,
+}
+
+/// How a request will actually be served.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Execution {
+    /// A hosted provider API. The harness offers tools and runs them itself.
+    Hosted,
+    /// A native coder CLI, which runs its own agent loop with its own tools.
+    /// The harness delegates the turn rather than driving it.
+    Native,
+}
+
+fn default_coder_for_backends(
+    providers: &[ProviderConfig],
+    coders: &[coders::CoderRoute],
+) -> String {
+    providers
+        .first()
+        .map(|provider| provider.ai_coder.clone())
+        .or_else(|| coders.first().map(|route| route.kind.id().to_string()))
+        .unwrap_or_else(|| "hermes".into())
 }
 
 fn valid_provider_id(id: &str) -> bool {
@@ -531,6 +670,18 @@ fn parse_model_path(value: &str) -> Option<(&str, &str, &str)> {
 }
 fn env_key(name: &str) -> Option<String> {
     env::var(name).ok().filter(|key| !key.is_empty())
+}
+/// Whether an opt-out flag is set. Distinct from `env_flag`: this feature is on
+/// by default, so an unset variable must not read as "off".
+fn env_disabled(name: &str) -> bool {
+    env::var(name)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "off" | "false" | "no" | "disabled"
+            )
+        })
+        .unwrap_or(false)
 }
 fn env_flag(name: &str) -> bool {
     env::var(name).ok().is_some_and(|value| {
@@ -559,15 +710,74 @@ struct AppState {
     client: Client,
     coder_slots: Arc<Semaphore>,
     metrics: Arc<AppMetrics>,
+    /// The canonical root every harness tool is confined to.
+    workspace: Workspace,
+    /// `None` when retrieval is disabled or the index could not be opened; the
+    /// harness then simply does not offer `search_memory`.
+    memory: Option<Arc<HarnessMemory>>,
+}
+
+impl AppState {
+    /// A harness over this state.
+    ///
+    /// Built per request rather than held in the state, because a `Harness`
+    /// owns an `Arc<Gateway>` and a `Gateway` owns this state: keeping one here
+    /// would be a reference cycle that never drops. Construction is cheap --
+    /// the index and the HTTP client are shared, not rebuilt.
+    fn harness(&self) -> Harness {
+        let context = ToolContext {
+            workspace: self.workspace.clone(),
+            memory: self.memory.clone(),
+        };
+        Harness::new(
+            Arc::new(Gateway {
+                state: self.clone(),
+            }),
+            context,
+            HarnessConfig {
+                max_steps: self.config.harness.max_steps,
+                budget: harness::transcript::Budget::default(),
+                memory_hits: self.config.harness.memory_hits,
+                inject_memory: self.config.harness.memory_hits > 0,
+            },
+        )
+    }
 }
 
 #[derive(Default)]
 struct AppMetrics {
     chat_requests: AtomicU64,
+    agent_requests: AtomicU64,
+    tool_calls: AtomicU64,
     coder_busy_rejections: AtomicU64,
 }
 
-pub fn build_router(config: Config) -> Result<Router, BuildError> {
+/// The API routes, mounted bare.
+///
+/// A composable router should not decide where it lives. `build_router` mounts
+/// these at `/api` for standalone use; an embedding host nests them wherever it
+/// keeps its own API, and applies its own authentication on the way in --
+/// nothing here authenticates anything.
+pub fn build_api_router(config: Config) -> Result<Router, BuildError> {
+    let state = gateway_state(config)?;
+    Ok(Router::new()
+        .route("/health", get(health))
+        .route("/ready", get(ready))
+        .route("/metrics", get(metrics))
+        .route("/providers", get(providers))
+        .route("/coders", get(coder_statuses))
+        .route("/models", get(models))
+        .route("/chat", post(chat))
+        .route("/agent", post(agent))
+        .route("/harness", get(harness_status))
+        .route("/harness/index", post(reindex))
+        .with_state(state)
+        .layer(DefaultBodyLimit::disable())
+        .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES))
+        .layer(TraceLayer::new_for_http()))
+}
+
+fn gateway_state(config: Config) -> Result<AppState, BuildError> {
     config.validate()?;
     let coder_slots = Arc::new(Semaphore::new(config.coder_max_concurrency));
     let client = Client::builder()
@@ -580,25 +790,83 @@ pub fn build_router(config: Config) -> Result<Router, BuildError> {
             env!("CARGO_PKG_VERSION")
         ))
         .build()?;
+    let workspace = Workspace::new(&config.coder_workspace, config.coder_allow_writes)?;
+    let memory = open_memory(&config, &workspace)?;
     let state = AppState {
         config: Arc::new(config),
         client,
         coder_slots,
         metrics: Arc::new(AppMetrics::default()),
+        workspace,
+        memory,
     };
+    Ok(state)
+}
+
+/// Open the codebase index, and start building it if asked to.
+///
+/// Opening is cheap enough to do inline -- it maps the segments and rebuilds the
+/// graph from rows already committed. Indexing a whole tree is not, so it runs
+/// on a blocking thread and the service starts serving immediately: an index
+/// that is still filling answers fewer queries, which is a better failure than
+/// a gateway that will not start.
+fn open_memory(
+    config: &Config,
+    workspace: &Workspace,
+) -> Result<Option<Arc<HarnessMemory>>, BuildError> {
+    let Some(directory) = &config.harness.memory_dir else {
+        return Ok(None);
+    };
+    let memory = match HarnessMemory::open(directory, workspace.root()) {
+        Ok(memory) => Arc::new(memory),
+        // The default location is a guess, and the standard deployment mounts
+        // the workspace read-only, so a failure there is a reason to run
+        // without retrieval rather than a reason not to start. Say so loudly:
+        // `/harness` will report no memory, and `/harness/index` will explain.
+        Err(error) if !config.harness.memory_required => {
+            tracing::warn!(
+                %error,
+                directory = %directory.display(),
+                "codebase memory unavailable; the harness will run without retrieval. \
+                 Set AI_HARNESS_MEMORY_DIR to a writable path to enable it"
+            );
+            return Ok(None);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    tracing::info!(
+        records = memory.live_count(),
+        directory = %directory.display(),
+        "codebase memory opened"
+    );
+
+    if config.harness.index_on_start {
+        let memory = Arc::clone(&memory);
+        // `spawn_blocking` panics with no reactor, and `Config` is usable
+        // outside one -- a test constructing a gateway directly, for instance.
+        match tokio::runtime::Handle::try_current() {
+            Ok(_) => {
+                tokio::task::spawn_blocking(move || match memory.index_workspace() {
+                    Ok(stats) => tracing::info!(
+                        files = stats.files,
+                        records = stats.records,
+                        skipped = stats.skipped,
+                        "codebase index built"
+                    ),
+                    Err(error) => tracing::warn!(%error, "codebase indexing failed"),
+                });
+            }
+            Err(_) => tracing::warn!("no reactor available; skipping startup indexing"),
+        }
+    }
+    Ok(Some(memory))
+}
+
+/// The standalone service: the API at `/api`, and a JSON 404 for anything else.
+pub fn build_router(config: Config) -> Result<Router, BuildError> {
     Ok(Router::new()
-        .route("/api/health", get(health))
-        .route("/api/ready", get(ready))
-        .route("/api/metrics", get(metrics))
-        .route("/api/providers", get(providers))
-        .route("/api/coders", get(coder_statuses))
-        .route("/api/models", get(models))
-        .route("/api/chat", post(chat))
-        .fallback(not_found)
-        .with_state(state)
-        .layer(DefaultBodyLimit::disable())
-        .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES))
-        .layer(TraceLayer::new_for_http()))
+        .nest("/api", build_api_router(config)?)
+        .fallback(not_found))
 }
 
 #[derive(Debug, Error)]
@@ -607,6 +875,10 @@ pub enum BuildError {
     Config(#[from] ConfigError),
     #[error("failed to build HTTP client: {0}")]
     Http(#[from] reqwest::Error),
+    #[error("the harness workspace is unusable: {0}")]
+    Workspace(#[from] WorkspaceError),
+    #[error("codebase memory is unusable: {0}")]
+    Memory(#[from] harness::memory::HarnessMemoryError),
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -642,6 +914,12 @@ async fn metrics(State(state): State<AppState>) -> Response {
         concat!(
             "# TYPE lumen_chat_requests_total counter\n",
             "lumen_chat_requests_total {}\n",
+            "# TYPE lumen_agent_requests_total counter\n",
+            "lumen_agent_requests_total {}\n",
+            "# TYPE lumen_agent_tool_calls_total counter\n",
+            "lumen_agent_tool_calls_total {}\n",
+            "# TYPE lumen_memory_records gauge\n",
+            "lumen_memory_records {}\n",
             "# TYPE lumen_coder_busy_rejections_total counter\n",
             "lumen_coder_busy_rejections_total {}\n",
             "# TYPE lumen_coder_slots_available gauge\n",
@@ -652,6 +930,12 @@ async fn metrics(State(state): State<AppState>) -> Response {
             "lumen_configured_providers {}\n",
         ),
         state.metrics.chat_requests.load(Ordering::Relaxed),
+        state.metrics.agent_requests.load(Ordering::Relaxed),
+        state.metrics.tool_calls.load(Ordering::Relaxed),
+        state
+            .memory
+            .as_ref()
+            .map_or(0, |memory| memory.live_count()),
         state.metrics.coder_busy_rejections.load(Ordering::Relaxed),
         state.coder_slots.available_permits(),
         state.config.coders.len(),
@@ -826,20 +1110,65 @@ pub struct ChatRequest {
     pub temperature: Option<f32>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    /// Tools the model may call.
+    ///
+    /// Lumen never executes these. It translates them into whichever wire
+    /// format the selected provider speaks, and hands any resulting calls back
+    /// to the caller to run. That keeps this service stateless and free of any
+    /// knowledge of the caller's domain, and means a tool runs with the
+    /// caller's own permissions rather than Lumen's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<ToolDef>>,
     pub messages: Vec<ChatMessage>,
 }
+
+/// A tool offered to the model, described in provider-neutral terms.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ToolDef {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema for the arguments. Passed through to the provider as-is;
+    /// all three accept JSON Schema, they merely disagree about where it goes.
+    pub input_schema: Value,
+}
+
+/// A call the model wants made.
+///
+/// `arguments` is a parsed object rather than the JSON string OpenAI puts on
+/// the wire — callers should not have to parse a string out of a struct that
+/// already knows it is JSON.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub arguments: Value,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChatMessage {
     pub role: Role,
+    #[serde(default)]
     pub content: String,
+    /// Set on an assistant turn that asked for tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    /// Set on a `tool` turn, naming the call this is the result of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     System,
     User,
     Assistant,
+    /// The result of a tool the caller ran on the model's behalf.
+    Tool,
 }
 
 async fn chat(
@@ -898,6 +1227,19 @@ async fn chat(
             .config
             .coder_route(requested_coder, provider_id, requested_model)
     {
+        // A CLI coder has no tool protocol. Flattening the tools into the
+        // prompt would let a model "call" something that never runs and whose
+        // result is never returned -- an answer built on a tool it believes
+        // executed. Refusing is the only honest option.
+        if request
+            .tools
+            .as_ref()
+            .is_some_and(|tools| !tools.is_empty())
+        {
+            return sse_error(
+                "Tool calling is not supported on AI coder routes; select a hosted provider",
+            );
+        }
         let permit = match state.coder_slots.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
@@ -926,71 +1268,12 @@ async fn chat(
             }
         };
     }
-    let provider = requested_provider
-        .and_then(|provider_id| state.config.provider_route(requested_coder, provider_id));
-    let Some(provider) = provider else {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "unknown_route",
-            format!(
-                "AI coder/provider route `{}/{}` is not configured",
-                requested_coder,
-                requested_provider.unwrap_or("*")
-            ),
-        );
+    let (provider_kind, upstream) = match open_upstream(&state, &request).await {
+        Ok(pair) => pair,
+        Err(error) => return sse_error(&error.to_string()),
     };
-    let model = requested_model.unwrap_or(&provider.default_model);
-    if model.trim().is_empty()
-        || model.len() > MAX_MODEL_BYTES
-        || model.chars().any(char::is_control)
-    {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_request",
-            "model is invalid",
-        );
-    }
-    let upstream_payload = provider_payload(
-        provider.kind,
-        model,
-        &request.messages,
-        request.temperature,
-        request.max_tokens,
-    );
-    let upstream_request = authenticated(
-        state
-            .client
-            .post(provider.chat_endpoint(model))
-            .header(header::ACCEPT, "text/event-stream")
-            .json(&upstream_payload),
-        provider,
-    );
-    let upstream = match tokio::time::timeout(Duration::from_secs(30), upstream_request.send())
-        .await
-    {
-        Ok(Ok(response)) => response,
-        Ok(Err(error)) => {
-            tracing::warn!(provider = provider.id, error = %error, "chat upstream request failed");
-            return sse_error("The selected AI provider is unavailable");
-        }
-        Err(_) => return sse_error("The selected AI provider timed out"),
-    };
-    if !upstream.status().is_success() {
-        let status = upstream.status();
-        let detail = limited_error_body(upstream).await;
-        tracing::warn!(provider = provider.id, %status, upstream_detail = %detail, "chat upstream rejected request");
-        return sse_error(&format!("The selected AI provider returned {status}"));
-    }
-    let is_sse = upstream
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.to_ascii_lowercase().starts_with("text/event-stream"));
-    if !is_sse {
-        return sse_error("The selected AI provider returned an invalid stream");
-    }
 
-    let kind = provider.kind;
+    let kind = provider_kind;
     let source = upstream.bytes_stream().eventsource();
     let output = stream! {
         pin_mut!(source);
@@ -1018,6 +1301,430 @@ async fn chat(
     response
 }
 
+/// Run the agent harness, streaming what it does as it does it.
+///
+/// `/chat` streams a model's text and hands any tool calls back for the caller
+/// to run. This runs them, which is the whole difference: the response is a
+/// record of an agent working, not a transcript of one asking.
+///
+/// The frames are JSON objects tagged by `event`, terminated by `[DONE]` like
+/// every other stream this service produces, so a client that only knows how to
+/// read text can still follow the `text` frames and ignore the rest.
+async fn agent(
+    State(state): State<AppState>,
+    payload: Result<Json<ChatRequest>, JsonRejection>,
+) -> Response {
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(error) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                error.body_text(),
+            );
+        }
+    };
+    if let Err(message) = validate_chat(&request) {
+        return json_error(StatusCode::BAD_REQUEST, "invalid_request", message);
+    }
+    state.metrics.agent_requests.fetch_add(1, Ordering::Relaxed);
+
+    let metrics = Arc::clone(&state.metrics);
+    let harness = state.harness();
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    // The run owns the sender, so the channel closes when the run ends and the
+    // loop below terminates without needing a sentinel.
+    let run = tokio::spawn(async move { harness.run(request, Some(sender)).await });
+
+    let output = stream! {
+        while let Some(event) = receiver.recv().await {
+            if matches!(event, HarnessEvent::ToolResult { .. }) {
+                metrics.tool_calls.fetch_add(1, Ordering::Relaxed);
+            }
+            yield Ok::<Bytes, std::io::Error>(frame(&event));
+        }
+        let closing = match run.await {
+            Ok(Ok(outcome)) => json!({
+                "event": "outcome",
+                "text": outcome.text,
+                "steps": outcome.steps,
+                "tool_calls": outcome.tool_calls,
+                "stopped_at_step_limit": outcome.stopped_at_step_limit,
+            }),
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "harness run failed");
+                error_payload(&error.to_string())
+            }
+            Err(error) => {
+                tracing::error!(%error, "harness task did not finish");
+                error_payload("The agent harness stopped unexpectedly")
+            }
+        };
+        yield Ok(frame(&closing));
+        yield Ok(Bytes::from_static(b"data: [DONE]\n\n"));
+    };
+
+    let mut response = Response::new(Body::from_stream(output));
+    add_sse_headers(response.headers_mut());
+    response
+}
+
+/// What the harness can do here, so a client can show it rather than guess.
+async fn harness_status(State(state): State<AppState>) -> Json<Value> {
+    let context = ToolContext {
+        workspace: state.workspace.clone(),
+        memory: state.memory.clone(),
+    };
+    Json(json!({
+        "workspace": state.workspace.root().display().to_string(),
+        "writes_enabled": state.workspace.allows_writes(),
+        "max_steps": state.config.harness.max_steps,
+        "memory": state.memory.as_ref().map(|memory| json!({
+            "records": memory.live_count(),
+            "retrieved_per_turn": state.config.harness.memory_hits,
+        })),
+        "tools": ToolRegistry::builtin(&context).names(),
+    }))
+}
+
+/// Rebuild the codebase index.
+///
+/// Idempotent: `index_file` tombstones a path's old rows before writing new
+/// ones, so running this twice replaces rows rather than duplicating them.
+async fn reindex(State(state): State<AppState>) -> Response {
+    let Some(memory) = state.memory.clone() else {
+        return json_error(
+            StatusCode::CONFLICT,
+            "memory_disabled",
+            "codebase memory is disabled; set AI_HARNESS_MEMORY_DIR to enable it",
+        );
+    };
+    // A whole-tree index is minutes of CPU on a large repository, and the
+    // reactor is also serving every other request on this process.
+    match tokio::task::spawn_blocking(move || memory.index_workspace()).await {
+        Ok(Ok(stats)) => Json(json!({
+            "files": stats.files,
+            "records": stats.records,
+            "skipped": stats.skipped,
+        }))
+        .into_response(),
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "codebase indexing failed");
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "index_failed",
+                "codebase indexing failed",
+            )
+        }
+        Err(error) => {
+            tracing::error!(%error, "indexing task did not finish");
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "index_failed",
+                "codebase indexing did not finish",
+            )
+        }
+    }
+}
+
+/// One SSE frame carrying a JSON value.
+fn frame(value: &impl Serialize) -> Bytes {
+    match serde_json::to_string(value) {
+        Ok(json) => Bytes::from(format!("data: {json}\n\n")),
+        Err(error) => Bytes::from(format!(
+            "data: {}\n\n",
+            error_payload(&format!("failed to encode a harness event: {error}"))
+        )),
+    }
+}
+
+/// Why a completion could not be produced.
+#[derive(Debug, thiserror::Error)]
+pub enum CompletionError {
+    #[error("invalid chat request: {0}")]
+    InvalidRequest(&'static str),
+    #[error("ai_coder/provider fields conflict with the canonical model path")]
+    ConflictingRoute,
+    #[error("AI coder/provider route `{0}` is not configured")]
+    UnknownRoute(String),
+    #[error("model is invalid")]
+    InvalidModel,
+    #[error("The selected AI provider is unavailable")]
+    Unavailable,
+    #[error("The selected AI provider timed out")]
+    TimedOut,
+    #[error("The selected AI provider returned {0}")]
+    Upstream(StatusCode),
+    #[error("The selected AI provider returned an invalid stream")]
+    NotStreaming,
+    #[error("The selected AI provider stream was interrupted")]
+    StreamInterrupted,
+    #[error("The selected AI provider returned invalid arguments for tool `{0}`")]
+    InvalidToolArguments(String),
+    #[error("The selected AI provider named a tool that cannot be routed: `{0}`")]
+    InvalidToolName(String),
+    #[error("Tool calling is not supported on AI coder routes; select a hosted provider")]
+    ToolsOnCoderRoute,
+    #[error("All AI coder execution slots are busy; try again shortly")]
+    CoderBusy,
+    #[error("The selected AI coder timed out")]
+    CoderTimedOut,
+    #[error("The selected AI coder failed; verify its native CLI authentication")]
+    CoderFailed,
+}
+
+/// Resolve the route, build the payload and open the upstream stream.
+///
+/// Shared by the streaming endpoint and [`Gateway::complete`] so the two cannot
+/// disagree about which provider a request reaches or what it is sent.
+async fn open_upstream(
+    state: &AppState,
+    request: &ChatRequest,
+) -> Result<(ProviderKind, reqwest::Response), CompletionError> {
+    let embedded = request.model.as_deref().and_then(parse_model_path);
+    let requested_coder = embedded
+        .map(|(coder, _, _)| coder)
+        .or(request.ai_coder.as_deref())
+        .unwrap_or(&state.config.default_coder);
+    let requested_provider = embedded
+        .map(|(_, provider, _)| provider)
+        .or(request.provider.as_deref())
+        .or(Some(state.config.default_provider.as_str()));
+    let requested_model = embedded
+        .map(|(_, _, model)| model)
+        .or(request.model.as_deref());
+
+    let provider = requested_provider
+        .and_then(|provider_id| state.config.provider_route(requested_coder, provider_id))
+        .ok_or_else(|| {
+            CompletionError::UnknownRoute(format!(
+                "{requested_coder}/{}",
+                requested_provider.unwrap_or("*")
+            ))
+        })?;
+
+    let model = requested_model.unwrap_or(&provider.default_model);
+    if model.trim().is_empty()
+        || model.len() > MAX_MODEL_BYTES
+        || model.chars().any(char::is_control)
+    {
+        return Err(CompletionError::InvalidModel);
+    }
+
+    let payload = provider_payload(
+        provider.kind,
+        model,
+        &request.messages,
+        request.temperature,
+        request.max_tokens,
+        request.tools.as_deref(),
+    );
+    let upstream_request = authenticated(
+        state
+            .client
+            .post(provider.chat_endpoint(model))
+            .header(header::ACCEPT, "text/event-stream")
+            .json(&payload),
+        provider,
+    );
+    let upstream = match tokio::time::timeout(Duration::from_secs(30), upstream_request.send())
+        .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            tracing::warn!(provider = provider.id, error = %error, "chat upstream request failed");
+            return Err(CompletionError::Unavailable);
+        }
+        Err(_) => return Err(CompletionError::TimedOut),
+    };
+    if !upstream.status().is_success() {
+        let status = upstream.status();
+        let detail = limited_error_body(upstream).await;
+        tracing::warn!(provider = provider.id, %status, upstream_detail = %detail, "chat upstream rejected request");
+        return Err(CompletionError::Upstream(status));
+    }
+    let is_sse = upstream
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().starts_with("text/event-stream"));
+    if !is_sse {
+        return Err(CompletionError::NotStreaming);
+    }
+    Ok((provider.kind, upstream))
+}
+
+/// One model turn, assembled.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Completion {
+    pub text: String,
+    /// Empty when the model answered rather than asking for a tool.
+    pub tool_calls: Vec<ToolCall>,
+}
+
+/// A programmatic handle on the gateway.
+///
+/// The HTTP endpoint streams, which is right for a person watching text appear
+/// and wrong for an agent loop that has to see a whole turn before deciding
+/// what to run. This assembles the stream and returns the finished turn.
+pub struct Gateway {
+    state: AppState,
+}
+
+impl Gateway {
+    pub fn new(config: Config) -> Result<Self, BuildError> {
+        Ok(Self {
+            state: gateway_state(config)?,
+        })
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.state.config
+    }
+
+    /// Whether this request would be served by a hosted API or by a native CLI.
+    ///
+    /// The harness asks before it decides whether to offer tools: a CLI coder
+    /// is already an agent, and handing it a tool registry it cannot use would
+    /// be rejected here and would be the wrong shape anyway.
+    pub fn execution_for(&self, request: &ChatRequest) -> Execution {
+        let route = self.state.config.route_for(request);
+        match self.state.config.native_route(&route) {
+            Some(_) => Execution::Native,
+            None => Execution::Hosted,
+        }
+    }
+
+    /// Run one turn to completion, returning the text and any tool calls.
+    pub async fn complete(&self, request: ChatRequest) -> Result<Completion, CompletionError> {
+        validate_chat(&request).map_err(CompletionError::InvalidRequest)?;
+        let embedded = request.model.as_deref().and_then(parse_model_path);
+        if embedded.is_some_and(|(coder, provider, _)| {
+            request
+                .ai_coder
+                .as_deref()
+                .is_some_and(|value| value != coder)
+                || request
+                    .provider
+                    .as_deref()
+                    .is_some_and(|value| value != provider)
+        }) {
+            return Err(CompletionError::ConflictingRoute);
+        }
+
+        let route = self.state.config.route_for(&request);
+        let native = self.state.config.native_route(&route);
+        if request.tools.as_ref().is_some_and(|t| !t.is_empty()) && native.is_some() {
+            return Err(CompletionError::ToolsOnCoderRoute);
+        }
+
+        if let Some(route) = native {
+            let permit = self
+                .state
+                .coder_slots
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| CompletionError::CoderBusy)?;
+            let prompt = coder_prompt(&request.messages, self.state.config.coder_allow_writes);
+            let result = coders::execute(
+                route,
+                &prompt,
+                &self.state.config.coder_workspace,
+                self.state.config.coder_allow_writes,
+                self.state.config.coder_timeout,
+            )
+            .await;
+            drop(permit);
+            let execution = match result {
+                Ok(execution) => execution,
+                Err(coders::CoderError::Timeout { .. }) => {
+                    return Err(CompletionError::CoderTimedOut);
+                }
+                Err(_) => return Err(CompletionError::CoderFailed),
+            };
+            return Ok(Completion {
+                text: execution.output,
+                tool_calls: Vec::new(),
+            });
+        }
+
+        let (kind, upstream) = open_upstream(&self.state, &request).await?;
+        let source = upstream.bytes_stream().eventsource();
+        pin_mut!(source);
+
+        let mut text = String::new();
+        // Arguments arrive in pieces keyed by index, so calls are assembled
+        // rather than read: id and name land once, the JSON accumulates.
+        let mut calls: std::collections::BTreeMap<u64, (String, String, String)> =
+            std::collections::BTreeMap::new();
+
+        let mut saw_done = false;
+        while let Some(event) = source.next().await {
+            let event = event.map_err(|_| CompletionError::StreamInterrupted)?;
+            let Some(data) = translate_event(kind, &event.event, &event.data) else {
+                continue;
+            };
+            if data == "[DONE]" {
+                saw_done = true;
+                break;
+            }
+            let Ok(chunk) = serde_json::from_str::<Value>(&data) else {
+                continue;
+            };
+            if let Some(part) = chunk
+                .pointer("/choices/0/delta/content")
+                .and_then(Value::as_str)
+            {
+                text.push_str(part);
+            }
+            for call in chunk
+                .pointer("/choices/0/delta/tool_calls")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
+                let entry = calls.entry(index).or_default();
+                if let Some(id) = call.get("id").and_then(Value::as_str) {
+                    entry.0 = id.to_string();
+                }
+                if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
+                    entry.1 = name.to_string();
+                }
+                if let Some(args) = call.pointer("/function/arguments").and_then(Value::as_str) {
+                    entry.2.push_str(args);
+                }
+            }
+        }
+
+        if !saw_done {
+            return Err(CompletionError::StreamInterrupted);
+        }
+
+        let tool_calls = calls
+            .into_values()
+            .filter(|(_, name, _)| !name.is_empty())
+            .map(|(id, name, arguments)| {
+                // Caught here rather than on the next turn: this transcript is
+                // handed straight back to the provider by an agent loop, and a
+                // name that cannot round-trip would fail validation there with
+                // no indication that upstream was what produced it.
+                if !valid_provider_id(&name) {
+                    return Err(CompletionError::InvalidToolName(display_identifier(&name)));
+                }
+                let arguments = serde_json::from_str(&arguments)
+                    .map_err(|_| CompletionError::InvalidToolArguments(name.clone()))?;
+                Ok(ToolCall {
+                    id,
+                    name,
+                    arguments,
+                })
+            })
+            .collect::<Result<Vec<_>, CompletionError>>()?;
+        Ok(Completion { text, tool_calls })
+    }
+}
+
 fn authenticated(request: RequestBuilder, provider: &ProviderConfig) -> RequestBuilder {
     let Some(key) = &provider.api_key else {
         return request;
@@ -1030,21 +1737,177 @@ fn authenticated(request: RequestBuilder, provider: &ProviderConfig) -> RequestB
         ProviderKind::Gemini => request.header("x-goog-api-key", key),
     }
 }
+/// Map a tool-call id back to the tool's name.
+///
+/// Gemini keys a function response by *name* while OpenAI and Anthropic key it
+/// by the id they issued, so a transcript that only carries ids has to be read
+/// backwards to serve Gemini. Built once per request rather than scanned per
+/// message.
+fn tool_names_by_id(messages: &[ChatMessage]) -> std::collections::HashMap<&str, &str> {
+    messages
+        .iter()
+        .filter_map(|m| m.tool_calls.as_ref())
+        .flatten()
+        .map(|c| (c.id.as_str(), c.name.as_str()))
+        .collect()
+}
+
+/// Arguments as the JSON *string* OpenAI puts on the wire.
+fn arguments_as_string(arguments: &Value) -> String {
+    match arguments {
+        Value::String(raw) => raw.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn openai_messages(messages: &[ChatMessage]) -> Vec<Value> {
+    messages
+        .iter()
+        .map(|m| match m.role {
+            Role::Tool => json!({
+                "role": "tool",
+                "tool_call_id": m.tool_call_id.clone().unwrap_or_default(),
+                "content": m.content,
+            }),
+            _ => {
+                let role = match m.role {
+                    Role::System => "system",
+                    Role::Assistant => "assistant",
+                    _ => "user",
+                };
+                let mut value = json!({"role": role, "content": m.content});
+                if let Some(calls) = &m.tool_calls {
+                    value["tool_calls"] = Value::Array(
+                        calls
+                            .iter()
+                            .map(|c| {
+                                json!({
+                                    "id": c.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": c.name,
+                                        "arguments": arguments_as_string(&c.arguments),
+                                    },
+                                })
+                            })
+                            .collect(),
+                    );
+                }
+                value
+            }
+        })
+        .collect()
+}
+
+fn anthropic_messages(messages: &[ChatMessage]) -> Vec<Value> {
+    messages
+        .iter()
+        .filter(|m| !matches!(m.role, Role::System))
+        .map(|m| match m.role {
+            // Anthropic carries a tool result as a user turn holding a
+            // tool_result block, not as a role of its own.
+            Role::Tool => json!({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": m.tool_call_id.clone().unwrap_or_default(),
+                    "content": m.content,
+                }],
+            }),
+            Role::Assistant if m.tool_calls.is_some() => {
+                let mut blocks: Vec<Value> = Vec::new();
+                if !m.content.is_empty() {
+                    blocks.push(json!({"type": "text", "text": m.content}));
+                }
+                for call in m.tool_calls.iter().flatten() {
+                    blocks.push(json!({
+                        "type": "tool_use",
+                        "id": call.id,
+                        "name": call.name,
+                        "input": call.arguments,
+                    }));
+                }
+                json!({"role": "assistant", "content": blocks})
+            }
+            Role::Assistant => json!({"role": "assistant", "content": m.content}),
+            _ => json!({"role": "user", "content": m.content}),
+        })
+        .collect()
+}
+
+fn gemini_contents(messages: &[ChatMessage]) -> Vec<Value> {
+    let names = tool_names_by_id(messages);
+    messages
+        .iter()
+        .filter(|m| !matches!(m.role, Role::System))
+        .map(|m| match m.role {
+            Role::Tool => {
+                let name = m
+                    .tool_call_id
+                    .as_deref()
+                    .and_then(|id| names.get(id).copied())
+                    .unwrap_or_default();
+                json!({
+                    "role": "user",
+                    "parts": [{"functionResponse": {
+                        "name": name,
+                        "response": {"content": m.content},
+                    }}],
+                })
+            }
+            Role::Assistant if m.tool_calls.is_some() => {
+                let mut parts: Vec<Value> = Vec::new();
+                if !m.content.is_empty() {
+                    parts.push(json!({"text": m.content}));
+                }
+                for call in m.tool_calls.iter().flatten() {
+                    parts.push(json!({"functionCall": {
+                        "name": call.name,
+                        "args": call.arguments,
+                    }}));
+                }
+                json!({"role": "model", "parts": parts})
+            }
+            Role::Assistant => json!({"role": "model", "parts": [{"text": m.content}]}),
+            _ => json!({"role": "user", "parts": [{"text": m.content}]}),
+        })
+        .collect()
+}
+
 fn provider_payload(
     kind: ProviderKind,
     model: &str,
     messages: &[ChatMessage],
     temperature: Option<f32>,
     max_tokens: Option<u32>,
+    tools: Option<&[ToolDef]>,
 ) -> Value {
     match kind {
         ProviderKind::Openai | ProviderKind::OpenaiCompatible => {
-            let mut payload = json!({"model": model, "messages": messages, "stream": true});
+            let mut payload = json!({
+                "model": model,
+                "messages": openai_messages(messages),
+                "stream": true,
+            });
             if let Some(value) = temperature {
                 payload["temperature"] = json!(value);
             }
             if let Some(value) = max_tokens {
                 payload["max_tokens"] = json!(value);
+            }
+            if let Some(tools) = tools.filter(|t| !t.is_empty()) {
+                payload["tools"] = Value::Array(
+                    tools
+                        .iter()
+                        .map(|tool| {
+                            json!({"type": "function", "function": {
+                                "name": tool.name,
+                                "description": tool.description,
+                                "parameters": tool.input_schema,
+                            }})
+                        })
+                        .collect(),
+                );
             }
             payload
         }
@@ -1055,14 +1918,31 @@ fn provider_payload(
                 .map(|m| m.content.as_str())
                 .collect::<Vec<_>>()
                 .join("\n\n");
-            let messages = messages.iter().filter(|m| !matches!(m.role, Role::System))
-                .map(|m| json!({"role": match m.role { Role::Assistant => "assistant", _ => "user" }, "content": m.content})).collect::<Vec<_>>();
-            let mut payload = json!({"model": model, "messages": messages, "max_tokens": max_tokens.unwrap_or(4096), "stream": true});
+            let mut payload = json!({
+                "model": model,
+                "messages": anthropic_messages(messages),
+                "max_tokens": max_tokens.unwrap_or(4096),
+                "stream": true,
+            });
             if !system.is_empty() {
                 payload["system"] = Value::String(system);
             }
             if let Some(value) = temperature {
                 payload["temperature"] = json!(value);
+            }
+            if let Some(tools) = tools.filter(|t| !t.is_empty()) {
+                payload["tools"] = Value::Array(
+                    tools
+                        .iter()
+                        .map(|tool| {
+                            json!({
+                                "name": tool.name,
+                                "description": tool.description,
+                                "input_schema": tool.input_schema,
+                            })
+                        })
+                        .collect(),
+                );
             }
             payload
         }
@@ -1073,8 +1953,7 @@ fn provider_payload(
                 .map(|m| m.content.as_str())
                 .collect::<Vec<_>>()
                 .join("\n\n");
-            let contents = messages.iter().filter(|m| !matches!(m.role, Role::System))
-                .map(|m| json!({"role": if matches!(m.role, Role::Assistant) { "model" } else { "user" }, "parts": [{"text": m.content}]})).collect::<Vec<_>>();
+            let contents = gemini_contents(messages);
             let mut generation = serde_json::Map::new();
             if let Some(value) = temperature {
                 generation.insert("temperature".into(), json!(value));
@@ -1088,6 +1967,18 @@ fn provider_payload(
             }
             if !generation.is_empty() {
                 payload["generationConfig"] = Value::Object(generation);
+            }
+            if let Some(tools) = tools.filter(|t| !t.is_empty()) {
+                payload["tools"] = json!([{
+                    "functionDeclarations": tools
+                        .iter()
+                        .map(|tool| json!({
+                            "name": tool.name,
+                            "description": tool.description,
+                            "parameters": tool.input_schema,
+                        }))
+                        .collect::<Vec<_>>(),
+                }]);
             }
             payload
         }
@@ -1104,11 +1995,42 @@ fn translate_event(kind: ProviderKind, event_type: &str, data: &str) -> Option<S
                 return Some("[DONE]".into());
             }
             let payload: Value = serde_json::from_str(data).ok()?;
+            // The block index is reused as the OpenAI tool_calls index. It
+            // counts text blocks too, so it may not start at zero -- harmless,
+            // because every accumulator treats it as an opaque grouping key
+            // rather than an offset.
+            let index = payload.get("index").and_then(Value::as_u64).unwrap_or(0);
             match payload.get("type").and_then(Value::as_str) {
-                Some("content_block_delta") => payload
-                    .pointer("/delta/text")
-                    .and_then(Value::as_str)
-                    .map(openai_delta),
+                // Anthropic announces a tool call before streaming its
+                // arguments, so the name arrives here and the arguments arrive
+                // as input_json_delta below.
+                Some("content_block_start")
+                    if payload
+                        .pointer("/content_block/type")
+                        .and_then(Value::as_str)
+                        == Some("tool_use") =>
+                {
+                    Some(openai_tool_start(
+                        index,
+                        payload
+                            .pointer("/content_block/id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                        payload
+                            .pointer("/content_block/name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    ))
+                }
+                Some("content_block_delta") => {
+                    if let Some(text) = payload.pointer("/delta/text").and_then(Value::as_str) {
+                        return Some(openai_delta(text));
+                    }
+                    payload
+                        .pointer("/delta/partial_json")
+                        .and_then(Value::as_str)
+                        .map(|partial| openai_tool_arguments(index, partial))
+                }
                 Some("message_stop") => Some("[DONE]".into()),
                 Some("error") => {
                     Some(error_payload("The Anthropic stream returned an error").to_string())
@@ -1131,6 +2053,18 @@ fn translate_event(kind: ProviderKind, event_type: &str, data: &str) -> Option<S
             let finish = payload
                 .pointer("/candidates/0/finishReason")
                 .and_then(Value::as_str);
+            // Gemini sends a complete functionCall rather than streaming its
+            // arguments, so one chunk carries both the name and the whole
+            // argument object.
+            if let Some(call) = payload
+                .pointer("/candidates/0/content/parts")
+                .and_then(Value::as_array)
+                .and_then(|parts| parts.iter().find_map(|part| part.get("functionCall")))
+            {
+                let name = call.get("name").and_then(Value::as_str).unwrap_or_default();
+                let args = call.get("args").cloned().unwrap_or_else(|| json!({}));
+                return Some(openai_tool_whole(0, name, &args.to_string()));
+            }
             text.as_deref()
                 .map(openai_delta)
                 .or_else(|| finish.map(|_| "[DONE]".into()))
@@ -1140,6 +2074,37 @@ fn translate_event(kind: ProviderKind, event_type: &str, data: &str) -> Option<S
 fn openai_delta(text: &str) -> String {
     json!({"choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]})
         .to_string()
+}
+
+/// Announce a tool call: id and name, arguments still to come.
+fn openai_tool_start(index: u64, id: &str, name: &str) -> String {
+    json!({"choices": [{"index": 0, "delta": {"tool_calls": [{
+        "index": index,
+        "id": id,
+        "type": "function",
+        "function": {"name": name, "arguments": ""},
+    }]}, "finish_reason": null}]})
+    .to_string()
+}
+
+/// A further slice of a tool call's arguments.
+fn openai_tool_arguments(index: u64, partial: &str) -> String {
+    json!({"choices": [{"index": 0, "delta": {"tool_calls": [{
+        "index": index,
+        "function": {"arguments": partial},
+    }]}, "finish_reason": null}]})
+    .to_string()
+}
+
+/// A tool call that arrived complete, for providers that do not stream them.
+fn openai_tool_whole(index: u64, name: &str, arguments: &str) -> String {
+    json!({"choices": [{"index": 0, "delta": {"tool_calls": [{
+        "index": index,
+        "id": format!("call_{index}"),
+        "type": "function",
+        "function": {"name": name, "arguments": arguments},
+    }]}, "finish_reason": null}]})
+    .to_string()
 }
 fn validate_chat(request: &ChatRequest) -> Result<(), &'static str> {
     if let Some(ai_coder) = &request.ai_coder
@@ -1170,8 +2135,29 @@ fn validate_chat(request: &ChatRequest) -> Result<(), &'static str> {
     }
     let mut total = 0usize;
     for message in &request.messages {
-        if message.content.trim().is_empty() {
+        let has_tool_calls = message
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| !calls.is_empty());
+        if message.content.trim().is_empty() && !(message.role == Role::Assistant && has_tool_calls)
+        {
             return Err("message content must not be empty");
+        }
+        if message.role == Role::Tool && message.tool_call_id.as_deref().is_none_or(str::is_empty) {
+            return Err("tool messages must identify their tool call");
+        }
+        if message.role != Role::Tool && message.tool_call_id.is_some() {
+            return Err("only tool messages may identify a tool call");
+        }
+        if message.role != Role::Assistant && message.tool_calls.is_some() {
+            return Err("only assistant messages may contain tool calls");
+        }
+        if let Some(calls) = &message.tool_calls {
+            for call in calls {
+                if call.id.is_empty() || !valid_provider_id(&call.name) {
+                    return Err("tool call is invalid");
+                }
+            }
         }
         if message.content.len() > MAX_CONTENT_BYTES {
             return Err("a message is too large");
@@ -1216,9 +2202,23 @@ fn coder_prompt(messages: &[ChatMessage], allow_writes: bool) -> String {
             Role::System => "SYSTEM",
             Role::User => "USER",
             Role::Assistant => "ASSISTANT",
+            // A CLI coder has no tool protocol, so a transcript that already
+            // contains tool traffic is flattened into labelled text. That keeps
+            // a conversation readable if it moves between a provider and a
+            // coder mid-thread; it does not make tools work here, which is why
+            // offering them to a coder route is refused outright below.
+            Role::Tool => "TOOL RESULT",
         };
         prompt.push_str(role);
         prompt.push_str(":\n");
+        if let Some(calls) = &message.tool_calls {
+            for call in calls {
+                prompt.push_str(&format!(
+                    "(requested tool {} with {})\n",
+                    call.name, call.arguments
+                ));
+            }
+        }
         prompt.push_str(&message.content);
         prompt.push_str("\n\n");
     }
@@ -1284,9 +2284,12 @@ mod tests {
             model: None,
             temperature: None,
             max_tokens: None,
+            tools: None,
             messages: vec![ChatMessage {
                 role: Role::User,
                 content: "Hello".into(),
+                tool_calls: None,
+                tool_call_id: None,
             }],
         }
     }
@@ -1306,6 +2309,7 @@ mod tests {
             coder_timeout: Duration::from_secs(30),
             coder_allow_writes: false,
             coder_max_concurrency: 2,
+            harness: HarnessSettings::default(),
         };
         assert!(config.validate().is_ok());
         let mut remote = config.clone();
@@ -1345,6 +2349,75 @@ mod tests {
             Err(ConfigError::DuplicateRoute(route)) if route == "hermes/openai"
         ));
     }
+
+    #[test]
+    fn defaults_to_the_first_installed_coder_when_no_hosted_provider_exists() {
+        let coders = vec![coders::CoderRoute {
+            kind: coders::CoderKind::Claude,
+            provider: "claude".into(),
+            provider_name: "Claude".into(),
+            model: "default".into(),
+            model_name: "Default".into(),
+            executable: PathBuf::from("/usr/bin/claude"),
+        }];
+
+        assert_eq!(default_coder_for_backends(&[], &coders), "claude");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn programmatic_gateway_executes_a_cli_coder_route() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let executable = workspace.path().join("hermes");
+        std::fs::write(&executable, "#!/bin/sh\nprintf native-answer\n").unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        let gateway = Gateway::new(Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            providers: Vec::new(),
+            coders: vec![coders::CoderRoute {
+                kind: coders::CoderKind::Hermes,
+                provider: "auto".into(),
+                provider_name: "Auto".into(),
+                model: "default".into(),
+                model_name: "Default".into(),
+                executable,
+            }],
+            default_coder: "hermes".into(),
+            default_provider: "auto".into(),
+            coder_workspace: workspace.path().to_owned(),
+            coder_timeout: Duration::from_secs(5),
+            coder_allow_writes: true,
+            coder_max_concurrency: 1,
+            harness: HarnessSettings::default(),
+        })
+        .unwrap();
+
+        let completion = gateway
+            .complete(ChatRequest {
+                ai_coder: Some("hermes".into()),
+                provider: Some("auto".into()),
+                model: Some("default".into()),
+                temperature: None,
+                max_tokens: None,
+                tools: None,
+                messages: vec![ChatMessage {
+                    role: Role::User,
+                    content: "hello".into(),
+                    tool_call_id: None,
+                    tool_calls: None,
+                }],
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(completion.text, "native-answer");
+        assert!(completion.tool_calls.is_empty());
+    }
+
     #[test]
     fn translates_all_native_streams() {
         let anthropic = translate_event(
@@ -1405,13 +2478,24 @@ mod tests {
             ChatMessage {
                 role: Role::System,
                 content: "Be concise".into(),
+                tool_calls: None,
+                tool_call_id: None,
             },
             ChatMessage {
                 role: Role::User,
                 content: "Hello".into(),
+                tool_calls: None,
+                tool_call_id: None,
             },
         ];
-        let openai = provider_payload(ProviderKind::Openai, "gpt", &messages, Some(0.4), Some(123));
+        let openai = provider_payload(
+            ProviderKind::Openai,
+            "gpt",
+            &messages,
+            Some(0.4),
+            Some(123),
+            None,
+        );
         assert!((openai["temperature"].as_f64().unwrap() - 0.4).abs() < 0.0001);
         assert_eq!(openai["max_tokens"], 123);
         let anthropic = provider_payload(
@@ -1420,6 +2504,7 @@ mod tests {
             &messages,
             Some(0.4),
             Some(123),
+            None,
         );
         assert_eq!(anthropic["system"], "Be concise");
         assert_eq!(anthropic["max_tokens"], 123);
@@ -1429,6 +2514,7 @@ mod tests {
             &messages,
             Some(0.4),
             Some(123),
+            None,
         );
         assert_eq!(gemini["generationConfig"]["maxOutputTokens"], 123);
     }
@@ -1475,5 +2561,305 @@ mod tests {
             parse_model_path("codex/codex/gpt-5.6"),
             Some(("codex", "codex", "gpt-5.6"))
         );
+    }
+
+    fn msg(role: Role, content: &str) -> ChatMessage {
+        ChatMessage {
+            role,
+            content: content.into(),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    fn tool() -> ToolDef {
+        ToolDef {
+            name: "search_feed".into(),
+            description: "Search opportunities".into(),
+            input_schema: json!({"type": "object", "properties": {"q": {"type": "string"}}}),
+        }
+    }
+
+    /// A transcript that has already been through one round of tool use.
+    fn transcript() -> Vec<ChatMessage> {
+        vec![
+            msg(Role::User, "any IT work in Virginia?"),
+            ChatMessage {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".into(),
+                    name: "search_feed".into(),
+                    arguments: json!({"q": "IT Virginia"}),
+                }]),
+                tool_call_id: None,
+            },
+            ChatMessage {
+                role: Role::Tool,
+                content: "3 results".into(),
+                tool_calls: None,
+                tool_call_id: Some("call_1".into()),
+            },
+        ]
+    }
+
+    #[test]
+    fn openai_sends_tools_and_a_tool_role() {
+        let tools = [tool()];
+        let payload = provider_payload(
+            ProviderKind::Openai,
+            "gpt",
+            &transcript(),
+            None,
+            None,
+            Some(&tools),
+        );
+        assert_eq!(payload.pointer("/tools/0/type").unwrap(), "function");
+        assert_eq!(
+            payload.pointer("/tools/0/function/name").unwrap(),
+            "search_feed"
+        );
+        // OpenAI wants arguments as a JSON string, not an object.
+        let args = payload
+            .pointer("/messages/1/tool_calls/0/function/arguments")
+            .unwrap();
+        assert!(args.is_string(), "arguments must be a string, got {args}");
+        assert_eq!(payload.pointer("/messages/2/role").unwrap(), "tool");
+        assert_eq!(
+            payload.pointer("/messages/2/tool_call_id").unwrap(),
+            "call_1"
+        );
+    }
+
+    /// Anthropic has no tool role: a result is a user turn holding a
+    /// tool_result block, and the arguments stay an object.
+    #[test]
+    fn anthropic_carries_a_tool_result_as_a_user_block() {
+        let tools = [tool()];
+        let payload = provider_payload(
+            ProviderKind::Anthropic,
+            "claude",
+            &transcript(),
+            None,
+            None,
+            Some(&tools),
+        );
+        assert_eq!(payload.pointer("/tools/0/name").unwrap(), "search_feed");
+        assert!(payload.pointer("/tools/0/input_schema").is_some());
+        assert_eq!(
+            payload.pointer("/messages/1/content/0/type").unwrap(),
+            "tool_use"
+        );
+        assert!(
+            payload
+                .pointer("/messages/1/content/0/input")
+                .unwrap()
+                .is_object()
+        );
+        assert_eq!(payload.pointer("/messages/2/role").unwrap(), "user");
+        assert_eq!(
+            payload.pointer("/messages/2/content/0/type").unwrap(),
+            "tool_result"
+        );
+        assert_eq!(
+            payload
+                .pointer("/messages/2/content/0/tool_use_id")
+                .unwrap(),
+            "call_1"
+        );
+    }
+
+    /// Gemini keys a response by function *name* while the transcript only
+    /// carries the id, so the name has to be recovered from the earlier turn.
+    #[test]
+    fn gemini_recovers_the_function_name_from_the_call_id() {
+        let tools = [tool()];
+        let payload = provider_payload(
+            ProviderKind::Gemini,
+            "gemini",
+            &transcript(),
+            None,
+            None,
+            Some(&tools),
+        );
+        assert_eq!(
+            payload
+                .pointer("/tools/0/functionDeclarations/0/name")
+                .unwrap(),
+            "search_feed"
+        );
+        assert_eq!(
+            payload
+                .pointer("/contents/1/parts/0/functionCall/name")
+                .unwrap(),
+            "search_feed"
+        );
+        assert_eq!(
+            payload
+                .pointer("/contents/2/parts/0/functionResponse/name")
+                .unwrap(),
+            "search_feed",
+            "the id must resolve back to the name"
+        );
+    }
+
+    #[test]
+    fn tools_are_omitted_when_none_are_offered() {
+        let payload = provider_payload(
+            ProviderKind::Openai,
+            "gpt",
+            &[msg(Role::User, "hi")],
+            None,
+            None,
+            None,
+        );
+        assert!(payload.get("tools").is_none());
+        let empty: [ToolDef; 0] = [];
+        let payload = provider_payload(
+            ProviderKind::Anthropic,
+            "claude",
+            &[msg(Role::User, "hi")],
+            None,
+            None,
+            Some(&empty),
+        );
+        assert!(
+            payload.get("tools").is_none(),
+            "an empty list is not a tool offer"
+        );
+    }
+
+    #[test]
+    fn anthropic_streams_a_tool_call_in_two_parts() {
+        let start = translate_event(
+            ProviderKind::Anthropic,
+            "content_block_start",
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_9","name":"search_feed","input":{}}}"#,
+        )
+        .expect("a tool_use block must not be dropped");
+        let start: Value = serde_json::from_str(&start).unwrap();
+        assert_eq!(
+            start.pointer("/choices/0/delta/tool_calls/0/id").unwrap(),
+            "toolu_9"
+        );
+        assert_eq!(
+            start
+                .pointer("/choices/0/delta/tool_calls/0/function/name")
+                .unwrap(),
+            "search_feed"
+        );
+
+        let args = translate_event(
+            ProviderKind::Anthropic,
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"q\":"}}"#,
+        )
+        .expect("argument deltas must not be dropped");
+        let args: Value = serde_json::from_str(&args).unwrap();
+        assert_eq!(
+            args.pointer("/choices/0/delta/tool_calls/0/function/arguments")
+                .unwrap(),
+            "{\"q\":"
+        );
+        // Both halves must land on the same index so an accumulator joins them.
+        assert_eq!(
+            start.pointer("/choices/0/delta/tool_calls/0/index"),
+            args.pointer("/choices/0/delta/tool_calls/0/index")
+        );
+    }
+
+    #[test]
+    fn gemini_streams_a_whole_tool_call_at_once() {
+        let chunk = translate_event(
+            ProviderKind::Gemini,
+            "message",
+            r#"{"candidates":[{"content":{"parts":[{"functionCall":{"name":"search_feed","args":{"q":"IT"}}}]}}]}"#,
+        )
+        .expect("a functionCall must not be dropped");
+        let chunk: Value = serde_json::from_str(&chunk).unwrap();
+        assert_eq!(
+            chunk
+                .pointer("/choices/0/delta/tool_calls/0/function/name")
+                .unwrap(),
+            "search_feed"
+        );
+        let args = chunk
+            .pointer("/choices/0/delta/tool_calls/0/function/arguments")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(args.contains("\"q\""), "arguments arrive whole, got {args}");
+    }
+
+    #[tokio::test]
+    async fn gateway_assembles_a_streamed_tool_call() {
+        use axum::body::Body;
+        use axum::http::Response as HttpResponse;
+
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                let body = concat!(
+                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"search_feed\",\"arguments\":\"{\\\"q\\\":\"}}]}}]}\n\n",
+                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"IT\\\"}\"}}]}}]}\n\n",
+                    "data: [DONE]\n\n"
+                );
+                HttpResponse::builder()
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from(body))
+                    .unwrap()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut config = Config {
+            bind: "127.0.0.1:41788".parse().unwrap(),
+            providers: vec![provider("openai", ProviderKind::Openai)],
+            coders: Vec::new(),
+            default_coder: "hermes".into(),
+            default_provider: "openai".into(),
+            coder_workspace: PathBuf::from("."),
+            coder_timeout: Duration::from_secs(30),
+            coder_allow_writes: false,
+            coder_max_concurrency: 2,
+            harness: HarnessSettings::default(),
+        };
+        config.providers[0].base_url = format!("http://{address}/v1");
+        let gateway = Gateway::new(config).unwrap();
+        let mut request = request();
+        request.tools = Some(vec![tool()]);
+
+        let completion = gateway.complete(request).await.unwrap();
+        assert_eq!(completion.text, "");
+        assert_eq!(
+            completion.tool_calls,
+            vec![ToolCall {
+                id: "call_1".into(),
+                name: "search_feed".into(),
+                arguments: json!({"q": "IT"}),
+            }]
+        );
+    }
+
+    /// The reason the normaliser was text-only is that text still has to work.
+    #[test]
+    fn plain_text_streaming_is_unchanged() {
+        for (kind, event, data) in [
+            (
+                ProviderKind::Anthropic,
+                "content_block_delta",
+                r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"Hi"}}"#,
+            ),
+            (
+                ProviderKind::Gemini,
+                "message",
+                r#"{"candidates":[{"content":{"parts":[{"text":"Hi"}]}}]}"#,
+            ),
+        ] {
+            let chunk = translate_event(kind, event, data).expect("text must survive");
+            let chunk: Value = serde_json::from_str(&chunk).unwrap();
+            assert_eq!(chunk.pointer("/choices/0/delta/content").unwrap(), "Hi");
+        }
     }
 }

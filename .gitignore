@@ -1,6 +1,8 @@
 node_modules/
 dist/
 target/
+# The default codebase-index location under the coder workspace.
+data/
 .vite/
 coverage/
 graphify-out/
@@ -17,3 +19,8 @@ graphify-out/
 .hermes/
 .DS_Store
 *.local
+
+# Playwright
+test-results/
+playwright-report/
+blob-report/

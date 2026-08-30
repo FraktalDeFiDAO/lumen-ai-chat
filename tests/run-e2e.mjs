@@ -1,4 +1,7 @@
 import { spawn } from 'node:child_process'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { reservePorts } from './ports.mjs'
 
 const cwd = new URL('..', import.meta.url).pathname
@@ -51,17 +54,27 @@ async function stopAll() {
   }
 }
 
+/// Run one test suite to completion, streaming its output. A suite's own
+/// reporter is the report; this only decides whether the run continues.
+async function run(label, command, args, env = {}) {
+  const child = start(command, args, env)
+  child.stdout.on('data', data => process.stdout.write(data))
+  child.stderr.on('data', data => process.stderr.write(data))
+  await new Promise((resolve, reject) => {
+    child.once('exit', code => code === 0 ? resolve() : reject(new Error(`${label} failed with exit code ${code}`)))
+    child.once('error', reject)
+  })
+}
+
+let memoryDir = ''
+
 try {
   const [mockPort, apiPort, webPort] = await reservePorts(3)
+  memoryDir = await mkdtemp(join(tmpdir(), 'lumen-memory-'))
   const mockURL = `http://127.0.0.1:${mockPort}`
   const apiURL = `http://127.0.0.1:${apiPort}`
   const webURL = `http://127.0.0.1:${webPort}`
-  const configGuards = start('node', ['tests/config-guards.mjs'])
-  await new Promise((resolve, reject) => {
-    configGuards.once('exit', code => code === 0 ? resolve() : reject(new Error(logs.get(configGuards)?.join('') || `Configuration guards exited ${code}`)))
-    configGuards.once('error', reject)
-  })
-  process.stdout.write(logs.get(configGuards)?.join('') ?? '')
+  await run('Configuration guards', 'node', ['--test', 'tests/contract/config-guards.test.mjs'])
 
   const mock = start('node', ['tests/mock-provider.mjs'], { MOCK_AI_PORT: String(mockPort) })
   await waitFor(`${mockURL}/v1/models`, mock, 10_000)
@@ -71,6 +84,9 @@ try {
     AI_DEFAULT_CODER: 'hermes',
     AI_DEFAULT_PROVIDER: 'z.ai',
     AI_CODER_WORKSPACE: cwd,
+    // Outside the repository on purpose: the default lives under the workspace,
+    // and a test run must not leave an index behind in the tree it indexed.
+    AI_HARNESS_MEMORY_DIR: memoryDir,
     AI_CODER_HERMES_BIN: `${cwd}tests/mock-coder.mjs`,
     AI_CODER_OPENCODE_BIN: `${cwd}tests/mock-coder.mjs`,
     AI_CODER_KILOCODE_BIN: `${cwd}tests/mock-coder.mjs`,
@@ -98,24 +114,17 @@ try {
   })
   await waitFor(`${apiURL}/api/ready`, backend)
 
-  const providerTest = start('node', ['tests/provider-contract.mjs'], { API_URL: apiURL })
-  await new Promise((resolve, reject) => {
-    providerTest.once('exit', code => code === 0 ? resolve() : reject(new Error(logs.get(providerTest)?.join('') || `Provider tests exited ${code}`)))
-    providerTest.once('error', reject)
-  })
-  process.stdout.write(logs.get(providerTest)?.join('') ?? '')
+  await run('Provider contracts', 'node', ['--test', 'tests/contract/provider-contract.test.mjs'], { API_URL: apiURL })
 
   const web = start('npm', ['run', 'dev:web', '--', '--port', String(webPort), '--strictPort'], {
     VITE_API_TARGET: apiURL,
   })
   await waitFor(webURL, web, 30_000)
 
-  const test = start('node', ['tests/e2e.mjs'], { BASE_URL: webURL })
-  await new Promise((resolve, reject) => {
-    test.once('exit', code => code === 0 ? resolve() : reject(new Error(logs.get(test)?.join('') || `E2E exited ${code}`)))
-    test.once('error', reject)
-  })
-  process.stdout.write(logs.get(test)?.join('') ?? '')
+  // Playwright drives the browser suite. It never starts a server itself: the
+  // stack above is already up, and the specs address it through BASE_URL.
+  await run('Browser suite', './node_modules/.bin/playwright', ['test', ...process.argv.slice(2)], { BASE_URL: webURL })
 } finally {
   await stopAll()
+  if (memoryDir) await rm(memoryDir, { recursive: true, force: true })
 }

@@ -1,6 +1,6 @@
 import { computed, ref, watch } from 'vue'
 import { defineStore } from 'pinia'
-import type { ChatModel, Conversation, Feedback, Message } from '@/types/chat'
+import type { ChatModel, Conversation, Feedback, Message, ToolActivity } from '@/types/chat'
 import { useSettingsStore } from './settings'
 
 const STORAGE_KEY = 'lumen-conversations-v1'
@@ -14,11 +14,38 @@ function loadConversations(): Conversation[] {
   } catch { return [] }
 }
 
-export function parseSSEBlock(block: string): { done: boolean; content: string; error?: string } {
-  const data = block.split(/\r?\n/)
+/// The payload of one SSE block: every `data:` line, rejoined.
+function blockData(block: string): string {
+  return block.split(/\r?\n/)
     .filter(line => line.startsWith('data:'))
     .map(line => line.slice(5).trimStart())
     .join('\n')
+}
+
+/// Read an SSE body block by block. `onBlock` returns true when the stream is
+/// over, which is what `[DONE]` means on every endpoint this app talks to.
+async function readFrames(response: Response, onBlock: (block: string) => boolean) {
+  if (!response.body) throw new Error('The server returned an empty response.')
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let finished = false
+  while (!finished) {
+    const { done, value } = await reader.read()
+    buffer += decoder.decode(value, { stream: !done })
+    const blocks = buffer.split(/\r?\n\r?\n/)
+    buffer = blocks.pop() ?? ''
+    for (const block of blocks) {
+      if (onBlock(block)) { finished = true; break }
+    }
+    if (done) break
+  }
+  // A stream cut off mid-frame still carries whatever the last block held.
+  if (buffer.trim() && !finished) onBlock(buffer)
+}
+
+export function parseSSEBlock(block: string): { done: boolean; content: string; error?: string } {
+  const data = blockData(block)
   if (!data) return { done: false, content: '' }
   if (data.trim() === '[DONE]') return { done: true, content: '' }
   try {
@@ -33,28 +60,81 @@ export function parseSSEBlock(block: string): { done: boolean; content: string; 
 }
 
 export async function readSSE(response: Response, onContent: (content: string) => void) {
-  if (!response.body) throw new Error('The server returned an empty response.')
-  const reader = response.body.getReader()
-  const decoder = new TextDecoder()
-  let buffer = ''
-  let doneEvent = false
-  while (!doneEvent) {
-    const { done, value } = await reader.read()
-    buffer += decoder.decode(value, { stream: !done })
-    const blocks = buffer.split(/\r?\n\r?\n/)
-    buffer = blocks.pop() ?? ''
-    for (const block of blocks) {
-      const event = parseSSEBlock(block)
-      if (event.error) throw new Error(event.error)
-      if (event.content) onContent(event.content)
-      if (event.done) { doneEvent = true; break }
-    }
-    if (done) break
-  }
-  if (buffer.trim() && !doneEvent) {
-    const event = parseSSEBlock(buffer)
+  await readFrames(response, block => {
+    const event = parseSSEBlock(block)
     if (event.error) throw new Error(event.error)
     if (event.content) onContent(event.content)
+    return event.done
+  })
+}
+
+/// One frame from `/api/agent`. The harness tags each by `event`; anything
+/// unrecognised is ignored rather than shown, so a newer server adding a frame
+/// type cannot break an older page.
+export interface HarnessFrame {
+  event?: string
+  step?: number
+  id?: string
+  name?: string
+  arguments?: unknown
+  output?: string
+  failed?: boolean
+  text?: string
+  records?: number
+  tool_calls?: number
+  stopped_at_step_limit?: boolean
+}
+
+export function parseHarnessBlock(block: string): { done: boolean; frame?: HarnessFrame; error?: string } {
+  const data = blockData(block)
+  if (!data) return { done: false }
+  if (data.trim() === '[DONE]') return { done: true }
+  try {
+    const value = JSON.parse(data) as HarnessFrame & { error?: { message?: unknown } | string }
+    if (value.error) {
+      const message = typeof value.error === 'string' ? value.error : value.error.message
+      return { done: false, error: typeof message === 'string' ? message : 'The agent harness returned an error.' }
+    }
+    return { done: false, frame: value }
+  } catch { return { done: false } }
+}
+
+export async function readHarnessSSE(response: Response, onFrame: (frame: HarnessFrame) => void) {
+  await readFrames(response, block => {
+    const event = parseHarnessBlock(block)
+    if (event.error) throw new Error(event.error)
+    if (event.frame) onFrame(event.frame)
+    return event.done
+  })
+}
+
+/// Fold one harness frame into the message being built.
+///
+/// Text arrives per step and is joined the same way the harness joins it for
+/// its own outcome, so the transcript a user reads matches the one the model
+/// was given on the next turn.
+export function applyHarnessFrame(message: Message, frame: HarnessFrame) {
+  switch (frame.event) {
+    case 'context':
+      message.contextRecords = frame.records
+      break
+    case 'text':
+      if (frame.text) message.content += message.content ? `\n\n${frame.text}` : frame.text
+      break
+    case 'tool_call': {
+      const activity: ToolActivity = { id: frame.id ?? '', name: frame.name ?? 'tool', arguments: frame.arguments }
+      message.tools = [...(message.tools ?? []), activity]
+      break
+    }
+    case 'tool_result': {
+      const activity = message.tools?.find(tool => tool.id === frame.id)
+      if (activity) { activity.output = frame.output; activity.failed = frame.failed === true }
+      break
+    }
+    case 'outcome':
+      if (!message.content && typeof frame.text === 'string') message.content = frame.text
+      if (frame.stopped_at_step_limit) message.incomplete = true
+      break
   }
 }
 
@@ -78,7 +158,10 @@ export const useChatStore = defineStore('chat', () => {
     const conversation: Conversation = { id: uid(), title: firstMessage ? firstMessage.slice(0, 42) : 'New conversation', messages: [], createdAt: now, updatedAt: now }
     conversations.value.unshift(conversation)
     activeId.value = conversation.id
-    return conversation
+    // The reactive element rather than the object that was pushed: everything
+    // that follows mutates this conversation, and through the raw object those
+    // writes never reach the watcher that saves it.
+    return conversations.value[0]!
   }
   function selectConversation(id: string | null) { activeId.value = id }
   function deleteConversation(id: string) {
@@ -92,7 +175,12 @@ export const useChatStore = defineStore('chat', () => {
     conversation.messages.push(message)
     conversation.updatedAt = Date.now()
     if (role === 'user' && conversation.messages.filter(m => m.role === 'user').length === 1) conversation.title = content.split('\n')[0]!.slice(0, 42)
-    return message
+    // The reactive element, not the object that was pushed. Streaming mutates
+    // this message for as long as the answer takes; through the raw object those
+    // writes are invisible to the watcher that persists the conversation, so a
+    // reload would show an answer that is empty or cut off at whichever
+    // millisecond `updatedAt` last happened to change.
+    return conversation.messages[conversation.messages.length - 1]!
   }
 
   async function loadModels() {
@@ -120,7 +208,10 @@ export const useChatStore = defineStore('chat', () => {
     try {
       const selected = models.value.find(model => model.key === selectedModel.value)
       const systemPrompt = [preferences.settings.systemPrompt.trim(), `Respond in ${preferences.settings.language}. Use a ${preferences.settings.responseStyle.toLowerCase()} level of detail.`].filter(Boolean).join('\n\n')
-      const response = await fetch('/api/chat', {
+      // Agent mode runs the same conversation through the harness, which
+      // executes tools against the workspace instead of only describing them.
+      const agent = preferences.settings.agentMode
+      const response = await fetch(agent ? '/api/agent' : '/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
         signal: currentController.signal,
@@ -142,11 +233,19 @@ export const useChatStore = defineStore('chat', () => {
         } catch { /* non-JSON error */ }
         throw new Error(detail || `Request failed (${response.status})`)
       }
-      await readSSE(response, chunk => { assistant.content += chunk; conversation.updatedAt = Date.now() })
-      if (!assistant.content) throw new Error('The model returned no response.')
+      if (agent) {
+        await readHarnessSSE(response, frame => { applyHarnessFrame(assistant, frame); conversation.updatedAt = Date.now() })
+        // A run that only called tools has no text, but it is not a failure --
+        // the tools it ran are the answer, and they are on the message.
+        if (!assistant.content && !assistant.tools?.length) throw new Error('The agent returned no response.')
+        if (!assistant.content) assistant.content = 'No summary was returned; see the tool activity above.'
+      } else {
+        await readSSE(response, chunk => { assistant.content += chunk; conversation.updatedAt = Date.now() })
+        if (!assistant.content) throw new Error('The model returned no response.')
+      }
     } catch (error) {
       if (currentController.signal.aborted) {
-        if (!assistant.content) conversation.messages = conversation.messages.filter(message => message.id !== assistant.id)
+        if (!assistant.content && !assistant.tools?.length) conversation.messages = conversation.messages.filter(message => message.id !== assistant.id)
       } else {
         assistant.error = error instanceof Error ? error.message : 'Something went wrong. Please try again.'
         if (!assistant.content) assistant.content = 'Unable to generate a response.'

@@ -8,14 +8,16 @@
     "dev:web": "vite --host 127.0.0.1 --port 41789",
     "dev:server": "cargo run --manifest-path backend/Cargo.toml",
     "build": "vue-tsc -b && vite build",
-    "build:server": "cargo build --manifest-path backend/Cargo.toml",
-    "check:server": "cargo fmt --manifest-path backend/Cargo.toml --check && cargo clippy --manifest-path backend/Cargo.toml --all-targets -- -D warnings && cargo test --manifest-path backend/Cargo.toml",
-    "typecheck": "vue-tsc -b",
+    "build:server": "cargo build --manifest-path backend/Cargo.toml --workspace",
+    "check:server": "cargo fmt --manifest-path backend/Cargo.toml --all --check && cargo clippy --manifest-path backend/Cargo.toml --workspace --all-targets -- -D warnings && cargo test --manifest-path backend/Cargo.toml --workspace",
+    "typecheck": "vue-tsc -b && vue-tsc -b tsconfig.test.json",
     "test": "vitest run",
     "test:e2e": "node tests/run-e2e.mjs",
-    "test:podman": "node tests/podman-smoke.mjs",
+    "test:podman": "playwright test --config playwright.podman.config.ts",
     "audit": "npm audit --audit-level=low && cargo audit --file backend/Cargo.lock && cargo deny --manifest-path backend/Cargo.toml check",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:e2e:only": "playwright test",
+    "test:e2e:report": "playwright show-report"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.1.14",
@@ -26,11 +28,12 @@
     "vue-router": "^4.6.3"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.1",
     "@types/node": "^24.7.2",
     "@vitejs/plugin-vue": "^6.0.1",
     "@vue/test-utils": "^2.4.6",
-    "concurrently": "^9.2.1",
     "@vue/tsconfig": "^0.8.1",
+    "concurrently": "^9.2.1",
     "jsdom": "^27.0.0",
     "playwright-core": "^1.62.1",
     "typescript": "~5.9.3",

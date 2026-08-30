@@ -56,3 +56,23 @@
 .theme-dark .welcome h1,.theme-dark .message-content { color:#eee; }.theme-dark .welcome-inner>p,.theme-dark .disclaimer { color:#99958d; }.theme-dark .suggestion-card { background:#2d2c28;border-color:#46443e; }.theme-dark .suggestion-card:hover { background:#34332e;border-color:#5a574f; }.theme-dark .suggestion-card strong { color:#e5e2da; }.theme-dark .composer-shell textarea { color:#eee; }.theme-dark .model-select-label select,.theme-dark .composer-icon { color:#b7b3aa; }.theme-dark .message.user .message-body { background:#3a3934;color:#eee; }.theme-dark .message-actions button:hover,.theme-dark .model-select-label select:hover:not(:disabled),.theme-dark .composer-icon:hover { background:#3b3934;color:#fff; }.theme-dark .attachment-chip { background:#3a3934;border-color:#504e47;color:#ddd9d0; }.theme-dark .overflow-menu { background:#302f2b;border-color:#4a4841; }.theme-dark .settings-page { background:#23221f;color:#eee; }
 .theme-dark .coder-status { border-color:#45433d; }.theme-dark .status-pill.installed_unverified { background:#294333;color:#a9dbb7; }.theme-dark .status-pill.unavailable { background:#3a3934;color:#aaa69c; }.theme-dark .coder-safety { color:#aaa69c; }
 @media (max-width:640px){.settings-layout nav{display:flex;flex-direction:row;overflow-x:auto;margin-bottom:24px}.settings-layout nav button{flex:none}.profile-form{grid-template-columns:1fr}.profile-card{align-items:flex-start;flex-direction:column}.settings-card{align-items:flex-start}.share-status{display:none}.model-select-label select{max-width:180px}}
+
+.harness-context { margin:0 0 8px;color:#77736b;font-size:11px; }
+.harness-incomplete { margin:9px 0 0;padding:8px 10px;border-radius:8px;background:#f7f0e4;color:#8a694e;font-size:12px; }
+.tool-activity { display:flex;flex-direction:column;gap:5px;margin:0 0 10px; }
+.tool-activity details { border:1px solid #e4e0d8;border-radius:8px;background:#faf9f6;font-size:11px; }
+.tool-activity details.failed { border-color:#e6c9c2;background:#fbefec; }
+.tool-activity summary { display:flex;align-items:center;gap:7px;padding:7px 9px;cursor:pointer;color:#6d6962; }
+.tool-activity summary strong { color:#45433e;font-weight:650; }
+.tool-activity summary span { flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:ui-monospace,SFMono-Regular,monospace;color:#8a867e; }
+.tool-activity summary em { font-style:normal;color:#a43d31;font-weight:650; }
+.tool-activity pre { max-height:260px;overflow:auto;margin:0;padding:0 9px 9px;font-family:ui-monospace,SFMono-Regular,monospace;font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-word;color:#55524c; }
+.agent-note { margin:0;color:#77736b;font-size:12px;line-height:1.5; }
+.harness-tools { display:flex;flex-wrap:wrap;gap:6px; }
+.harness-tools code { padding:3px 7px;border-radius:999px;background:#f0efeb;color:#5d5a54;font-size:11px; }
+.theme-dark .tool-activity details { background:#2d2c28;border-color:#46443e; }
+.theme-dark .tool-activity details.failed { background:#3a2b28;border-color:#5f4740; }
+.theme-dark .tool-activity summary strong { color:#e5e2da; }
+.theme-dark .tool-activity pre,.theme-dark .harness-context,.theme-dark .agent-note { color:#aaa69c; }
+.theme-dark .harness-tools code { background:#3a3934;color:#ddd9d0; }
+.theme-dark .harness-incomplete { background:#3a352b;color:#d8c39c; }
