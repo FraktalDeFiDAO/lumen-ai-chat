@@ -6,6 +6,10 @@ services:
     build:
       context: .
       dockerfile: Containerfile.backend
+      args:
+        # Match the user the container runs as, below.
+        APP_UID: "${UID:-1000}"
+        APP_GID: "${GID:-1000}"
     container_name: lumen-ai-chat-api
     network_mode: host
     userns_mode: keep-id
