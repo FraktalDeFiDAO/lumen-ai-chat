@@ -1,0 +1,67 @@
+name: Promotion
+
+# Promotions move a commit that already passed CI to the next environment; they
+# must not be a way to move one that did not.
+#
+# GitHub cannot enforce this here — branch protection and rulesets both require
+# Pro or a public repository, and this is a private repository on Free. So the
+# rule is enforced as a job that fails the pull request instead: the same
+# outcome, arriving by a different route.
+
+on:
+  pull_request:
+    branches: [staging, main]
+
+permissions:
+  contents: read
+
+jobs:
+  direction:
+    name: Promotions only go one way
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the source branch
+        env:
+          BASE: ${{ github.base_ref }}
+          HEAD: ${{ github.head_ref }}
+        run: |
+          set -euo pipefail
+          case "$BASE:$HEAD" in
+            staging:dev|main:staging)
+              echo "$HEAD -> $BASE is a promotion." ;;
+            main:hotfix/*|staging:hotfix/*)
+              echo "$HEAD -> $BASE is a hotfix, which is allowed to skip ahead." ;;
+            *)
+              echo "::error::$HEAD cannot be merged into $BASE."
+              echo "Work flows dev -> staging -> main. Open this against dev, or"
+              echo "name it hotfix/* if it is an urgent fix that must skip ahead."
+              exit 1 ;;
+          esac
+
+  verified:
+    name: The commit being promoted already passed CI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Look for a successful CI run on this exact commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # A hotfix has no prior run to find; CI on the pull request itself is
+          # what covers it.
+          if [[ "${{ github.head_ref }}" == hotfix/* ]]; then
+            echo "Hotfix: verified by this pull request's own CI run."
+            exit 0
+          fi
+          runs=$(gh api "repos/$REPO/actions/runs?head_sha=$SHA&status=success" \
+                   --jq '[.workflow_runs[] | select(.name == "CI")] | length')
+          if [[ "$runs" -eq 0 ]]; then
+            echo "::error::No successful CI run for $SHA."
+            echo "The commit at the head of this branch has not passed CI on the"
+            echo "branch it came from. Push it there first and let it go green."
+            exit 1
+          fi
+          echo "Found $runs successful CI run(s) for $SHA."

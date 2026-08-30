@@ -460,6 +460,21 @@ already had is uploaded once and the local copy is left where it is. Turning the
 store on therefore does not strand anybody's history, and turning it off again
 does not lose it.
 
+## Contributing
+
+Work flows `feature/* → dev → staging → main`, by pull request at every step.
+[CONTRIBUTING.md](CONTRIBUTING.md) has the rules and, importantly, which of them
+GitHub can actually enforce here — this is a private repository on a Free
+account, where branch protection is unavailable, so the promotion rules live in
+a workflow and a local hook instead. Releases are tags on `main`:
+[RELEASING.md](RELEASING.md).
+
+Install the local push guard once per clone:
+
+```bash
+git config core.hooksPath githooks
+```
+
 ## Quality gates
 
 ```bash

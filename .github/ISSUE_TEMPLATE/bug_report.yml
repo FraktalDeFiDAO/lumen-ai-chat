@@ -1,0 +1,32 @@
+name: Bug report
+description: Something behaves differently from what it says it does
+labels: [bug]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: The observed behaviour, and what you expected instead.
+    validations: { required: true }
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: The smallest sequence that shows it.
+    validations: { required: true }
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Which deployment
+      options:
+        - Local dev (npm run dev)
+        - Compose, single user (compose.yaml)
+        - Compose, hosted (compose.yaml + compose.hosted.yaml)
+        - Other
+    validations: { required: true }
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: Gateway logs, browser console, the failing test. Redact secrets.
+      render: text
