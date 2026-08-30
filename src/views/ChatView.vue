@@ -28,7 +28,15 @@ function keyboardShortcut(event: KeyboardEvent) {
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') { event.preventDefault(); store.selectConversation(null); router.push('/') }
   if (event.key === 'Escape') overflowOpen.value = false
 }
-onMounted(() => { window.addEventListener('keydown', keyboardShortcut); store.loadModels() })
+// The history arrives asynchronously now, so the route is resolved again once
+// it is here: a deep link to /chat/:id is opened before there is anything to
+// find it in, and would otherwise fall back to the empty state.
+onMounted(async () => {
+  window.addEventListener('keydown', keyboardShortcut)
+  store.loadModels()
+  await store.ensureHistory()
+  syncRoute()
+})
 onBeforeUnmount(() => window.removeEventListener('keydown', keyboardShortcut))
 async function shareChat() {
   const conversation = store.activeConversation

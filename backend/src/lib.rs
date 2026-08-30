@@ -1186,6 +1186,10 @@ async fn current_user(
     Json(json!({
         "user": user,
         "multi_user": state.identity.is_multi_user(),
+        // Whether this deployment keeps conversations. The client asks here
+        // rather than by trying the store and reading a 503, which every browser
+        // reports as a failed request on an ordinary page load.
+        "conversations": state.store.is_some(),
     }))
 }
 async fn health(State(state): State<AppState>) -> Json<Value> {

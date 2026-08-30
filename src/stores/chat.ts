@@ -2,17 +2,15 @@ import { computed, ref, watch } from 'vue'
 import { defineStore } from 'pinia'
 import type { ChatModel, Conversation, Feedback, Message, ToolActivity } from '@/types/chat'
 import { useSettingsStore } from './settings'
+import { LocalBackend, detectBackend, type ConversationBackend } from './persistence'
 
-const STORAGE_KEY = 'lumen-conversations-v1'
 const MODEL_KEY = 'lumen-model-v1'
+/// A streamed answer changes the conversation on every chunk. Saving each one
+/// would be a request per token; waiting for the stream to end would lose the
+/// answer if the tab closed. This is the compromise, and it is why `flush`
+/// exists for the moments that must not wait.
+const SAVE_DEBOUNCE_MS = 700
 const uid = () => crypto.randomUUID()
-
-function loadConversations(): Conversation[] {
-  try {
-    const value = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '[]')
-    return Array.isArray(value) ? value : []
-  } catch { return [] }
-}
 
 /// The payload of one SSE block: every `data:` line, rejoined.
 function blockData(block: string): string {
@@ -140,7 +138,14 @@ export function applyHarnessFrame(message: Message, frame: HarnessFrame) {
 
 export const useChatStore = defineStore('chat', () => {
   const preferences = useSettingsStore()
-  const conversations = ref<Conversation[]>(loadConversations())
+  const conversations = ref<Conversation[]>([])
+  /// Where conversations are kept. Local until the server says otherwise, so a
+  /// page that never reaches the API still works.
+  const backend = ref<ConversationBackend>(new LocalBackend())
+  const historyError = ref('')
+  /// Ids whose transcripts are in hand. The server sends a list of titles, so
+  /// opening a conversation is what fetches what was said in it.
+  const loaded = new Set<string>()
   const activeId = ref<string | null>(null)
   const isGenerating = ref(false)
   const models = ref<ChatModel[]>([])
@@ -148,28 +153,122 @@ export const useChatStore = defineStore('chat', () => {
   const modelsError = ref('')
   const activeConversation = computed(() => conversations.value.find(c => c.id === activeId.value) ?? null)
   const sortedConversations = computed(() => [...conversations.value].sort((a, b) => b.updatedAt - a.updatedAt))
-  watch(conversations, value => localStorage.setItem(STORAGE_KEY, JSON.stringify(value)), { deep: true })
+  // Persist whichever conversation is being changed. Only the open one ever
+  // mutates -- streaming, feedback, regeneration all happen there -- so watching
+  // it is enough, and it keeps a save from rewriting the whole history.
+  watch(activeConversation, value => { if (value) schedule(value) }, { deep: true })
   watch(selectedModel, value => value ? localStorage.setItem(MODEL_KEY, value) : localStorage.removeItem(MODEL_KEY))
 
   let controller: AbortController | null = null
+
+  const pending = new Map<string, ReturnType<typeof setTimeout>>()
+
+  function schedule(conversation: Conversation) {
+    const existing = pending.get(conversation.id)
+    if (existing) clearTimeout(existing)
+    pending.set(conversation.id, setTimeout(() => {
+      pending.delete(conversation.id)
+      void save(conversation)
+    }, SAVE_DEBOUNCE_MS))
+  }
+
+  async function save(conversation: Conversation) {
+    try {
+      await backend.value.save(conversation)
+      historyError.value = ''
+    } catch (error) {
+      historyError.value = error instanceof Error ? error.message : 'Could not save this conversation.'
+    }
+  }
+
+  /// Write everything that is waiting, now. Called when a run finishes and
+  /// before anything that would make a pending save meaningless.
+  async function flush() {
+    const waiting = [...pending.keys()]
+    for (const id of waiting) {
+      const timer = pending.get(id)
+      if (timer) clearTimeout(timer)
+      pending.delete(id)
+      const conversation = conversations.value.find(item => item.id === id)
+      if (conversation) await save(conversation)
+    }
+  }
+
+  /// The history is loaded once per session, whichever page asks first.
+  ///
+  /// It used to be read synchronously when the store was constructed, so every
+  /// view simply had it. Now that it comes over the network, a view that forgets
+  /// to ask sees an empty history -- which is how Data controls came to report
+  /// nothing to delete when it was opened directly.
+  let loading: Promise<void> | null = null
+
+  function ensureHistory() {
+    loading ??= loadHistory()
+    return loading
+  }
+
+  /// Discover where conversations live and read the history from there.
+  async function loadHistory() {
+    historyError.value = ''
+    try {
+      backend.value = await detectBackend()
+      conversations.value = await backend.value.list()
+      loaded.clear()
+      if (backend.value.listIncludesMessages) {
+        for (const conversation of conversations.value) loaded.add(conversation.id)
+      }
+    } catch (error) {
+      historyError.value = error instanceof Error ? error.message : 'Could not load your conversations.'
+    }
+  }
+
+  /// Fetch a transcript the history list did not carry. Selecting a conversation
+  /// is the only thing that needs one, so it is the only thing that waits.
+  async function ensureLoaded(id: string) {
+    if (loaded.has(id)) return
+    try {
+      const conversation = await backend.value.load(id)
+      const index = conversations.value.findIndex(item => item.id === id)
+      if (conversation && index >= 0) conversations.value[index] = conversation
+      loaded.add(id)
+    } catch (error) {
+      historyError.value = error instanceof Error ? error.message : 'Could not open that conversation.'
+    }
+  }
 
   function createConversation(firstMessage?: string) {
     const now = Date.now()
     const conversation: Conversation = { id: uid(), title: firstMessage ? firstMessage.slice(0, 42) : 'New conversation', messages: [], createdAt: now, updatedAt: now }
     conversations.value.unshift(conversation)
     activeId.value = conversation.id
+    loaded.add(conversation.id)
     // The reactive element rather than the object that was pushed: everything
     // that follows mutates this conversation, and through the raw object those
     // writes never reach the watcher that saves it.
     return conversations.value[0]!
   }
-  function selectConversation(id: string | null) { activeId.value = id }
+  function selectConversation(id: string | null) {
+    activeId.value = id
+    if (id) void ensureLoaded(id)
+  }
   function deleteConversation(id: string) {
     if (activeId.value === id) stopGenerating()
+    const timer = pending.get(id)
+    if (timer) { clearTimeout(timer); pending.delete(id) }
     conversations.value = conversations.value.filter(c => c.id !== id)
+    loaded.delete(id)
     if (activeId.value === id) activeId.value = null
+    void backend.value.remove(id).catch(() => { historyError.value = 'Could not delete that conversation.' })
   }
-  function clearAll() { stopGenerating(); conversations.value = []; activeId.value = null }
+  function clearAll() {
+    stopGenerating()
+    for (const timer of pending.values()) clearTimeout(timer)
+    pending.clear()
+    conversations.value = []
+    loaded.clear()
+    activeId.value = null
+    void backend.value.clear().catch(() => { historyError.value = 'Could not clear your conversations.' })
+  }
   function addMessage(conversation: Conversation, role: Message['role'], content: string) {
     const message: Message = { id: uid(), role, content, createdAt: Date.now(), feedback: null }
     conversation.messages.push(message)
@@ -257,6 +356,7 @@ export const useChatStore = defineStore('chat', () => {
       }
       conversation.updatedAt = Date.now()
     }
+    await flush()
     return conversation.id
   }
 
@@ -286,5 +386,5 @@ export const useChatStore = defineStore('chat', () => {
     if (message) message.feedback = message.feedback === feedback ? null : feedback
   }
 
-  return { conversations, activeId, activeConversation, sortedConversations, isGenerating, models, selectedModel, modelsError, createConversation, selectConversation, deleteConversation, clearAll, sendMessage, stopGenerating, regenerate, setFeedback, loadModels }
+  return { conversations, activeId, activeConversation, sortedConversations, isGenerating, models, selectedModel, modelsError, historyError, backend, loadHistory, ensureHistory, ensureLoaded, flush, createConversation, selectConversation, deleteConversation, clearAll, sendMessage, stopGenerating, regenerate, setFeedback, loadModels }
 })

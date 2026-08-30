@@ -67,6 +67,7 @@ async function run(label, command, args, env = {}) {
 }
 
 let memoryDir = ''
+let storeDir = ''
 
 try {
   const [mockPort, apiPort, webPort] = await reservePorts(3)
@@ -87,6 +88,10 @@ try {
     // Outside the repository on purpose: the default lives under the workspace,
     // and a test run must not leave an index behind in the tree it indexed.
     AI_HARNESS_MEMORY_DIR: memoryDir,
+    // The browser suite covers the deployment that keeps conversations in the
+    // browser, which is what every current install does. `tests/hosted/` covers
+    // the server-backed one against its own stack.
+    AI_STORE: 'off',
     AI_CODER_HERMES_BIN: `${cwd}tests/mock-coder.mjs`,
     AI_CODER_OPENCODE_BIN: `${cwd}tests/mock-coder.mjs`,
     AI_CODER_KILOCODE_BIN: `${cwd}tests/mock-coder.mjs`,
@@ -124,7 +129,44 @@ try {
   // Playwright drives the browser suite. It never starts a server itself: the
   // stack above is already up, and the specs address it through BASE_URL.
   await run('Browser suite', './node_modules/.bin/playwright', ['test', ...process.argv.slice(2)], { BASE_URL: webURL })
+
+  // A second stack, this one keeping conversations on the server under an
+  // identity a proxy asserted. It is a separate gateway because the store and
+  // the identity mode are startup configuration, not something a spec can flip,
+  // and a separate Vite because the proxy target is too.
+  const [hostedApiPort, hostedWebPort] = await reservePorts(2)
+  const hostedApiURL = `http://127.0.0.1:${hostedApiPort}`
+  const hostedWebURL = `http://127.0.0.1:${hostedWebPort}`
+  storeDir = await mkdtemp(join(tmpdir(), 'lumen-store-'))
+
+  const hostedBackend = start('cargo', ['run', '--manifest-path', 'backend/Cargo.toml'], {
+    APP_BIND: `127.0.0.1:${hostedApiPort}`,
+    AI_DEFAULT_CODER: 'hermes',
+    AI_DEFAULT_PROVIDER: 'z.ai',
+    AI_CODER_WORKSPACE: cwd,
+    AI_HARNESS_MEMORY: 'off',
+    AI_STORE_PATH: join(storeDir, 'conversations.db'),
+    AI_IDENTITY_MODE: 'proxy',
+    AI_CODER_HERMES_BIN: `${cwd}tests/mock-coder.mjs`,
+    AI_CODER_ROUTES_JSON: JSON.stringify([
+      { coder: 'hermes', provider: 'z.ai', provider_name: 'Z.AI', model: 'glm-5.2', model_name: 'GLM 5.2' },
+    ]),
+  })
+  await waitFor(`${hostedApiURL}/api/ready`, hostedBackend)
+
+  const hostedWeb = start('npm', ['run', 'dev:web', '--', '--port', String(hostedWebPort), '--strictPort'], {
+    VITE_API_TARGET: hostedApiURL,
+  })
+  await waitFor(hostedWebURL, hostedWeb, 30_000)
+
+  await run(
+    'Hosted browser suite',
+    './node_modules/.bin/playwright',
+    ['test', '--config', 'playwright.hosted.config.ts'],
+    { BASE_URL: hostedWebURL },
+  )
 } finally {
   await stopAll()
   if (memoryDir) await rm(memoryDir, { recursive: true, force: true })
+  if (storeDir) await rm(storeDir, { recursive: true, force: true })
 }

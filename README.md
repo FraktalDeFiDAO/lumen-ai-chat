@@ -312,6 +312,52 @@ data: [DONE]
 
 Open http://127.0.0.1:41789. The Rust API binds to http://127.0.0.1:41788 and Vite proxies `/api` to it.
 
+## Identity and stored conversations
+
+Lumen serves one person by default: conversations live in that browser, and the
+gateway neither knows nor asks who is asking. That is unchanged, and it is what
+every existing install keeps doing.
+
+A hosted deployment turns both on. Identity comes from a header set by a trusted
+reverse proxy — the identity-aware proxy this README already requires for remote
+access — rather than from credentials the gateway checks itself:
+
+```bash
+export AI_IDENTITY_MODE=proxy                  # default: single
+export AI_IDENTITY_USER_HEADER=x-forwarded-user
+export AI_STORE_PATH=/var/lib/lumen/conversations.db   # must be writable
+```
+
+`proxy` mode is only safe when nothing can reach the gateway except that proxy,
+which is why the loopback bind guard stays. In `single` mode the header is
+ignored entirely, so a deployment that was not told to trust a proxy cannot have
+its user decided by whoever sends the request.
+
+Conversations are then keyed by that identity. Every read and every write names
+the user it is for: a conversation belonging to someone else reads as missing
+rather than as forbidden, and an id cannot be taken over by saving onto it.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `AI_IDENTITY_MODE` | `single` | `proxy` to trust an identity header |
+| `AI_IDENTITY_USER_HEADER` | `x-forwarded-user` | Header carrying the user id |
+| `AI_IDENTITY_EMAIL_HEADER` | `x-forwarded-email` | Optional; empty disables |
+| `AI_IDENTITY_NAME_HEADER` | `x-forwarded-preferred-username` | Optional; empty disables |
+| `AI_STORE` | enabled | Set `off` to keep conversations in the browser |
+| `AI_STORE_PATH` | `$AI_CODER_WORKSPACE/data/conversations.db` | Naming it makes open failures fatal |
+
+`GET /api/me` reports who the gateway thinks is asking and whether it keeps
+conversations; the client uses it to decide where to put them.
+
+- `GET /api/conversations` — history, summaries only
+- `GET /api/conversations/{id}` — one transcript
+- `PUT /api/conversations/{id}` — save one, replacing what was there
+- `DELETE /api/conversations/{id}` and `DELETE /api/conversations`
+
+Note that the store is the deployment's first piece of persistent state: the API
+container currently runs entirely on tmpfs with a read-only root, so a hosted
+deployment needs a real volume for it.
+
 ## Quality gates
 
 ```bash
@@ -342,6 +388,7 @@ npm run test:podman  # while the Compose deployment is running
 | `tests/contract/config-guards.test.mjs` | `node --test` | That naming a local model does not by itself enable local inference, and that `OLLAMA_ENABLED` does |
 | `tests/contract/provider-contract.test.mjs` | `node --test` | The service surface, the model catalog, a streamed answer from each of the five CLI adapters and all four hosted protocols, route conflicts, and the harness driving its own loop over every protocol and delegating to a native coder |
 | `tests/e2e/*.spec.ts` | Playwright | The browser, below |
+| `tests/hosted/*.spec.ts` | Playwright | The server-backed deployment, against a second stack with a store and proxy identity: history surviving a browser that remembers nothing, following the person rather than the machine, and never crossing between two people |
 
 `npm run test:podman` runs `tests/podman/podman-smoke.spec.ts` against a Compose deployment you already have running — production images, hardened containers, and a real Hermes invocation rather than a mock. It is the only suite that is not mocked, which is why it is a separate config with its own timeouts.
 
