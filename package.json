@@ -13,7 +13,7 @@
     "typecheck": "vue-tsc -b",
     "test": "vitest run",
     "test:e2e": "node tests/run-e2e.mjs",
-    "test:podman": "node tests/podman-smoke.mjs",
+    "test:podman": "playwright test --config playwright.podman.config.ts",
     "audit": "npm audit --audit-level=low && cargo audit --file backend/Cargo.lock && cargo deny --manifest-path backend/Cargo.toml check",
     "test:watch": "vitest",
     "test:e2e:only": "playwright test",

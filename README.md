@@ -335,7 +335,15 @@ npm run test:podman  # while the Compose deployment is running
 
 `npm test` runs the Vitest unit suite over the frontend: the chat store (SSE and harness frame parsing, streaming, abort, regeneration, persistence), the settings store, and each component — `AppSidebar`, `ChatComposer`, `MessageBubble` — in isolation.
 
-`npm run test:e2e` starts a full stack (mock provider, the real gateway with mock coder executables, Vite) and runs, in order: the configuration guards, the provider contract suite against all five CLI adapters and every hosted protocol, and then the Playwright suite in Chromium.
+`npm run test:e2e` starts a full stack (mock provider, the real gateway with mock coder executables, Vite) and runs three suites against it in order, stopping at the first failure:
+
+| Suite | Runner | Covers |
+| --- | --- | --- |
+| `tests/contract/config-guards.test.mjs` | `node --test` | That naming a local model does not by itself enable local inference, and that `OLLAMA_ENABLED` does |
+| `tests/contract/provider-contract.test.mjs` | `node --test` | The service surface, the model catalog, a streamed answer from each of the five CLI adapters and all four hosted protocols, route conflicts, and the harness driving its own loop over every protocol and delegating to a native coder |
+| `tests/e2e/*.spec.ts` | Playwright | The browser, below |
+
+`npm run test:podman` runs `tests/podman/podman-smoke.spec.ts` against a Compose deployment you already have running — production images, hardened containers, and a real Hermes invocation rather than a mock. It is the only suite that is not mocked, which is why it is a separate config with its own timeouts.
 
 The Playwright specs live in `tests/e2e/` and cover both pages in full:
 
