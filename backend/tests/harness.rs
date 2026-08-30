@@ -14,11 +14,12 @@ use std::{
 
 use ai_chatbot_gateway::{
     ChatMessage, ChatRequest, Config, Execution, Gateway, HarnessSettings, ProviderConfig,
-    ProviderKind, Role,
+    ProviderKind, Role, StoreSettings,
     harness::{
         Harness, HarnessConfig, HarnessEvent, memory::HarnessMemory, tools::ToolContext,
         transcript::Budget, workspace::Workspace,
     },
+    identity::Identity,
 };
 use axum::{
     Router,
@@ -140,6 +141,11 @@ fn config(address: SocketAddr, workspace: &std::path::Path) -> Config {
         coder_allow_writes: true,
         coder_max_concurrency: 2,
         harness: HarnessSettings::default(),
+        store: StoreSettings {
+            enabled: false,
+            ..StoreSettings::default()
+        },
+        identity: Identity::single_user(),
     }
 }
 

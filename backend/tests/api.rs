@@ -8,7 +8,9 @@
 use std::{net::SocketAddr, path::Path, time::Duration};
 
 use ai_chatbot_gateway::{
-    Config, HarnessSettings, ProviderConfig, ProviderKind, build_api_router, build_router,
+    Config, HarnessSettings, ProviderConfig, ProviderKind, StoreSettings, build_api_router,
+    build_router,
+    identity::{Identity, ProxyHeaders},
 };
 use axum::{
     Router,
@@ -53,6 +55,10 @@ async fn upstream() -> SocketAddr {
 }
 
 fn config(address: SocketAddr, workspace: &Path) -> Config {
+    configured(address, workspace, None)
+}
+
+fn configured(address: SocketAddr, workspace: &Path, identity: Option<Identity>) -> Config {
     Config {
         bind: "127.0.0.1:41788".parse().unwrap(),
         providers: vec![ProviderConfig {
@@ -77,6 +83,11 @@ fn config(address: SocketAddr, workspace: &Path) -> Config {
             memory_dir: None,
             ..HarnessSettings::default()
         },
+        store: StoreSettings {
+            enabled: false,
+            ..StoreSettings::default()
+        },
+        identity: identity.unwrap_or_else(Identity::single_user),
     }
 }
 
@@ -445,5 +456,461 @@ async fn a_body_larger_than_the_limit_is_rejected() {
     assert!(
         status == StatusCode::PAYLOAD_TOO_LARGE || status == StatusCode::BAD_REQUEST,
         "an oversized body should be refused, got {status}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------------
+
+async fn me(identity: Option<Identity>, headers: &[(&str, &str)]) -> (StatusCode, Value) {
+    let workspace = tempfile::tempdir().unwrap();
+    let address = upstream().await;
+    let router = build_api_router(configured(address, workspace.path(), identity)).unwrap();
+
+    let mut request = Request::builder().uri("/me");
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let (status, body) = call(router, request.body(Body::empty()).unwrap()).await;
+    (
+        status,
+        serde_json::from_str(&body).unwrap_or_else(|_| panic!("/me did not answer JSON: {body}")),
+    )
+}
+
+/// The deployment Lumen has always been: one person, no header to forge.
+#[tokio::test]
+async fn a_single_user_deployment_names_the_local_user_and_says_it_is_not_shared() {
+    let (status, body) = me(None, &[]).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["user"]["id"], "local");
+    assert_eq!(body["multi_user"], false);
+}
+
+/// Identity must come from configuration, never from the request. A header that
+/// nothing was told to read cannot be allowed to decide who someone is.
+#[tokio::test]
+async fn a_single_user_deployment_ignores_an_identity_header_entirely() {
+    let (status, body) = me(None, &[("x-forwarded-user", "someone-else")]).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["user"]["id"], "local");
+}
+
+#[tokio::test]
+async fn a_proxy_deployment_reports_the_user_the_proxy_asserted() {
+    let (status, body) = me(
+        Some(Identity::proxy(ProxyHeaders::default())),
+        &[
+            ("x-forwarded-user", "riley"),
+            ("x-forwarded-email", "riley@example.com"),
+            ("x-forwarded-preferred-username", "Riley Chen"),
+        ],
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["user"]["id"], "riley");
+    assert_eq!(body["user"]["email"], "riley@example.com");
+    assert_eq!(body["user"]["display_name"], "Riley Chen");
+    assert_eq!(body["multi_user"], true);
+}
+
+/// A request that reaches a proxy deployment without an identity did not come
+/// through the proxy, which is the one thing that must never be served.
+#[tokio::test]
+async fn a_proxy_deployment_refuses_a_request_that_carries_no_identity() {
+    let (status, body) = me(Some(Identity::proxy(ProxyHeaders::default())), &[]).await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"]["type"], "unauthenticated");
+}
+
+#[tokio::test]
+async fn a_proxy_deployment_refuses_an_identity_it_cannot_use_as_a_key() {
+    for value in ["", "  ", "with space", "a/b"] {
+        let (status, _) = me(
+            Some(Identity::proxy(ProxyHeaders::default())),
+            &[("x-forwarded-user", value)],
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{value:?} was accepted as an identity"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Conversations
+// ---------------------------------------------------------------------------
+
+/// A router with a real store on disk and proxy identity, so the isolation
+/// assertions below are made through HTTP rather than against the store directly.
+fn shared_router(store: &Path) -> Router {
+    let workspace = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+    let mut settings = configured(
+        "127.0.0.1:1".parse().unwrap(),
+        workspace.path(),
+        Some(Identity::proxy(ProxyHeaders::default())),
+    );
+    settings.store = StoreSettings {
+        path: Some(store.to_path_buf()),
+        required: true,
+        enabled: true,
+    };
+    build_api_router(settings).unwrap()
+}
+
+fn conversation(id: &str, title: &str, updated_at: i64) -> Value {
+    json!({
+        "id": id,
+        "title": title,
+        "created_at": updated_at,
+        "updated_at": updated_at,
+        "messages": [
+            {"id": "m1", "role": "user", "content": "a question", "created_at": updated_at},
+            {"id": "m2", "role": "assistant", "content": "an answer", "created_at": updated_at},
+        ],
+    })
+}
+
+async fn as_user(router: Router, user: &str, request: Request<Body>) -> (StatusCode, String) {
+    let (parts, body) = request.into_parts();
+    let mut rebuilt = Request::builder().method(parts.method).uri(parts.uri);
+    for (name, value) in parts.headers.iter() {
+        rebuilt = rebuilt.header(name, value);
+    }
+    call(
+        router,
+        rebuilt.header("x-forwarded-user", user).body(body).unwrap(),
+    )
+    .await
+}
+
+fn put_request(path: &str, payload: Value) -> Request<Body> {
+    Request::builder()
+        .method("PUT")
+        .uri(path)
+        .header("content-type", "application/json")
+        .body(Body::from(payload.to_string()))
+        .unwrap()
+}
+
+fn get_request(path: &str) -> Request<Body> {
+    Request::builder().uri(path).body(Body::empty()).unwrap()
+}
+
+fn delete_request(path: &str) -> Request<Body> {
+    Request::builder()
+        .method("DELETE")
+        .uri(path)
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_conversation_saved_over_http_can_be_read_back() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("conversations.db");
+
+    let (status, body) = as_user(
+        shared_router(&database),
+        "riley",
+        put_request("/conversations/c1", conversation("c1", "First chat", 10)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = as_user(
+        shared_router(&database),
+        "riley",
+        get_request("/conversations/c1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let value: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["title"], "First chat");
+    assert_eq!(value["messages"].as_array().unwrap().len(), 2);
+    assert_eq!(value["messages"][1]["content"], "an answer");
+}
+
+#[tokio::test]
+async fn the_history_lists_only_summaries_newest_first() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("conversations.db");
+
+    for (id, title, updated) in [("older", "Older", 10), ("newer", "Newer", 20)] {
+        as_user(
+            shared_router(&database),
+            "riley",
+            put_request(
+                &format!("/conversations/{id}"),
+                conversation(id, title, updated),
+            ),
+        )
+        .await;
+    }
+
+    let (status, body) = as_user(
+        shared_router(&database),
+        "riley",
+        get_request("/conversations"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let listed = serde_json::from_str::<Value>(&body).unwrap();
+    let items = listed["conversations"].as_array().unwrap().clone();
+
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["id"], "newer");
+    assert_eq!(items[0]["message_count"], 2);
+    assert!(
+        items[0].get("messages").is_none(),
+        "the list must not carry transcripts"
+    );
+}
+
+/// The property the whole hosted design rests on, asserted at the edge.
+#[tokio::test]
+async fn one_user_cannot_see_read_or_delete_anothers_conversation() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("conversations.db");
+
+    as_user(
+        shared_router(&database),
+        "riley",
+        put_request(
+            "/conversations/private",
+            conversation("private", "Riley's", 10),
+        ),
+    )
+    .await;
+
+    let (status, body) = as_user(
+        shared_router(&database),
+        "sam",
+        get_request("/conversations"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        serde_json::from_str::<Value>(&body).unwrap()["conversations"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "another user's history leaked into the list: {body}"
+    );
+
+    let (status, _) = as_user(
+        shared_router(&database),
+        "sam",
+        get_request("/conversations/private"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "a guessed id was readable");
+
+    let (status, _) = as_user(
+        shared_router(&database),
+        "sam",
+        delete_request("/conversations/private"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "a guessed id was deletable");
+
+    let (status, body) = as_user(
+        shared_router(&database),
+        "riley",
+        get_request("/conversations/private"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the owner lost their conversation: {body}"
+    );
+}
+
+#[tokio::test]
+async fn saving_over_someone_elses_id_is_refused_rather_than_silently_ignored() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("conversations.db");
+
+    as_user(
+        shared_router(&database),
+        "riley",
+        put_request(
+            "/conversations/shared",
+            conversation("shared", "Riley's", 10),
+        ),
+    )
+    .await;
+
+    let (status, _) = as_user(
+        shared_router(&database),
+        "sam",
+        put_request("/conversations/shared", conversation("shared", "Sam's", 20)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (_, body) = as_user(
+        shared_router(&database),
+        "riley",
+        get_request("/conversations/shared"),
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["title"],
+        "Riley's",
+        "the original was overwritten"
+    );
+}
+
+#[tokio::test]
+async fn clearing_history_clears_only_the_callers_own() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("conversations.db");
+
+    as_user(
+        shared_router(&database),
+        "riley",
+        put_request("/conversations/r1", conversation("r1", "One", 10)),
+    )
+    .await;
+    as_user(
+        shared_router(&database),
+        "riley",
+        put_request("/conversations/r2", conversation("r2", "Two", 20)),
+    )
+    .await;
+    as_user(
+        shared_router(&database),
+        "sam",
+        put_request("/conversations/s1", conversation("s1", "Sam's", 30)),
+    )
+    .await;
+
+    let (status, body) = as_user(
+        shared_router(&database),
+        "riley",
+        delete_request("/conversations"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["deleted"], 2);
+
+    let (_, body) = as_user(
+        shared_router(&database),
+        "sam",
+        get_request("/conversations"),
+    )
+    .await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["conversations"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "another user's history was cleared too"
+    );
+}
+
+#[tokio::test]
+async fn a_body_that_disagrees_with_the_path_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("conversations.db");
+
+    let (status, body) = as_user(
+        shared_router(&database),
+        "riley",
+        put_request(
+            "/conversations/c1",
+            conversation("something-else", "Confused", 10),
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("does not match"), "{body}");
+}
+
+#[tokio::test]
+async fn an_unknown_conversation_is_a_json_404() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("conversations.db");
+
+    let (status, body) = as_user(
+        shared_router(&database),
+        "riley",
+        get_request("/conversations/nope"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["error"]["type"],
+        "not_found"
+    );
+}
+
+#[tokio::test]
+async fn conversations_require_an_identity_when_one_is_configured() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("conversations.db");
+
+    let (status, _) = call(shared_router(&database), get_request("/conversations")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// A deployment that keeps conversations in the browser says so, rather than
+/// answering as though it saved something.
+#[tokio::test]
+async fn a_deployment_without_a_store_says_the_endpoint_is_unavailable() {
+    let workspace = tempfile::tempdir().unwrap();
+    let address = upstream().await;
+    let router = build_api_router(config(address, workspace.path())).unwrap();
+
+    let (status, body) = call(router, get_request("/conversations")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["error"]["type"],
+        "store_unavailable"
+    );
+}
+
+#[tokio::test]
+async fn a_conversation_keeps_the_tool_activity_the_client_put_on_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("conversations.db");
+
+    let mut payload = conversation("c1", "With tools", 10);
+    payload["messages"][1]["feedback"] = json!("up");
+    payload["messages"][1]["extra"] = json!({
+        "tools": [{"id": "call-1", "name": "read_file", "output": "ok", "failed": false}],
+        "contextRecords": 4,
+        "incomplete": true,
+    });
+
+    as_user(
+        shared_router(&database),
+        "riley",
+        put_request("/conversations/c1", payload.clone()),
+    )
+    .await;
+    let (_, body) = as_user(
+        shared_router(&database),
+        "riley",
+        get_request("/conversations/c1"),
+    )
+    .await;
+
+    let read: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(read["messages"][1]["feedback"], "up");
+    assert_eq!(
+        read["messages"][1]["extra"],
+        payload["messages"][1]["extra"]
     );
 }

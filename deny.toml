@@ -11,6 +11,9 @@ allow = [
   "MIT",
   "Unicode-3.0",
   "Unlicense",
+  # foldhash, reached through rusqlite's hashmaps. Permissive and OSI-approved,
+  # in the same class as the MIT and ISC entries above.
+  "Zlib",
 ]
 confidence-threshold = 0.8
 
