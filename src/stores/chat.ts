@@ -158,7 +158,10 @@ export const useChatStore = defineStore('chat', () => {
     const conversation: Conversation = { id: uid(), title: firstMessage ? firstMessage.slice(0, 42) : 'New conversation', messages: [], createdAt: now, updatedAt: now }
     conversations.value.unshift(conversation)
     activeId.value = conversation.id
-    return conversation
+    // The reactive element rather than the object that was pushed: everything
+    // that follows mutates this conversation, and through the raw object those
+    // writes never reach the watcher that saves it.
+    return conversations.value[0]!
   }
   function selectConversation(id: string | null) { activeId.value = id }
   function deleteConversation(id: string) {
@@ -172,7 +175,12 @@ export const useChatStore = defineStore('chat', () => {
     conversation.messages.push(message)
     conversation.updatedAt = Date.now()
     if (role === 'user' && conversation.messages.filter(m => m.role === 'user').length === 1) conversation.title = content.split('\n')[0]!.slice(0, 42)
-    return message
+    // The reactive element, not the object that was pushed. Streaming mutates
+    // this message for as long as the answer takes; through the raw object those
+    // writes are invisible to the watcher that persists the conversation, so a
+    // reload would show an answer that is empty or cut off at whichever
+    // millisecond `updatedAt` last happened to change.
+    return conversation.messages[conversation.messages.length - 1]!
   }
 
   async function loadModels() {

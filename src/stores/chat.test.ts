@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
+import { nextTick } from 'vue'
 import { applyHarnessFrame, parseHarnessBlock, parseSSEBlock, readSSE, useChatStore } from './chat'
 import { useSettingsStore } from './settings'
 import type { Message } from '@/types/chat'
@@ -52,6 +53,20 @@ describe('chat store', () => {
     const [, options] = fetchMock.mock.calls[0]!
     expect(fetchMock.mock.calls[0]![0]).toBe('/api/chat')
     expect(JSON.parse(options.body)).toEqual({ ai_coder: 'hermes', provider: 'provider-a', model: 'hermes/provider-a/model-a', temperature: 0.7, max_tokens: 4096, messages: [{ role: 'system', content: 'Respond in English. Use a balanced level of detail.' }, { role: 'user', content: 'Hi' }] })
+  })
+  it('saves the streamed answer, so a reload does not lose it', async () => {
+    // The store hands out reactive conversations and messages; when it handed
+    // out the raw objects instead, everything a stream appended was invisible to
+    // the watcher below and a reload showed an empty answer.
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(sseResponse(['data: {"choices":[{"delta":{"content":"Hello"}}]}\n\n', 'data: {"choices":[{"delta":{"content":" there"}}]}\n\ndata: [DONE]\n\n'])))
+    const store = useChatStore()
+    await store.sendMessage('Remember me')
+    await nextTick()
+
+    const stored = JSON.parse(localStorage.getItem('lumen-conversations-v1') ?? '[]') as Array<{ title: string; messages: Array<{ role: string; content: string }> }>
+    expect(stored).toHaveLength(1)
+    expect(stored[0]!.title).toBe('Remember me')
+    expect(stored[0]!.messages.map(message => message.content)).toEqual(['Remember me', 'Hello there'])
   })
   it('aborts safely without leaving an empty assistant response', async () => {
     vi.stubGlobal('fetch', vi.fn((_url: string, options: RequestInit) => new Promise((_resolve, reject) => {
