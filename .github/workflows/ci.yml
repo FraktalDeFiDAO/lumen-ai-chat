@@ -2,7 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # Every long-lived branch, not just the last one. A commit that reaches
+    # `dev` and is never built there is a commit nobody has verified until it is
+    # already a promotion candidate.
+    branches: [main, staging, dev]
   pull_request:
 
 permissions:

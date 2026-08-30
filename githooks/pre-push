@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Refuse a direct push to a long-lived branch.
+#
+# This is the local stand-in for branch protection, which GitHub will not give a
+# private repository on a Free account. It is opt-in per clone:
+#
+#   git config core.hooksPath githooks
+#
+# It is bypassable with --no-verify, and that is fine: it exists to stop the
+# accident, not the decision.
+set -euo pipefail
+
+protected="main staging dev"
+
+while read -r _local_ref _local_sha remote_ref _remote_sha; do
+  branch="${remote_ref#refs/heads/}"
+  for guarded in $protected; do
+    if [ "$branch" = "$guarded" ]; then
+      # A merge commit reaching a protected branch came from a pull request
+      # being merged locally, which is the intended way in.
+      echo "refusing to push directly to '$branch'." >&2
+      echo >&2
+      echo "Work flows feature -> dev -> staging -> main, by pull request." >&2
+      echo "Open one against 'dev', or name the branch 'hotfix/*' if it has to" >&2
+      echo "skip ahead. If you really mean it: git push --no-verify" >&2
+      exit 1
+    fi
+  done
+done
+
+exit 0
