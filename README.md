@@ -402,11 +402,20 @@ check.
 export APP_BIND=0.0.0.0:41788
 export AI_IDENTITY_MODE=proxy
 export AI_TRUSTED_PROXY=true
+export AI_IDENTITY_SHARED_SECRET="$(openssl rand -hex 32)"
 ```
 
-All three, or the service refuses to start. Neither switch works without the
-other, and relaxing the bind relaxes nothing else: a remote deployment with
-several users still cannot share a writable workspace.
+All four, or the service refuses to start.
+
+The secret is the part that is not merely an assertion. `AI_TRUSTED_PROXY` says
+the network is arranged correctly and nothing can check that; a value only the
+proxy knows, sent by it on every request and compared in constant time, is
+something this process *can* check. Without it, any host that can reach the port
+can claim to be any user, so off loopback it is required rather than encouraged.
+On loopback it is optional, because there the machine is the boundary.
+
+Relaxing the bind relaxes nothing else: a remote deployment with several users
+still cannot share a writable workspace.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -415,6 +424,8 @@ several users still cannot share a writable workspace.
 | `AI_QUOTA_TOKENS_PER_WINDOW` | `0` (unlimited) | Tokens one person may spend per window |
 | `AI_QUOTA_WINDOW_SECONDS` | `3600` | Window length, 60–86400 |
 | `AI_TRUSTED_PROXY` | off | Assert that a proxy authenticates in front |
+| `AI_IDENTITY_SHARED_SECRET` | unset | A value only the proxy knows; required off loopback |
+| `AI_IDENTITY_SECRET_HEADER` | `x-lumen-proxy-secret` | Header the secret arrives in |
 
 ### Running the hosted deployment
 

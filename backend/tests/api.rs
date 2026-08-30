@@ -10,7 +10,7 @@ use std::{net::SocketAddr, path::Path, time::Duration};
 use ai_chatbot_gateway::{
     Config, HarnessSettings, ProviderConfig, ProviderKind, StoreSettings, build_api_router,
     build_router,
-    identity::{Identity, ProxyHeaders},
+    identity::{Identity, ProxyHeaders, Secret},
     quota::Limits,
     workspaces::WorkspaceMode,
 };
@@ -1257,4 +1257,92 @@ async fn refusals_are_counted_for_an_operator_to_see() {
 
     let (_, body) = as_user(router, "riley", get_request("/metrics")).await;
     assert!(body.contains("lumen_quota_rejections_total 1"), "{body}");
+}
+
+/// A shared secret is what turns "nothing else can reach this port" from an
+/// assertion into something that fails closed when it is wrong.
+#[tokio::test]
+async fn a_forged_identity_is_refused_when_the_proxy_has_a_secret() {
+    let workspace = tempfile::tempdir().unwrap();
+    let address = upstream().await;
+    let identity = Identity::proxy(ProxyHeaders {
+        secret: Some(Secret::new("x-lumen-proxy-secret", "correct-horse")),
+        ..ProxyHeaders::default()
+    });
+    let router = || {
+        build_api_router(configured(
+            address,
+            workspace.path(),
+            Some(identity.clone()),
+        ))
+        .unwrap()
+    };
+
+    // Whoever holds the secret is the proxy, and what it says goes.
+    let (status, body) = call(
+        router(),
+        Request::builder()
+            .uri("/me")
+            .header("x-lumen-proxy-secret", "correct-horse")
+            .header("x-forwarded-user", "riley")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["user"]["id"],
+        "riley"
+    );
+
+    // Anyone else claiming to be riley has identified nobody.
+    for headers in [
+        vec![("x-forwarded-user", "riley")],
+        vec![
+            ("x-lumen-proxy-secret", "wrong"),
+            ("x-forwarded-user", "riley"),
+        ],
+    ] {
+        let mut request = Request::builder().uri("/me");
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        let (status, _) = call(router(), request.body(Body::empty()).unwrap()).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a forged identity was served"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_secret_guards_the_conversations_a_forged_identity_would_have_reached() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("conversations.db");
+    let workspace = tempfile::tempdir().unwrap();
+    let mut settings = configured(
+        "127.0.0.1:1".parse().unwrap(),
+        workspace.path(),
+        Some(Identity::proxy(ProxyHeaders {
+            secret: Some(Secret::new("x-lumen-proxy-secret", "correct-horse")),
+            ..ProxyHeaders::default()
+        })),
+    );
+    settings.store = StoreSettings {
+        path: Some(database),
+        required: true,
+        enabled: true,
+    };
+
+    let (status, _) = call(
+        build_api_router(settings).unwrap(),
+        Request::builder()
+            .uri("/conversations")
+            .header("x-forwarded-user", "riley")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }

@@ -58,6 +58,8 @@ pub enum IdentityError {
     Missing,
     #[error("the identity header is not usable: {0}")]
     Malformed(String),
+    #[error("the request did not come from the configured proxy")]
+    Untrusted,
 }
 
 impl IntoResponse for IdentityError {
@@ -82,6 +84,12 @@ pub trait IdentityProvider: Send + Sync + std::fmt::Debug {
     fn is_multi_user(&self) -> bool {
         true
     }
+
+    /// Whether this provider can prove a request came from the proxy, rather
+    /// than only believing what it was told.
+    fn has_shared_secret(&self) -> bool {
+        false
+    }
 }
 
 /// Everyone is the same person: the behaviour Lumen has always had.
@@ -104,6 +112,55 @@ pub struct ProxyHeaders {
     pub user_header: String,
     pub email_header: Option<String>,
     pub name_header: Option<String>,
+    /// A secret only the proxy knows, if one is configured.
+    ///
+    /// Without it, trusting the identity header is a claim about the network:
+    /// anyone who can reach the port can say they are anyone. The service cannot
+    /// check the network, but it can check that whoever sent the request knows
+    /// something only the proxy was told -- which turns "nothing else can reach
+    /// this port" from an assertion into something that fails closed when it is
+    /// wrong.
+    pub secret: Option<Secret>,
+}
+
+/// A shared secret and the header it arrives in.
+#[derive(Clone)]
+pub struct Secret {
+    pub header: String,
+    value: Vec<u8>,
+}
+
+impl std::fmt::Debug for Secret {
+    /// Never the value: this ends up in startup logs and error reports.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Secret")
+            .field("header", &self.header)
+            .field("value", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Secret {
+    pub fn new(header: impl Into<String>, value: impl AsRef<[u8]>) -> Self {
+        Self {
+            header: header.into(),
+            value: value.as_ref().to_vec(),
+        }
+    }
+
+    /// Compared in constant time. A byte-at-a-time comparison leaks the secret
+    /// to anyone who can measure how long a rejection took.
+    fn matches(&self, presented: &[u8]) -> bool {
+        if presented.len() != self.value.len() {
+            return false;
+        }
+        let mut difference = 0u8;
+        for (expected, actual) in self.value.iter().zip(presented) {
+            difference |= expected ^ actual;
+        }
+        difference == 0
+    }
 }
 
 impl Default for ProxyHeaders {
@@ -112,12 +169,28 @@ impl Default for ProxyHeaders {
             user_header: "x-forwarded-user".into(),
             email_header: Some("x-forwarded-email".into()),
             name_header: Some("x-forwarded-preferred-username".into()),
+            secret: None,
         }
     }
 }
 
 impl IdentityProvider for ProxyHeaders {
+    fn has_shared_secret(&self) -> bool {
+        self.secret.is_some()
+    }
+
     fn identify(&self, headers: &HeaderMap) -> Result<User, IdentityError> {
+        // Checked before anything is read from the request: a caller who cannot
+        // prove it is the proxy has not identified anybody, whatever it claims.
+        if let Some(secret) = &self.secret {
+            let presented = headers
+                .get(&secret.header)
+                .map(|value| value.as_bytes())
+                .unwrap_or_default();
+            if !secret.matches(presented) {
+                return Err(IdentityError::Untrusted);
+            }
+        }
         let raw = headers
             .get(&self.user_header)
             .ok_or(IdentityError::Missing)?
@@ -192,6 +265,10 @@ impl Identity {
 
     pub fn is_multi_user(&self) -> bool {
         self.0.is_multi_user()
+    }
+
+    pub fn has_shared_secret(&self) -> bool {
+        self.0.has_shared_secret()
     }
 }
 
@@ -340,6 +417,7 @@ mod tests {
             user_header: "x-authentik-uid".into(),
             email_header: None,
             name_header: None,
+            secret: None,
         };
         let user = provider
             .identify(&headers(&[("x-authentik-uid", "abc123")]))

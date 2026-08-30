@@ -48,8 +48,24 @@ services:
       AI_CODER_ALLOW_WRITES: "true"
       AI_IDENTITY_MODE: proxy
       AI_IDENTITY_USER_HEADER: x-forwarded-user
-      AI_QUOTA_REQUESTS_PER_WINDOW: "200"
-      AI_QUOTA_TOKENS_PER_WINDOW: "2000000"
+      # Something only the proxy knows, sent by it on every request. On loopback
+      # this is defence in depth; off loopback the service refuses to start
+      # without it, because it is the only part of "nothing else can reach this
+      # port" that a process can actually check.
+      #
+      #   AI_IDENTITY_SHARED_SECRET: "$(openssl rand -hex 32)"
+      #
+      # Set it in an environment file rather than here, so it is not committed.
+      AI_IDENTITY_SHARED_SECRET: "${LUMEN_PROXY_SECRET:-}"
+      # A ceiling, not a recommendation. These are deliberately low: a quota that
+      # is too tight annoys somebody, and one that is absent bills you. Size them
+      # from what a request costs at your provider and how many people you are
+      # serving, and read the current spend per user from GET /api/me.
+      #
+      # 40 requests an hour is a working afternoon of ordinary chat. An agent run
+      # is worth several, since each of its steps is a model call.
+      AI_QUOTA_REQUESTS_PER_WINDOW: "40"
+      AI_QUOTA_TOKENS_PER_WINDOW: "500000"
       AI_QUOTA_WINDOW_SECONDS: "3600"
     volumes:
       - lumen-state:/var/lib/lumen:rw

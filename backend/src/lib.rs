@@ -279,6 +279,12 @@ pub enum ConfigError {
     UnknownWorkspaceMode(String),
     #[error("{0}")]
     UnsafeTenancy(&'static str),
+    #[error(
+        "a bind off loopback needs AI_IDENTITY_SHARED_SECRET, set to a value \
+         only the proxy knows and sent by it on every request: without it any \
+         host that can reach this port can claim to be any user"
+    )]
+    UnprovenProxy,
 }
 
 impl Config {
@@ -610,8 +616,18 @@ impl Config {
         // which this process cannot check -- so the most it can do is refuse
         // unless an operator has said both that a proxy authenticates in front
         // and that this is deliberate.
-        if !self.bind.ip().is_loopback() && !(self.trusted_proxy && self.identity.is_multi_user()) {
-            return Err(ConfigError::RemoteBind);
+        if !self.bind.ip().is_loopback() {
+            if !(self.trusted_proxy && self.identity.is_multi_user()) {
+                return Err(ConfigError::RemoteBind);
+            }
+            // On loopback, "only the proxy can set the header" is a property of
+            // the machine. Off it, it is a property of the network, and the one
+            // thing this process can actually check is that the sender knows
+            // something only the proxy was told. So off loopback the secret is
+            // required rather than encouraged.
+            if !self.identity.has_shared_secret() {
+                return Err(ConfigError::UnprovenProxy);
+            }
         }
         // Refused before the service is listening, because no runtime check
         // makes a shared writable workspace safe to share between people.
@@ -816,10 +832,20 @@ fn identity_from_env() -> Result<Identity, ConfigError> {
             {
                 return Err(ConfigError::InvalidIdentityHeader(user_header));
             }
+            let secret = match env::var("AI_IDENTITY_SHARED_SECRET") {
+                Ok(value) if value.trim().is_empty() => None,
+                Ok(value) => Some(identity::Secret::new(
+                    optional_header("AI_IDENTITY_SECRET_HEADER", None)
+                        .unwrap_or_else(|| "x-lumen-proxy-secret".into()),
+                    value.trim(),
+                )),
+                Err(_) => None,
+            };
             Ok(Identity::proxy(ProxyHeaders {
                 user_header,
                 email_header: optional_header("AI_IDENTITY_EMAIL_HEADER", defaults.email_header),
                 name_header: optional_header("AI_IDENTITY_NAME_HEADER", defaults.name_header),
+                secret,
             }))
         }
         other => Err(ConfigError::UnknownIdentityMode(other.into())),
@@ -3599,10 +3625,39 @@ mod bind_tests {
         assert!(matches!(settings.validate(), Err(ConfigError::RemoteBind)));
     }
 
+    /// Acknowledging a proxy and taking identity from it are still not enough
+    /// off loopback: without something only the proxy knows, every host that can
+    /// reach the port can claim to be anyone.
     #[test]
-    fn both_together_are_what_it_takes() {
+    fn a_remote_bind_needs_the_proxy_to_prove_itself() {
         let mut settings = config("0.0.0.0:41788");
         settings.trusted_proxy = true;
+        settings.identity = Identity::proxy(identity::ProxyHeaders::default());
+        assert!(matches!(
+            settings.validate(),
+            Err(ConfigError::UnprovenProxy)
+        ));
+    }
+
+    #[test]
+    fn all_three_together_are_what_it_takes() {
+        let mut settings = config("0.0.0.0:41788");
+        settings.trusted_proxy = true;
+        settings.identity = Identity::proxy(identity::ProxyHeaders {
+            secret: Some(identity::Secret::new(
+                "x-lumen-proxy-secret",
+                "correct-horse",
+            )),
+            ..identity::ProxyHeaders::default()
+        });
+        assert!(settings.validate().is_ok());
+    }
+
+    /// A secret buys nothing on loopback, where the machine is the boundary, so
+    /// it is not demanded there.
+    #[test]
+    fn loopback_still_needs_no_secret() {
+        let mut settings = config("127.0.0.1:41788");
         settings.identity = Identity::proxy(identity::ProxyHeaders::default());
         assert!(settings.validate().is_ok());
     }
@@ -3622,7 +3677,13 @@ mod bind_tests {
     fn a_remote_deployment_is_still_held_to_the_tenancy_rules() {
         let mut settings = config("0.0.0.0:41788");
         settings.trusted_proxy = true;
-        settings.identity = Identity::proxy(identity::ProxyHeaders::default());
+        settings.identity = Identity::proxy(identity::ProxyHeaders {
+            secret: Some(identity::Secret::new(
+                "x-lumen-proxy-secret",
+                "correct-horse",
+            )),
+            ..identity::ProxyHeaders::default()
+        });
         settings.coder_allow_writes = true;
         settings.workspace_mode = WorkspaceMode::Shared;
 
