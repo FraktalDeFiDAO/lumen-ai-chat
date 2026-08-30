@@ -31,7 +31,7 @@ function submit() {
   const sections = attachments.value.map(file => `--- Attached file: ${file.name} ---\n${file.content}\n--- End of ${file.name} ---`)
   if (text.value.trim()) sections.unshift(text.value.trim())
   emit('send', sections.join('\n\n'))
-  text.value = ''; attachments.value = []; attachmentError.value = ''; nextTick(resize)
+  text.value = ''; attachments.value = []; attachmentError.value = ''; void nextTick(resize)
 }
 function keydown(event: KeyboardEvent) { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); submit() } }
 function extension(name: string) { return name.includes('.') ? name.split('.').pop()!.toLowerCase() : '' }

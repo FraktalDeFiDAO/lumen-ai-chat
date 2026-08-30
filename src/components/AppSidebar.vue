@@ -8,9 +8,9 @@ import { useSettingsStore } from '@/stores/settings'
 defineProps<{ open: boolean }>()
 const emit = defineEmits<{ close: [] }>()
 const store = useChatStore(); const preferences = useSettingsStore(); const router = useRouter(); const query = ref('')
-function newChat() { store.selectConversation(null); router.push('/'); emit('close') }
-function openChat(id: string) { store.selectConversation(id); router.push(`/chat/${id}`); emit('close') }
-function removeChat(id: string) { store.deleteConversation(id); if (!store.activeId) router.push('/') }
+function newChat() { store.selectConversation(null); void router.push('/'); emit('close') }
+function openChat(id: string) { store.selectConversation(id); void router.push(`/chat/${id}`); emit('close') }
+function removeChat(id: string) { store.deleteConversation(id); if (!store.activeId) void router.push('/') }
 </script>
 
 <template>

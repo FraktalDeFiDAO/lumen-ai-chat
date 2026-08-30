@@ -464,6 +464,7 @@ does not lose it.
 
 ```bash
 npm run check:server
+npm run lint
 npm run typecheck
 npm test
 npm run build
@@ -480,6 +481,13 @@ npm run test:podman  # while the Compose deployment is running
 | `backend/tests/api.rs` | The HTTP surface: health, readiness, Prometheus metrics, the provider and coder lists, the model catalog with its degraded-provider fallback, streamed chat, request refusals, the JSON 404, the body limit, and that the bare router carries no `/api` prefix |
 | `backend/tests/harness.rs` | The agent loop end to end against a scripted upstream: a tool call becoming real work, a failed tool being reported rather than ending the run, the step limit, retrieval, delegation to a native coder, every provider protocol, and the `/agent`, `/harness`, `/harness/index` endpoints |
 | `harness-memory` | Row payload round trips, crash-tail recovery, reopen, tombstones, HNSW recall against brute force, quantization, SIMD kernels, and the embedder |
+
+`npm run lint` is the frontend's counterpart to clippy at `-D warnings`, which
+the Rust side has had from the start. It is type-aware, so it catches what a type
+checker will not: a promise nobody awaits, a `catch` that swallows something it
+should not, a template binding a prop that does not exist. Adding it found six
+floating promises in navigation and background loads, each of which would have
+surfaced as an unhandled rejection.
 
 `npm test` runs the Vitest unit suite over the frontend: the chat store (SSE and harness frame parsing, streaming, abort, regeneration, persistence), the settings store, and each component — `AppSidebar`, `ChatComposer`, `MessageBubble` — in isolation.
 
