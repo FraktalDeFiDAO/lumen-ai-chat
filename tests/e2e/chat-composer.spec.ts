@@ -30,7 +30,7 @@ test.describe('ChatComposer — model selection', () => {
     const alternative = await select.locator('option').nth(1).getAttribute('value')
     expect(alternative).toBeTruthy()
 
-    await select.selectOption(alternative!)
+    await select.selectOption(alternative)
     expect(await page.evaluate(key => window.localStorage.getItem(key), MODEL_KEY)).toBe(alternative)
 
     await page.reload()

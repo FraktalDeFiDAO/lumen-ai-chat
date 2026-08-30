@@ -25,7 +25,7 @@ function syncRoute() { const id = typeof route.params.id === 'string' ? route.pa
 watch(() => route.params.id, syncRoute, { immediate: true })
 watch(() => store.activeConversation?.messages.map(message => message.content.length).join(','), async () => { await nextTick(); messagesEl.value?.scrollTo({ top: messagesEl.value.scrollHeight, behavior: 'smooth' }) })
 function keyboardShortcut(event: KeyboardEvent) {
-  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') { event.preventDefault(); store.selectConversation(null); router.push('/') }
+  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') { event.preventDefault(); store.selectConversation(null); void router.push('/') }
   if (event.key === 'Escape') overflowOpen.value = false
 }
 // The history arrives asynchronously now, so the route is resolved again once
@@ -33,7 +33,7 @@ function keyboardShortcut(event: KeyboardEvent) {
 // find it in, and would otherwise fall back to the empty state.
 onMounted(async () => {
   window.addEventListener('keydown', keyboardShortcut)
-  store.loadModels()
+  void store.loadModels()
   await store.ensureHistory()
   syncRoute()
 })

@@ -316,7 +316,7 @@ impl Tool for SearchText {
     }
 
     fn description(&self) -> &'static str {
-        "Find a literal, case-insensitive string across workspace files. Returns `path:line: text`. Use this for exact identifiers; use search_memory for a description of behaviour."
+        "Find a literal, case-insensitive string across workspace files. Returns `path:line: text`. Use this when you know the exact string; use search_memory when you know roughly what the code is called but not where it is."
     }
 
     fn input_schema(&self) -> Value {
@@ -394,7 +394,7 @@ impl Tool for SearchMemory {
     }
 
     fn description(&self) -> &'static str {
-        "Search the indexed codebase by meaning rather than by exact text. Give a description of the behaviour you are looking for; returns the matching functions, types and sections with their file and line range."
+        "Search the indexed codebase for functions, types and sections. Ranking combines word overlap with exact symbol-name matches, so use words that appear in the code itself -- identifiers, type names, the project's own vocabulary -- rather than a paraphrase of what the code does. Returns each match with its file and line range."
     }
 
     fn input_schema(&self) -> Value {

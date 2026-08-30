@@ -21,8 +21,10 @@ interface Settings {
 
 const defaults: Settings = { displayName: 'Alex Morgan', email: 'alex@example.com', responseStyle: 'Balanced', language: 'English', theme: 'System', notifications: true, temperature: 0.7, maxTokens: 4096, systemPrompt: '', agentMode: false }
 function load(): Settings {
-  try { return { ...defaults, ...JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') } }
-  catch { return { ...defaults } }
+  try {
+    const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as Partial<Settings> | null
+    return stored && typeof stored === 'object' ? { ...defaults, ...stored } : { ...defaults }
+  } catch { return { ...defaults } }
 }
 
 export const useSettingsStore = defineStore('settings', () => {

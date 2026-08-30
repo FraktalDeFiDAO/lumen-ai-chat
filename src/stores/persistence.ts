@@ -23,6 +23,9 @@ export interface ConversationBackend {
 
 const STORAGE_KEY = 'lumen-conversations-v1'
 
+/* eslint-disable @typescript-eslint/require-await --
+   These methods implement an async interface against synchronous storage. The
+   signatures are the contract, not an oversight. */
 export class LocalBackend implements ConversationBackend {
   readonly listIncludesMessages = true
 
@@ -55,8 +58,8 @@ export class LocalBackend implements ConversationBackend {
 
 function read(): Conversation[] {
   try {
-    const value = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '[]')
-    return Array.isArray(value) ? value : []
+    const value = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '[]') as unknown
+    return Array.isArray(value) ? (value as Conversation[]) : []
   } catch { return [] }
 }
 

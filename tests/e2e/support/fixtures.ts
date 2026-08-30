@@ -45,7 +45,7 @@ export function conversation(
 /// assertion meaningful: the page reloads, the app reads what it wrote.
 export async function seedStorage(page: Page, entries: Record<string, unknown>) {
   await page.addInitScript(values => {
-    for (const [key, value] of Object.entries(values as Record<string, unknown>)) {
+    for (const [key, value] of Object.entries(values)) {
       if (window.localStorage.getItem(key) === null) {
         window.localStorage.setItem(key, typeof value === 'string' ? value : JSON.stringify(value))
       }
