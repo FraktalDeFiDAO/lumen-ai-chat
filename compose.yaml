@@ -6,6 +6,10 @@ services:
     build:
       context: .
       dockerfile: Containerfile.backend
+      args:
+        # Match the user the container runs as, below.
+        APP_UID: "${UID:-1000}"
+        APP_GID: "${GID:-1000}"
     container_name: lumen-ai-chat-api
     network_mode: host
     userns_mode: keep-id
@@ -23,6 +27,12 @@ services:
       AI_HARNESS_MEMORY_DIR: /run/lumen-home/memory
       AI_HARNESS_INDEX_ON_START: "true"
       AI_HARNESS_MAX_STEPS: "12"
+      # This deployment serves one person and keeps their conversations in their
+      # browser. Stated rather than implied: the default store location is under
+      # the workspace, which is mounted read-only, so leaving this unset would
+      # mean a store that fails to open and a warning on every start.
+      # `compose.hosted.yaml` is the deployment that keeps them server-side.
+      AI_STORE: "off"
       HOME: /run/lumen-home
       USER: "${USER:-admministrator}"
       PATH: "${HOME}/.local/bin:${HOME}/.local/share/pnpm/bin:/usr/local/sbin:/usr/local/bin:/usr/bin"

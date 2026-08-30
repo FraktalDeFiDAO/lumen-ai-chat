@@ -55,7 +55,7 @@ async function rebuildIndex() {
     await loadHarness()
   } catch (error) { indexing.value = error instanceof Error ? error.message : 'Indexing failed.' }
 }
-onMounted(() => { void loadCoders(); void loadHarness() })
+onMounted(() => { void loadCoders(); void loadHarness(); void chat.ensureHistory() })
 </script>
 <template>
   <div :class="['settings-page', `theme-${preferences.settings.theme.toLowerCase()}`]">

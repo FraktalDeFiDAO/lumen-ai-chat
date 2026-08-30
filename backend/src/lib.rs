@@ -13,6 +13,10 @@ use std::{
 
 pub mod coders;
 pub mod harness;
+pub mod identity;
+pub mod quota;
+pub mod store;
+pub mod workspaces;
 
 use crate::harness::{
     Harness, HarnessConfig, HarnessEvent,
@@ -20,12 +24,16 @@ use crate::harness::{
     tools::{ToolContext, ToolRegistry},
     workspace::{Workspace, WorkspaceError},
 };
+use crate::identity::{CurrentUser, Identity, ProxyHeaders};
+use crate::quota::{Limits, Quotas};
+use crate::store::{ConversationStore, StoreError, StoredConversation};
+use crate::workspaces::{Tenancy, WorkspaceMode, Workspaces};
 
 use async_stream::stream;
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, State, rejection::JsonRejection},
+    extract::{DefaultBodyLimit, Path, State, rejection::JsonRejection},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -161,6 +169,29 @@ impl Default for HarnessSettings {
     }
 }
 
+/// Where server-side conversations live, and how hard their absence is.
+#[derive(Clone, Debug)]
+pub struct StoreSettings {
+    /// `None` derives the path from the workspace, the way the index does.
+    pub path: Option<PathBuf>,
+    /// Set when an operator named a path: failing to open one that was asked
+    /// for is fatal, rather than quietly serving a service without history.
+    pub required: bool,
+    /// `false` keeps conversations in the browser, which is what every
+    /// single-user deployment did before there was anywhere else to put them.
+    pub enabled: bool,
+}
+
+impl Default for StoreSettings {
+    fn default() -> Self {
+        Self {
+            path: None,
+            required: false,
+            enabled: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub bind: SocketAddr,
@@ -172,7 +203,19 @@ pub struct Config {
     pub coder_timeout: Duration,
     pub coder_allow_writes: bool,
     pub coder_max_concurrency: usize,
+    /// Whether everyone shares one workspace or each user gets a subtree.
+    pub workspace_mode: WorkspaceMode,
+    /// What one person may spend. Unlimited unless configured.
+    pub quotas: Limits,
+    /// Whether the operator has said something else terminates TLS and
+    /// authenticates in front of this process. Binding off loopback without it
+    /// is refused.
+    pub trusted_proxy: bool,
     pub harness: HarnessSettings,
+    pub store: StoreSettings,
+    /// How a request becomes a user. Single-user by default, which is the
+    /// behaviour every deployment had before this existed.
+    pub identity: Identity,
 }
 
 #[derive(Debug, Deserialize)]
@@ -222,8 +265,26 @@ pub enum ConfigError {
     InvalidCoderConfig(String),
     #[error("AI_CODER_WORKSPACE must name an existing directory: {0}")]
     InvalidCoderWorkspace(String),
-    #[error("APP_BIND must use a loopback address")]
+    #[error(
+        "APP_BIND may only leave loopback for a deployment that is behind a \
+         trusted proxy: set AI_IDENTITY_MODE=proxy and AI_TRUSTED_PROXY=true, \
+         and make sure nothing but that proxy can reach this port"
+    )]
     RemoteBind,
+    #[error("AI_IDENTITY_MODE must be `single` or `proxy`, not `{0}`")]
+    UnknownIdentityMode(String),
+    #[error("AI_IDENTITY_USER_HEADER is not a usable header name: {0}")]
+    InvalidIdentityHeader(String),
+    #[error("AI_WORKSPACE_MODE must be `shared` or `per_user`, not `{0}`")]
+    UnknownWorkspaceMode(String),
+    #[error("{0}")]
+    UnsafeTenancy(&'static str),
+    #[error(
+        "a bind off loopback needs AI_IDENTITY_SHARED_SECRET, set to a value \
+         only the proxy knows and sent by it on every request: without it any \
+         host that can reach this port can claim to be any user"
+    )]
+    UnprovenProxy,
 }
 
 impl Config {
@@ -430,19 +491,40 @@ impl Config {
                 )
             })?;
         let workspace_text = env::var("AI_CODER_WORKSPACE").ok();
-        let coder_workspace = workspace_text
+        let workspace_mode = match env::var("AI_WORKSPACE_MODE")
+            .unwrap_or_else(|_| "shared".into())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "shared" => WorkspaceMode::Shared,
+            "per_user" | "per-user" => WorkspaceMode::PerUser,
+            other => return Err(ConfigError::UnknownWorkspaceMode(other.into())),
+        };
+        let requested_workspace = workspace_text
             .as_deref()
             .map(PathBuf::from)
-            .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
-            .canonicalize()
-            .map_err(|_| {
-                ConfigError::InvalidCoderWorkspace(workspace_text.unwrap_or_else(|| ".".into()))
-            })?;
-        if !coder_workspace.is_dir() {
-            return Err(ConfigError::InvalidCoderWorkspace(
-                coder_workspace.display().to_string(),
-            ));
-        }
+            .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        // In shared mode this names a project, which has to be there already. In
+        // per-user mode it names the parent the subtrees hang off, which the
+        // service creates -- a fresh deployment has an empty volume and nobody
+        // to have made it.
+        let coder_workspace = match workspace_mode {
+            WorkspaceMode::Shared => {
+                let resolved = requested_workspace.canonicalize().map_err(|_| {
+                    ConfigError::InvalidCoderWorkspace(
+                        workspace_text.clone().unwrap_or_else(|| ".".into()),
+                    )
+                })?;
+                if !resolved.is_dir() {
+                    return Err(ConfigError::InvalidCoderWorkspace(
+                        resolved.display().to_string(),
+                    ));
+                }
+                resolved
+            }
+            WorkspaceMode::PerUser => requested_workspace,
+        };
         let coder_timeout = Duration::from_secs(
             env::var("AI_CODER_TIMEOUT_SECONDS")
                 .ok()
@@ -492,6 +574,31 @@ impl Config {
             coder_allow_writes: env_flag("AI_CODER_ALLOW_WRITES"),
             coder_max_concurrency,
             harness,
+            workspace_mode,
+            trusted_proxy: env_flag("AI_TRUSTED_PROXY"),
+            quotas: Limits {
+                requests: env::var("AI_QUOTA_REQUESTS_PER_WINDOW")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0),
+                tokens: env::var("AI_QUOTA_TOKENS_PER_WINDOW")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0),
+                window: Duration::from_secs(
+                    env::var("AI_QUOTA_WINDOW_SECONDS")
+                        .ok()
+                        .and_then(|value| value.parse().ok())
+                        .filter(|seconds| (60..=86_400).contains(seconds))
+                        .unwrap_or(3600),
+                ),
+            },
+            store: StoreSettings {
+                path: env::var("AI_STORE_PATH").ok().map(PathBuf::from),
+                required: env::var("AI_STORE_PATH").is_ok(),
+                enabled: !env_disabled("AI_STORE"),
+            },
+            identity: identity_from_env()?,
         };
         config.validate()?;
         Ok(config)
@@ -501,9 +608,35 @@ impl Config {
         if self.providers.is_empty() && self.coders.is_empty() {
             return Err(ConfigError::NoProviders);
         }
+        // Loopback stays the default, and leaving it is an explicit act.
+        //
+        // Identity here is asserted by a header, which is only worth anything if
+        // the only thing that can set it is the proxy in front. On loopback that
+        // is a property of the machine. Off it, it is a property of the network,
+        // which this process cannot check -- so the most it can do is refuse
+        // unless an operator has said both that a proxy authenticates in front
+        // and that this is deliberate.
         if !self.bind.ip().is_loopback() {
-            return Err(ConfigError::RemoteBind);
+            if !(self.trusted_proxy && self.identity.is_multi_user()) {
+                return Err(ConfigError::RemoteBind);
+            }
+            // On loopback, "only the proxy can set the header" is a property of
+            // the machine. Off it, it is a property of the network, and the one
+            // thing this process can actually check is that the sender knows
+            // something only the proxy was told. So off loopback the secret is
+            // required rather than encouraged.
+            if !self.identity.has_shared_secret() {
+                return Err(ConfigError::UnprovenProxy);
+            }
         }
+        // Refused before the service is listening, because no runtime check
+        // makes a shared writable workspace safe to share between people.
+        workspaces::validate(
+            self.workspace_mode,
+            self.identity.is_multi_user(),
+            self.coder_allow_writes,
+        )
+        .map_err(ConfigError::UnsafeTenancy)?;
         let mut ids = HashSet::new();
         let mut provider_routes = HashSet::new();
         for provider in &self.providers {
@@ -683,6 +816,52 @@ fn env_disabled(name: &str) -> bool {
         })
         .unwrap_or(false)
 }
+/// Identity is single-user unless a deployment says otherwise, because trusting
+/// a header is only safe once something in front is setting it.
+fn identity_from_env() -> Result<Identity, ConfigError> {
+    let mode = env::var("AI_IDENTITY_MODE").unwrap_or_else(|_| "single".into());
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "single" => Ok(Identity::single_user()),
+        "proxy" => {
+            let defaults = ProxyHeaders::default();
+            let user_header = env::var("AI_IDENTITY_USER_HEADER")
+                .map(|value| value.trim().to_ascii_lowercase())
+                .unwrap_or(defaults.user_header);
+            if user_header.is_empty()
+                || axum::http::HeaderName::from_bytes(user_header.as_bytes()).is_err()
+            {
+                return Err(ConfigError::InvalidIdentityHeader(user_header));
+            }
+            let secret = match env::var("AI_IDENTITY_SHARED_SECRET") {
+                Ok(value) if value.trim().is_empty() => None,
+                Ok(value) => Some(identity::Secret::new(
+                    optional_header("AI_IDENTITY_SECRET_HEADER", None)
+                        .unwrap_or_else(|| "x-lumen-proxy-secret".into()),
+                    value.trim(),
+                )),
+                Err(_) => None,
+            };
+            Ok(Identity::proxy(ProxyHeaders {
+                user_header,
+                email_header: optional_header("AI_IDENTITY_EMAIL_HEADER", defaults.email_header),
+                name_header: optional_header("AI_IDENTITY_NAME_HEADER", defaults.name_header),
+                secret,
+            }))
+        }
+        other => Err(ConfigError::UnknownIdentityMode(other.into())),
+    }
+}
+
+/// An explicitly empty value turns a display field off; an unset one keeps the
+/// default, so a deployment that names only its user header still gets the rest.
+fn optional_header(key: &str, fallback: Option<String>) -> Option<String> {
+    match env::var(key) {
+        Ok(value) if value.trim().is_empty() => None,
+        Ok(value) => Some(value.trim().to_ascii_lowercase()),
+        Err(_) => fallback,
+    }
+}
+
 fn env_flag(name: &str) -> bool {
     env::var(name).ok().is_some_and(|value| {
         matches!(
@@ -710,11 +889,19 @@ struct AppState {
     client: Client,
     coder_slots: Arc<Semaphore>,
     metrics: Arc<AppMetrics>,
-    /// The canonical root every harness tool is confined to.
-    workspace: Workspace,
-    /// `None` when retrieval is disabled or the index could not be opened; the
-    /// harness then simply does not offer `search_memory`.
-    memory: Option<Arc<HarnessMemory>>,
+    /// Which files a given user is allowed to touch, and the index over them.
+    workspaces: Arc<Workspaces>,
+    identity: Identity,
+    quotas: Arc<Quotas>,
+    /// `None` when conversations are kept in the browser, or when the store
+    /// could not be opened and was not required.
+    store: Option<ConversationStore>,
+}
+
+impl axum::extract::FromRef<AppState> for Identity {
+    fn from_ref(state: &AppState) -> Self {
+        state.identity.clone()
+    }
 }
 
 impl AppState {
@@ -724,14 +911,25 @@ impl AppState {
     /// owns an `Arc<Gateway>` and a `Gateway` owns this state: keeping one here
     /// would be a reference cycle that never drops. Construction is cheap --
     /// the index and the HTTP client are shared, not rebuilt.
-    fn harness(&self) -> Harness {
+    /// The files this user may touch, or the reason they may not.
+    fn tenancy(&self, user: &identity::User) -> Result<Tenancy, WorkspaceRejection> {
+        self.workspaces.for_user(user).map_err(|error| {
+            tracing::error!(%error, user = user.id, "could not resolve a workspace");
+            WorkspaceRejection
+        })
+    }
+
+    fn harness_for(&self, tenancy: &Tenancy) -> Harness {
         let context = ToolContext {
-            workspace: self.workspace.clone(),
-            memory: self.memory.clone(),
+            workspace: tenancy.workspace.clone(),
+            memory: tenancy.memory.clone(),
         };
         Harness::new(
             Arc::new(Gateway {
                 state: self.clone(),
+                // A native coder runs where this user's files are, not where
+                // the process happened to be configured.
+                coder_root: tenancy.workspace.root().to_path_buf(),
             }),
             context,
             HarnessConfig {
@@ -750,6 +948,8 @@ struct AppMetrics {
     agent_requests: AtomicU64,
     tool_calls: AtomicU64,
     coder_busy_rejections: AtomicU64,
+    quota_rejections: AtomicU64,
+    tokens_charged: AtomicU64,
 }
 
 /// The API routes, mounted bare.
@@ -761,6 +961,17 @@ struct AppMetrics {
 pub fn build_api_router(config: Config) -> Result<Router, BuildError> {
     let state = gateway_state(config)?;
     Ok(Router::new()
+        .route("/me", get(current_user))
+        .route(
+            "/conversations",
+            get(list_conversations).delete(clear_conversations),
+        )
+        .route(
+            "/conversations/{id}",
+            get(read_conversation)
+                .put(save_conversation)
+                .delete(remove_conversation),
+        )
         .route("/health", get(health))
         .route("/ready", get(ready))
         .route("/metrics", get(metrics))
@@ -790,15 +1001,30 @@ fn gateway_state(config: Config) -> Result<AppState, BuildError> {
             env!("CARGO_PKG_VERSION")
         ))
         .build()?;
-    let workspace = Workspace::new(&config.coder_workspace, config.coder_allow_writes)?;
-    let memory = open_memory(&config, &workspace)?;
+    let workspaces = match config.workspace_mode {
+        WorkspaceMode::Shared => {
+            let workspace = Workspace::new(&config.coder_workspace, config.coder_allow_writes)?;
+            let memory = open_memory(&config, &workspace)?;
+            Workspaces::shared(workspace, memory)
+        }
+        // Each subtree is created on demand, so nothing is built here except the
+        // base it hangs off.
+        WorkspaceMode::PerUser => Workspaces::per_user(
+            &config.coder_workspace,
+            config.coder_allow_writes,
+            config.harness.memory_dir.clone(),
+        )?,
+    };
+    let store = open_store(&config)?;
     let state = AppState {
+        store,
+        quotas: Arc::new(Quotas::new(config.quotas)),
+        identity: config.identity.clone(),
         config: Arc::new(config),
         client,
         coder_slots,
         metrics: Arc::new(AppMetrics::default()),
-        workspace,
-        memory,
+        workspaces: Arc::new(workspaces),
     };
     Ok(state)
 }
@@ -810,6 +1036,42 @@ fn gateway_state(config: Config) -> Result<AppState, BuildError> {
 /// on a blocking thread and the service starts serving immediately: an index
 /// that is still filling answers fewer queries, which is a better failure than
 /// a gateway that will not start.
+/// Open the conversation store, or decide to live without one.
+///
+/// The same rule as the index: a path an operator named is a promise, so
+/// failing to open it stops the service. A derived one is a convenience, and a
+/// read-only workspace losing it should not take chat down with it.
+fn open_store(config: &Config) -> Result<Option<ConversationStore>, BuildError> {
+    if !config.store.enabled {
+        return Ok(None);
+    }
+    let path = config
+        .store
+        .path
+        .clone()
+        .unwrap_or_else(|| config.coder_workspace.join("data/conversations.db"));
+
+    match ConversationStore::open(&path) {
+        Ok(store) => {
+            tracing::info!(
+                path = %path.display(),
+                conversations = store.total().unwrap_or(0),
+                "conversation store opened"
+            );
+            Ok(Some(store))
+        }
+        Err(error) if !config.store.required => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "conversation store unavailable; conversations stay in the browser"
+            );
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn open_memory(
     config: &Config,
     workspace: &Workspace,
@@ -879,6 +1141,10 @@ pub enum BuildError {
     Workspace(#[from] WorkspaceError),
     #[error("codebase memory is unusable: {0}")]
     Memory(#[from] harness::memory::HarnessMemoryError),
+    #[error("the conversation store is unusable: {0}")]
+    Store(#[from] StoreError),
+    #[error("the per-user workspaces are unusable: {0}")]
+    Tenancy(#[from] workspaces::TenancyError),
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -893,6 +1159,190 @@ struct ProviderInfo {
     is_default: bool,
 }
 
+// ---------------------------------------------------------------------------
+// Conversations
+// ---------------------------------------------------------------------------
+
+/// Conversations are the one thing here that belongs to a person rather than to
+/// the service, so every handler below names the user it is acting for and the
+/// store has no way to answer without one.
+///
+/// SQLite is synchronous, and the reactor is serving every other request on this
+/// process, so each call goes to `spawn_blocking` the way the index and the file
+/// tools do.
+/// A workspace that could not be opened. Small on purpose: a `Response` in an
+/// `Err` makes every `Result` in the call chain the size of a response.
+struct WorkspaceRejection;
+
+impl IntoResponse for WorkspaceRejection {
+    fn into_response(self) -> Response {
+        json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "workspace_unavailable",
+            "your workspace could not be opened",
+        )
+    }
+}
+
+enum StoreRejection {
+    Unavailable,
+    Invalid(String),
+    Failed,
+}
+
+impl IntoResponse for StoreRejection {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Unavailable => json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "store_unavailable",
+                "server-side conversations are not configured; set AI_STORE_PATH to a writable path",
+            ),
+            Self::Invalid(message) => {
+                json_error(StatusCode::BAD_REQUEST, "invalid_request", message)
+            }
+            Self::Failed => json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "store_failed",
+                "the conversation store failed",
+            ),
+        }
+    }
+}
+
+async fn with_store<T, F>(state: &AppState, work: F) -> Result<T, StoreRejection>
+where
+    T: Send + 'static,
+    F: FnOnce(ConversationStore) -> Result<T, StoreError> + Send + 'static,
+{
+    let store = state.store.clone().ok_or(StoreRejection::Unavailable)?;
+    match tokio::task::spawn_blocking(move || work(store)).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(StoreError::Invalid(message))) => Err(StoreRejection::Invalid(message)),
+        Ok(Err(error)) => {
+            tracing::error!(%error, "the conversation store failed");
+            Err(StoreRejection::Failed)
+        }
+        Err(error) => {
+            tracing::error!(%error, "the conversation store task did not finish");
+            Err(StoreRejection::Failed)
+        }
+    }
+}
+
+async fn list_conversations(
+    State(state): State<AppState>,
+    CurrentUser(user): CurrentUser,
+) -> Response {
+    match with_store(&state, move |store| store.list(&user.id)).await {
+        Ok(conversations) => Json(json!({ "conversations": conversations })).into_response(),
+        Err(rejection) => rejection.into_response(),
+    }
+}
+
+/// A conversation belonging to someone else is answered as missing rather than
+/// as forbidden: telling a caller that an id exists but is not theirs is itself
+/// something they should not learn.
+async fn read_conversation(
+    State(state): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    Path(id): Path<String>,
+) -> Response {
+    match with_store(&state, move |store| store.get(&user.id, &id)).await {
+        Ok(Some(conversation)) => Json(conversation).into_response(),
+        Ok(None) => json_error(StatusCode::NOT_FOUND, "not_found", "no such conversation"),
+        Err(rejection) => rejection.into_response(),
+    }
+}
+
+/// The client owns the transcript and sends it whole, so this replaces rather
+/// than merges. Anything else races the stream that is still being written.
+async fn save_conversation(
+    State(state): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    Path(id): Path<String>,
+    payload: Result<Json<StoredConversation>, JsonRejection>,
+) -> Response {
+    let Json(mut conversation) = match payload {
+        Ok(value) => value,
+        Err(rejection) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                rejection.body_text(),
+            );
+        }
+    };
+    // The path is the identifier; a body disagreeing with it is a bug in the
+    // client, not a second opinion about which conversation this is.
+    if !conversation.id.is_empty() && conversation.id != id {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "the conversation id in the body does not match the one in the path",
+        );
+    }
+    conversation.id = id;
+
+    match with_store(&state, move |store| {
+        store.save(&user.id, &conversation)?;
+        Ok(conversation)
+    })
+    .await
+    {
+        Ok(saved) => (StatusCode::OK, Json(saved)).into_response(),
+        Err(rejection) => rejection.into_response(),
+    }
+}
+
+async fn remove_conversation(
+    State(state): State<AppState>,
+    CurrentUser(user): CurrentUser,
+    Path(id): Path<String>,
+) -> Response {
+    match with_store(&state, move |store| store.delete(&user.id, &id)).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => json_error(StatusCode::NOT_FOUND, "not_found", "no such conversation"),
+        Err(rejection) => rejection.into_response(),
+    }
+}
+
+async fn clear_conversations(
+    State(state): State<AppState>,
+    CurrentUser(user): CurrentUser,
+) -> Response {
+    match with_store(&state, move |store| store.delete_all(&user.id)).await {
+        Ok(deleted) => Json(json!({ "deleted": deleted })).into_response(),
+        Err(rejection) => rejection.into_response(),
+    }
+}
+
+/// Who the gateway thinks is asking, and whether it is serving more than one
+/// person. The client needs both: a name to show, and whether to offer anything
+/// that only makes sense when accounts exist.
+async fn current_user(
+    State(state): State<AppState>,
+    CurrentUser(user): CurrentUser,
+) -> Json<Value> {
+    Json(json!({
+        "user": user,
+        "multi_user": state.identity.is_multi_user(),
+        // Whether this deployment keeps conversations. The client asks here
+        // rather than by trying the store and reading a 503, which every browser
+        // reports as a failed request on an ordinary page load.
+        "conversations": state.store.is_some(),
+        "quota": state.config.quotas.enabled().then(|| {
+            let (requests, tokens) = state.quotas.usage(&user.id);
+            json!({
+                "requests_used": requests,
+                "requests_limit": state.config.quotas.requests,
+                "tokens_used": tokens,
+                "tokens_limit": state.config.quotas.tokens,
+                "window_seconds": state.config.quotas.window.as_secs(),
+            })
+        }),
+    }))
+}
 async fn health(State(state): State<AppState>) -> Json<Value> {
     Json(json!({
         "status": "ok",
@@ -920,6 +1370,10 @@ async fn metrics(State(state): State<AppState>) -> Response {
             "lumen_agent_tool_calls_total {}\n",
             "# TYPE lumen_memory_records gauge\n",
             "lumen_memory_records {}\n",
+            "# TYPE lumen_quota_rejections_total counter\n",
+            "lumen_quota_rejections_total {}\n",
+            "# TYPE lumen_tokens_charged_total counter\n",
+            "lumen_tokens_charged_total {}\n",
             "# TYPE lumen_coder_busy_rejections_total counter\n",
             "lumen_coder_busy_rejections_total {}\n",
             "# TYPE lumen_coder_slots_available gauge\n",
@@ -932,10 +1386,9 @@ async fn metrics(State(state): State<AppState>) -> Response {
         state.metrics.chat_requests.load(Ordering::Relaxed),
         state.metrics.agent_requests.load(Ordering::Relaxed),
         state.metrics.tool_calls.load(Ordering::Relaxed),
-        state
-            .memory
-            .as_ref()
-            .map_or(0, |memory| memory.live_count()),
+        state.workspaces.live_records(),
+        state.metrics.quota_rejections.load(Ordering::Relaxed),
+        state.metrics.tokens_charged.load(Ordering::Relaxed),
         state.metrics.coder_busy_rejections.load(Ordering::Relaxed),
         state.coder_slots.available_permits(),
         state.config.coders.len(),
@@ -1171,8 +1624,37 @@ pub enum Role {
     Tool,
 }
 
+/// Refuse a request that would spend more than this user is allowed.
+///
+/// 429 with `Retry-After`, because the caller can succeed later without changing
+/// anything -- which is exactly what that status is for.
+fn over_quota(state: &AppState, user: &identity::User) -> Option<Response> {
+    let refused = state.quotas.admit(&user.id).err()?;
+    state
+        .metrics
+        .quota_rejections
+        .fetch_add(1, Ordering::Relaxed);
+    tracing::info!(
+        user = user.id,
+        limit = refused.limit,
+        used = refused.used,
+        "quota exceeded"
+    );
+
+    let mut response = json_error(
+        StatusCode::TOO_MANY_REQUESTS,
+        "quota_exceeded",
+        refused.message(),
+    );
+    if let Ok(value) = HeaderValue::from_str(&refused.retry_after.as_secs().max(1).to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    Some(response)
+}
+
 async fn chat(
     State(state): State<AppState>,
+    CurrentUser(user): CurrentUser,
     payload: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Response {
     let Json(request) = match payload {
@@ -1188,7 +1670,17 @@ async fn chat(
     if let Err(message) = validate_chat(&request) {
         return json_error(StatusCode::BAD_REQUEST, "invalid_request", message);
     }
+    if let Some(refusal) = over_quota(&state, &user) {
+        return refusal;
+    }
     state.metrics.chat_requests.fetch_add(1, Ordering::Relaxed);
+    // Resolved up front: a native coder runs in this user's workspace, and in a
+    // per-user deployment that is the only thing keeping it out of everyone
+    // else's.
+    let coder_root = match state.tenancy(&user) {
+        Ok(tenancy) => tenancy.workspace.root().to_path_buf(),
+        Err(rejection) => return rejection.into_response(),
+    };
     let embedded = request.model.as_deref().and_then(parse_model_path);
     if embedded.is_some_and(|(coder, provider, _)| {
         request
@@ -1254,7 +1746,7 @@ async fn chat(
         let result = coders::execute(
             route,
             &prompt,
-            &state.config.coder_workspace,
+            &coder_root,
             state.config.coder_allow_writes,
             state.config.coder_timeout,
         )
@@ -1275,12 +1767,19 @@ async fn chat(
 
     let kind = provider_kind;
     let source = upstream.bytes_stream().eventsource();
+    let quotas = Arc::clone(&state.quotas);
+    let metrics = Arc::clone(&state.metrics);
+    let charged_to = user.id.clone();
     let output = stream! {
         pin_mut!(source);
         let mut sent_done = false;
+        let mut counted = 0u64;
         while let Some(event) = source.next().await {
             match event {
                 Ok(event) => {
+                    if let Some(usage) = usage_from_event(kind, &event.data) {
+                        counted = apply_usage(counted, usage);
+                    }
                     if let Some(data) = translate_event(kind, &event.event, &event.data) {
                         if data == "[DONE]" { sent_done = true; }
                         yield Ok::<Bytes, std::io::Error>(Bytes::from(format!("data: {data}\n\n")));
@@ -1295,6 +1794,12 @@ async fn chat(
             }
         }
         if !sent_done { yield Ok(Bytes::from_static(b"data: [DONE]\n\n")); }
+        // Charged at the end rather than up front: this is what the run actually
+        // cost, and a run that reported nothing is charged nothing.
+        if counted > 0 {
+            quotas.charge(&charged_to, counted);
+            metrics.tokens_charged.fetch_add(counted, Ordering::Relaxed);
+        }
     };
     let mut response = Response::new(Body::from_stream(output));
     add_sse_headers(response.headers_mut());
@@ -1312,6 +1817,7 @@ async fn chat(
 /// read text can still follow the `text` frames and ignore the rest.
 async fn agent(
     State(state): State<AppState>,
+    CurrentUser(user): CurrentUser,
     payload: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Response {
     let Json(request) = match payload {
@@ -1327,10 +1833,17 @@ async fn agent(
     if let Err(message) = validate_chat(&request) {
         return json_error(StatusCode::BAD_REQUEST, "invalid_request", message);
     }
+    if let Some(refusal) = over_quota(&state, &user) {
+        return refusal;
+    }
     state.metrics.agent_requests.fetch_add(1, Ordering::Relaxed);
 
+    let tenancy = match state.tenancy(&user) {
+        Ok(tenancy) => tenancy,
+        Err(rejection) => return rejection.into_response(),
+    };
     let metrics = Arc::clone(&state.metrics);
-    let harness = state.harness();
+    let harness = state.harness_for(&tenancy);
     let (sender, mut receiver) = mpsc::unbounded_channel();
     // The run owns the sender, so the channel closes when the run ends and the
     // loop below terminates without needing a sentinel.
@@ -1370,29 +1883,38 @@ async fn agent(
 }
 
 /// What the harness can do here, so a client can show it rather than guess.
-async fn harness_status(State(state): State<AppState>) -> Json<Value> {
+async fn harness_status(State(state): State<AppState>, CurrentUser(user): CurrentUser) -> Response {
+    let tenancy = match state.tenancy(&user) {
+        Ok(tenancy) => tenancy,
+        Err(rejection) => return rejection.into_response(),
+    };
     let context = ToolContext {
-        workspace: state.workspace.clone(),
-        memory: state.memory.clone(),
+        workspace: tenancy.workspace.clone(),
+        memory: tenancy.memory.clone(),
     };
     Json(json!({
-        "workspace": state.workspace.root().display().to_string(),
-        "writes_enabled": state.workspace.allows_writes(),
+        "workspace": tenancy.workspace.root().display().to_string(),
+        "writes_enabled": tenancy.workspace.allows_writes(),
         "max_steps": state.config.harness.max_steps,
-        "memory": state.memory.as_ref().map(|memory| json!({
+        "memory": tenancy.memory.as_ref().map(|memory| json!({
             "records": memory.live_count(),
             "retrieved_per_turn": state.config.harness.memory_hits,
         })),
         "tools": ToolRegistry::builtin(&context).names(),
     }))
+    .into_response()
 }
 
 /// Rebuild the codebase index.
 ///
 /// Idempotent: `index_file` tombstones a path's old rows before writing new
 /// ones, so running this twice replaces rows rather than duplicating them.
-async fn reindex(State(state): State<AppState>) -> Response {
-    let Some(memory) = state.memory.clone() else {
+async fn reindex(State(state): State<AppState>, CurrentUser(user): CurrentUser) -> Response {
+    let tenancy = match state.tenancy(&user) {
+        Ok(tenancy) => tenancy,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let Some(memory) = tenancy.memory.clone() else {
         return json_error(
             StatusCode::CONFLICT,
             "memory_disabled",
@@ -1569,12 +2091,17 @@ pub struct Completion {
 /// what to run. This assembles the stream and returns the finished turn.
 pub struct Gateway {
     state: AppState,
+    /// Where a native coder CLI runs. Per user when the deployment is per user,
+    /// so a coder cannot be the way around the workspace boundary the tools keep.
+    coder_root: PathBuf,
 }
 
 impl Gateway {
     pub fn new(config: Config) -> Result<Self, BuildError> {
+        let coder_root = config.coder_workspace.clone();
         Ok(Self {
             state: gateway_state(config)?,
+            coder_root,
         })
     }
 
@@ -1629,7 +2156,7 @@ impl Gateway {
             let result = coders::execute(
                 route,
                 &prompt,
-                &self.state.config.coder_workspace,
+                &self.coder_root,
                 self.state.config.coder_allow_writes,
                 self.state.config.coder_timeout,
             )
@@ -1888,6 +2415,9 @@ fn provider_payload(
                 "model": model,
                 "messages": openai_messages(messages),
                 "stream": true,
+                // Without this the stream carries no usage at all, and a token
+                // budget over it would be a number nobody was ever charged.
+                "stream_options": {"include_usage": true},
             });
             if let Some(value) = temperature {
                 payload["temperature"] = json!(value);
@@ -1984,6 +2514,60 @@ fn provider_payload(
         }
     }
 }
+/// What a provider says a run cost, read off its own stream.
+///
+/// Protocols disagree about more than field names. OpenAI sends one usage object
+/// at the end covering the whole call. Anthropic sends input tokens when the
+/// message opens and output tokens as it closes, so they add up. Gemini repeats
+/// a running total on every chunk, so they must not.
+///
+/// Nothing is estimated. A provider that reports no usage charges nothing,
+/// because a made-up number in a budget is worse than an absent one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Usage {
+    /// Add this to what has been counted so far.
+    Delta(u64),
+    /// A running total that replaces what has been counted so far.
+    Total(u64),
+}
+
+fn usage_from_event(kind: ProviderKind, data: &str) -> Option<Usage> {
+    if data.trim().is_empty() || data.trim() == "[DONE]" {
+        return None;
+    }
+    let payload: Value = serde_json::from_str(data).ok()?;
+    match kind {
+        ProviderKind::Openai | ProviderKind::OpenaiCompatible => payload
+            .pointer("/usage/total_tokens")
+            .and_then(Value::as_u64)
+            .map(Usage::Total),
+        ProviderKind::Anthropic => {
+            let input = payload
+                .pointer("/message/usage/input_tokens")
+                .and_then(Value::as_u64);
+            let output = payload
+                .pointer("/usage/output_tokens")
+                .and_then(Value::as_u64);
+            match (input, output) {
+                (None, None) => None,
+                (input, output) => Some(Usage::Delta(input.unwrap_or(0) + output.unwrap_or(0))),
+            }
+        }
+        ProviderKind::Gemini => payload
+            .pointer("/usageMetadata/totalTokenCount")
+            .and_then(Value::as_u64)
+            .map(Usage::Total),
+    }
+}
+
+/// Fold one reported usage into a running count.
+fn apply_usage(counted: u64, usage: Usage) -> u64 {
+    match usage {
+        Usage::Delta(value) => counted.saturating_add(value),
+        Usage::Total(value) => value.max(counted),
+    }
+}
+
 fn translate_event(kind: ProviderKind, event_type: &str, data: &str) -> Option<String> {
     if data.trim().is_empty() {
         return None;
@@ -2309,7 +2893,12 @@ mod tests {
             coder_timeout: Duration::from_secs(30),
             coder_allow_writes: false,
             coder_max_concurrency: 2,
+            workspace_mode: WorkspaceMode::Shared,
+            quotas: Limits::default(),
+            trusted_proxy: false,
             harness: HarnessSettings::default(),
+            store: StoreSettings::default(),
+            identity: Identity::single_user(),
         };
         assert!(config.validate().is_ok());
         let mut remote = config.clone();
@@ -2392,7 +2981,12 @@ mod tests {
             coder_timeout: Duration::from_secs(5),
             coder_allow_writes: true,
             coder_max_concurrency: 1,
+            workspace_mode: WorkspaceMode::Shared,
+            quotas: Limits::default(),
+            trusted_proxy: false,
             harness: HarnessSettings::default(),
+            store: StoreSettings::default(),
+            identity: Identity::single_user(),
         })
         .unwrap();
 
@@ -2823,7 +3417,12 @@ mod tests {
             coder_timeout: Duration::from_secs(30),
             coder_allow_writes: false,
             coder_max_concurrency: 2,
+            workspace_mode: WorkspaceMode::Shared,
+            quotas: Limits::default(),
+            trusted_proxy: false,
             harness: HarnessSettings::default(),
+            store: StoreSettings::default(),
+            identity: Identity::single_user(),
         };
         config.providers[0].base_url = format!("http://{address}/v1");
         let gateway = Gateway::new(config).unwrap();
@@ -2861,5 +3460,239 @@ mod tests {
             let chunk: Value = serde_json::from_str(&chunk).unwrap();
             assert_eq!(chunk.pointer("/choices/0/delta/content").unwrap(), "Hi");
         }
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    #[test]
+    fn openai_reports_one_total_for_the_whole_call() {
+        let usage = usage_from_event(
+            ProviderKind::Openai,
+            r#"{"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":30,"total_tokens":42}}"#,
+        );
+        assert_eq!(usage, Some(Usage::Total(42)));
+    }
+
+    #[test]
+    fn anthropic_reports_input_and_output_separately_and_they_add_up() {
+        let opened = usage_from_event(
+            ProviderKind::Anthropic,
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":12}}}"#,
+        );
+        let closed = usage_from_event(
+            ProviderKind::Anthropic,
+            r#"{"type":"message_delta","usage":{"output_tokens":30}}"#,
+        );
+        assert_eq!(opened, Some(Usage::Delta(12)));
+        assert_eq!(closed, Some(Usage::Delta(30)));
+        assert_eq!(
+            apply_usage(apply_usage(0, opened.unwrap()), closed.unwrap()),
+            42
+        );
+    }
+
+    /// Gemini repeats a running total on every chunk, so adding them up would
+    /// charge several times over for the same tokens.
+    #[test]
+    fn a_repeated_running_total_is_not_counted_twice() {
+        let first = usage_from_event(
+            ProviderKind::Gemini,
+            r#"{"candidates":[],"usageMetadata":{"totalTokenCount":20}}"#,
+        );
+        let second = usage_from_event(
+            ProviderKind::Gemini,
+            r#"{"candidates":[],"usageMetadata":{"totalTokenCount":42}}"#,
+        );
+        assert_eq!(first, Some(Usage::Total(20)));
+        assert_eq!(
+            apply_usage(apply_usage(0, first.unwrap()), second.unwrap()),
+            42
+        );
+    }
+
+    /// A late chunk that reports less than has already been counted must not
+    /// refund tokens that were really spent.
+    #[test]
+    fn a_total_never_walks_backwards() {
+        assert_eq!(apply_usage(42, Usage::Total(10)), 42);
+    }
+
+    #[test]
+    fn a_stream_that_reports_nothing_charges_nothing() {
+        for kind in [
+            ProviderKind::Openai,
+            ProviderKind::OpenaiCompatible,
+            ProviderKind::Anthropic,
+            ProviderKind::Gemini,
+        ] {
+            assert_eq!(
+                usage_from_event(kind, r#"{"choices":[{"delta":{"content":"hi"}}]}"#),
+                None,
+                "{kind:?} invented usage from a plain content chunk"
+            );
+            assert_eq!(usage_from_event(kind, "[DONE]"), None);
+            assert_eq!(usage_from_event(kind, "   "), None);
+            assert_eq!(usage_from_event(kind, "not json"), None);
+        }
+    }
+
+    #[test]
+    fn openai_compatible_providers_are_asked_to_report_usage() {
+        let payload = provider_payload(
+            ProviderKind::Openai,
+            "test-model",
+            &[ChatMessage {
+                role: Role::User,
+                content: "hello".into(),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            None,
+            None,
+            None,
+        );
+        assert_eq!(payload["stream_options"]["include_usage"], true);
+    }
+}
+
+#[cfg(test)]
+mod bind_tests {
+    use super::*;
+
+    fn config(bind: &str) -> Config {
+        Config {
+            bind: bind.parse().unwrap(),
+            providers: vec![ProviderConfig {
+                id: "openai".into(),
+                name: "OpenAI".into(),
+                ai_coder: "api".into(),
+                ai_coder_name: "API".into(),
+                provider_id: "openai".into(),
+                kind: ProviderKind::Openai,
+                base_url: "https://example.test/v1".into(),
+                default_model: "test-model".into(),
+                api_key: Some("test-key".into()),
+            }],
+            coders: Vec::new(),
+            default_coder: "api".into(),
+            default_provider: "openai".into(),
+            coder_workspace: PathBuf::from("."),
+            coder_timeout: Duration::from_secs(30),
+            coder_allow_writes: false,
+            coder_max_concurrency: 2,
+            workspace_mode: WorkspaceMode::Shared,
+            quotas: Limits::default(),
+            trusted_proxy: false,
+            harness: HarnessSettings::default(),
+            store: StoreSettings::default(),
+            identity: Identity::single_user(),
+        }
+    }
+
+    #[test]
+    fn loopback_needs_no_permission() {
+        assert!(config("127.0.0.1:41788").validate().is_ok());
+        assert!(config("[::1]:41788").validate().is_ok());
+    }
+
+    #[test]
+    fn leaving_loopback_is_refused_by_default() {
+        assert!(matches!(
+            config("0.0.0.0:41788").validate(),
+            Err(ConfigError::RemoteBind)
+        ));
+    }
+
+    /// Saying "there is a proxy" is not enough on its own: without proxy
+    /// identity, every request would arrive as the same local user, and the port
+    /// would be an unauthenticated way in for anyone who can reach it.
+    #[test]
+    fn acknowledging_a_proxy_is_not_enough_without_identity_from_it() {
+        let mut settings = config("0.0.0.0:41788");
+        settings.trusted_proxy = true;
+        assert!(matches!(settings.validate(), Err(ConfigError::RemoteBind)));
+    }
+
+    /// And identity alone is not enough either: a header is only worth something
+    /// when the operator has said nothing but the proxy can set it.
+    #[test]
+    fn identity_from_a_proxy_is_not_enough_without_acknowledging_one() {
+        let mut settings = config("0.0.0.0:41788");
+        settings.identity = Identity::proxy(identity::ProxyHeaders::default());
+        assert!(matches!(settings.validate(), Err(ConfigError::RemoteBind)));
+    }
+
+    /// Acknowledging a proxy and taking identity from it are still not enough
+    /// off loopback: without something only the proxy knows, every host that can
+    /// reach the port can claim to be anyone.
+    #[test]
+    fn a_remote_bind_needs_the_proxy_to_prove_itself() {
+        let mut settings = config("0.0.0.0:41788");
+        settings.trusted_proxy = true;
+        settings.identity = Identity::proxy(identity::ProxyHeaders::default());
+        assert!(matches!(
+            settings.validate(),
+            Err(ConfigError::UnprovenProxy)
+        ));
+    }
+
+    #[test]
+    fn all_three_together_are_what_it_takes() {
+        let mut settings = config("0.0.0.0:41788");
+        settings.trusted_proxy = true;
+        settings.identity = Identity::proxy(identity::ProxyHeaders {
+            secret: Some(identity::Secret::new(
+                "x-lumen-proxy-secret",
+                "correct-horse",
+            )),
+            ..identity::ProxyHeaders::default()
+        });
+        assert!(settings.validate().is_ok());
+    }
+
+    /// A secret buys nothing on loopback, where the machine is the boundary, so
+    /// it is not demanded there.
+    #[test]
+    fn loopback_still_needs_no_secret() {
+        let mut settings = config("127.0.0.1:41788");
+        settings.identity = Identity::proxy(identity::ProxyHeaders::default());
+        assert!(settings.validate().is_ok());
+    }
+
+    /// The refusal has to be actionable: an operator reading it should know both
+    /// switches to reach for.
+    #[test]
+    fn the_refusal_says_what_to_do_about_it() {
+        let message = ConfigError::RemoteBind.to_string();
+        assert!(message.contains("AI_IDENTITY_MODE=proxy"), "{message}");
+        assert!(message.contains("AI_TRUSTED_PROXY=true"), "{message}");
+    }
+
+    /// Relaxing the bind must not relax anything else: a remote deployment with
+    /// several users still cannot share one writable workspace.
+    #[test]
+    fn a_remote_deployment_is_still_held_to_the_tenancy_rules() {
+        let mut settings = config("0.0.0.0:41788");
+        settings.trusted_proxy = true;
+        settings.identity = Identity::proxy(identity::ProxyHeaders {
+            secret: Some(identity::Secret::new(
+                "x-lumen-proxy-secret",
+                "correct-horse",
+            )),
+            ..identity::ProxyHeaders::default()
+        });
+        settings.coder_allow_writes = true;
+        settings.workspace_mode = WorkspaceMode::Shared;
+
+        assert!(matches!(
+            settings.validate(),
+            Err(ConfigError::UnsafeTenancy(_))
+        ));
+
+        settings.workspace_mode = WorkspaceMode::PerUser;
+        assert!(settings.validate().is_ok());
     }
 }

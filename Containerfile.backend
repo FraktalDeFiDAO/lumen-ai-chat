@@ -18,7 +18,18 @@ RUN for attempt in 1 2 3; do \
 COPY --from=builder /build/target/release/ai-chatbot-gateway /usr/local/bin/lumen-api
 COPY --chmod=0755 container/api-entrypoint.sh /usr/local/bin/lumen-entrypoint
 RUN chmod 0755 /usr/local/bin/lumen-api
-USER 1000:1000
+# The only writable state a hosted deployment keeps: the conversation store, the
+# per-user workspaces, and the per-user indexes. It exists in the image so a
+# volume mounted over it inherits an ownership the unprivileged user can write.
+#
+# The ids are build arguments because Compose runs this as ${UID}:${GID} under
+# `userns_mode: keep-id`, which is the host user's real id. Baking 1000 in would
+# hand anyone whose id is not 1000 an unwritable volume and a service that
+# refuses to start.
+ARG APP_UID=1000
+ARG APP_GID=1000
+RUN install -d -o ${APP_UID} -g ${APP_GID} -m 0700 /var/lib/lumen
+USER ${APP_UID}:${APP_GID}
 WORKDIR /workspace
 EXPOSE 41788
 ENTRYPOINT ["/usr/local/bin/lumen-entrypoint"]
