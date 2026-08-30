@@ -145,7 +145,7 @@ Every tool is confined to `AI_CODER_WORKSPACE`. Paths are normalised, checked ag
 | `read_file` | Numbered lines, with `offset`/`limit` paging |
 | `list_directory` | Entries, excluding anything a read would refuse |
 | `search_text` | Literal, case-insensitive match across the workspace |
-| `search_memory` | Semantic and symbol search over the codebase index |
+| `search_memory` | Word-overlap and symbol-name search over the codebase index |
 | `write_file` | Create or replace a file (write mode only) |
 | `edit_file` | Exact string replacement, refusing an ambiguous match (write mode only) |
 
@@ -155,7 +155,9 @@ A tool error is returned to the model as a tool result, not raised as a failure:
 
 ### Codebase index
 
-`search_memory` is backed by [`harness-memory`](backend/harness-memory/README.md), a vector store with int8-quantised rows, an HNSW graph, and hybrid retrieval that fuses embedding similarity with exact symbol-name matching.
+`search_memory` is backed by [`harness-memory`](backend/harness-memory/README.md), a vector store with int8-quantised rows, an HNSW graph, and hybrid retrieval that fuses vector similarity with exact symbol-name matching through reciprocal rank fusion.
+
+The vectors come from a hashed bag-of-tokens embedder, not a trained model, so retrieval ranks on **shared vocabulary rather than on meaning**: a query using the words the code uses finds it, and a paraphrase that shares none of them does not. The tool description tells the model exactly that, so it asks with identifiers and project terms instead of prose. The embedding width is pinned at 384 — MiniLM's — so substituting a real model later does not change the on-disk row format or require a reindex of anything but the vectors.
 
 The indexer cuts each file into records a coding agent would want back — a function, a type, a Markdown heading — and falls back to fixed windows for files with no detectable definitions, so a README is retrievable rather than invisible. A successful `write_file` or `edit_file` re-indexes that file immediately, which is what stops the agent from reading its own stale work back.
 

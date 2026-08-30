@@ -157,7 +157,7 @@ test.describe('SettingsView — agent harness', () => {
     await openSection(page, 'Agent harness')
 
     await expect(page.getByText('Retrieval unavailable')).toBeVisible()
-    await expect(page.getByText('Set AI_HARNESS_MEMORY_DIR to a writable path to enable semantic search.')).toBeVisible()
+    await expect(page.getByText('Set AI_HARNESS_MEMORY_DIR to a writable path to enable codebase search.')).toBeVisible()
     await expect(page.getByRole('button', { name: 'Rebuild' })).toBeDisabled()
     await expect(page.locator('.agent-note').first()).toContainText('writable')
   })
