@@ -2,7 +2,7 @@ import { computed, ref, watch } from 'vue'
 import { defineStore } from 'pinia'
 import type { ChatModel, Conversation, Feedback, Message, ToolActivity } from '@/types/chat'
 import { useSettingsStore } from './settings'
-import { LocalBackend, detectBackend, type ConversationBackend } from './persistence'
+import { LocalBackend, ServerBackend, detectBackend, markMigrated, migrateLocalHistory, type ConversationBackend } from './persistence'
 
 const MODEL_KEY = 'lumen-model-v1'
 /// A streamed answer changes the conversation on every chunk. Saving each one
@@ -212,7 +212,18 @@ export const useChatStore = defineStore('chat', () => {
     historyError.value = ''
     try {
       backend.value = await detectBackend()
-      conversations.value = await backend.value.list()
+      let listed = await backend.value.list()
+
+      // A deployment that has just switched storage on would otherwise strand
+      // whatever this browser already held. Only when the server has nothing
+      // for this person: an empty history there and a full one here is the one
+      // situation where the browser's copy is the real one.
+      if (backend.value instanceof ServerBackend) {
+        if (listed.length) markMigrated()
+        else if (await migrateLocalHistory(backend.value)) listed = await backend.value.list()
+      }
+
+      conversations.value = listed
       loaded.clear()
       if (backend.value.listIncludesMessages) {
         for (const conversation of conversations.value) loaded.add(conversation.id)

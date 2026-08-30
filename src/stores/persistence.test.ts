@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { LocalBackend, ServerBackend, StoreUnavailable, detectBackend } from './persistence'
+import { LocalBackend, ServerBackend, StoreUnavailable, detectBackend, markMigrated, migrateLocalHistory } from './persistence'
 import type { Conversation } from '@/types/chat'
 
 const STORAGE_KEY = 'lumen-conversations-v1'
@@ -241,5 +241,81 @@ describe('detectBackend', () => {
   it('still uses the server when the caller is not signed in', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(401, { error: { message: 'unauthenticated' } })))
     expect(await detectBackend()).toBeInstanceOf(ServerBackend)
+  })
+})
+
+describe('migrateLocalHistory', () => {
+  beforeEach(() => {
+    localStorage.clear()
+    vi.restoreAllMocks()
+  })
+
+  function stubServer(saved: Conversation[] = []) {
+    return {
+      listIncludesMessages: false,
+      list: vi.fn().mockResolvedValue([]),
+      load: vi.fn().mockResolvedValue(null),
+      save: vi.fn().mockImplementation(async (conversation: Conversation) => { saved.push(conversation) }),
+      remove: vi.fn().mockResolvedValue(undefined),
+      clear: vi.fn().mockResolvedValue(undefined),
+    }
+  }
+
+  it('moves what this browser held to the server', async () => {
+    const local = new LocalBackend()
+    await local.save(conversation('c1', 'First'))
+    await local.save(conversation('c2', 'Second'))
+    const saved: Conversation[] = []
+
+    expect(await migrateLocalHistory(stubServer(saved))).toBe(2)
+    expect(saved.map(item => item.id).sort()).toEqual(['c1', 'c2'])
+  })
+
+  /// A migration that ran twice would resurrect conversations the user has since
+  /// deleted on the server.
+  it('runs once and then never again', async () => {
+    await new LocalBackend().save(conversation('c1', 'First'))
+
+    expect(await migrateLocalHistory(stubServer())).toBe(1)
+    expect(await migrateLocalHistory(stubServer())).toBe(0)
+  })
+
+  it('leaves the local copy alone, in case the upload was not the end of it', async () => {
+    const local = new LocalBackend()
+    await local.save(conversation('c1', 'First'))
+
+    await migrateLocalHistory(stubServer())
+    expect((await local.list()).map(item => item.id)).toEqual(['c1'])
+  })
+
+  it('has nothing to do for a browser with no history', async () => {
+    const server = stubServer()
+    expect(await migrateLocalHistory(server)).toBe(0)
+    expect(server.save).not.toHaveBeenCalled()
+  })
+
+  /// Stopping short leaves the flag unset, so the next load picks up where this
+  /// one gave up rather than abandoning what did not make it.
+  it('stops at the first refusal and tries again next time', async () => {
+    const local = new LocalBackend()
+    await local.save(conversation('c1', 'First'))
+    await local.save(conversation('c2', 'Second'))
+
+    const failing = stubServer()
+    failing.save = vi.fn()
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error('the store is full'))
+
+    expect(await migrateLocalHistory(failing)).toBe(1)
+    expect(await migrateLocalHistory(stubServer())).toBe(2)
+  })
+
+  it('marks the job done without moving anything when told to', async () => {
+    await new LocalBackend().save(conversation('c1', 'First'))
+    markMigrated()
+
+    const server = stubServer()
+    expect(await migrateLocalHistory(server)).toBe(0)
+    expect(server.save).not.toHaveBeenCalled()
   })
 })

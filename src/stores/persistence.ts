@@ -95,6 +95,58 @@ interface StoredSummary {
 
 export class StoreUnavailable extends Error {}
 
+const MIGRATED_KEY = 'lumen-conversations-migrated-v1'
+
+/// Move this browser's conversations to the server, once.
+///
+/// A deployment that switches storage on would otherwise strand every
+/// conversation its users already had: still in `localStorage`, no longer where
+/// the app looks. This runs when the server is in use and has nothing for this
+/// person yet, uploads what the browser holds, and records that it is done.
+///
+/// The local copy is left alone. It costs a few kilobytes and it is the only
+/// thing standing between a failed upload and lost history.
+export async function migrateLocalHistory(server: ConversationBackend): Promise<number> {
+  if (readFlag(MIGRATED_KEY)) return 0
+
+  const local = await new LocalBackend().list()
+  if (!local.length) {
+    writeFlag(MIGRATED_KEY)
+    return 0
+  }
+
+  let moved = 0
+  for (const conversation of local) {
+    try {
+      await server.save(conversation)
+      moved += 1
+    } catch {
+      // One conversation the server will not take must not strand the rest, and
+      // must not mark the migration done: the next load tries again.
+      return moved
+    }
+  }
+  writeFlag(MIGRATED_KEY)
+  return moved
+}
+
+/// Record that there is nothing left to move, without moving anything: the
+/// server already holds this person's history, so the browser's copy is a stale
+/// duplicate rather than the only one.
+export function markMigrated() {
+  writeFlag(MIGRATED_KEY)
+}
+
+function readFlag(key: string): boolean {
+  try { return localStorage.getItem(key) === 'true' }
+  catch { return true }
+}
+
+function writeFlag(key: string) {
+  try { localStorage.setItem(key, 'true') }
+  catch { /* nothing to do; the worst case is trying again next load */ }
+}
+
 export class ServerBackend implements ConversationBackend {
   readonly listIncludesMessages = false
 

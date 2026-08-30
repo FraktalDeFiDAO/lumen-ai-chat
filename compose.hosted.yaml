@@ -1,0 +1,58 @@
+# The hosted deployment: several people, each with their own conversations,
+# workspace, and codebase index.
+#
+#   podman compose -f compose.yaml -f compose.hosted.yaml up -d
+#
+# What it changes, and why each one is necessary rather than nice:
+#
+#   * A volume. This is the deployment's first piece of persistent state. The
+#     base deployment runs entirely on tmpfs by design, which is exactly right
+#     when conversations live in a browser and the workspace is someone's
+#     checkout. Neither is true here.
+#
+#   * A writable workspace base. In per-user mode `AI_CODER_WORKSPACE` is the
+#     parent the subtrees hang off, not a project, so it cannot be the read-only
+#     project mount. The consequence is deliberate: an agent in this deployment
+#     sees the asking user's files, not the repository.
+#
+#   * Identity from the proxy. Put an identity-aware proxy in front of
+#     127.0.0.1:41789 and have it set `X-Forwarded-User`. Nothing else may be
+#     able to reach that port -- the header is only worth what the network makes
+#     it worth. The bind stays on loopback for that reason.
+#
+#   * Quotas. An agent run is several model calls, and this deployment is
+#     spending on behalf of people who are not watching the bill.
+#
+# The root filesystem stays read-only, capabilities stay dropped, and privilege
+# escalation stays off. The volume is the only thing that changes about what the
+# container can write.
+
+services:
+  api:
+    environment:
+      AI_CODER_WORKSPACE: /var/lib/lumen/workspaces
+      AI_WORKSPACE_MODE: per_user
+      # The base deployment switches the store off; this is the deployment it
+      # exists for. Without this line the merged configuration would carry that
+      # `off` and quietly ignore the path below.
+      AI_STORE: "on"
+      AI_STORE_PATH: /var/lib/lumen/conversations.db
+      # Per user, and persistent: rebuilding every index for every user on each
+      # restart is a pass over every user's tree, not one.
+      AI_HARNESS_MEMORY_DIR: /var/lib/lumen/indexes
+      # There is no single workspace to index at start when each user has their
+      # own; an index is built when its owner first asks for one.
+      AI_HARNESS_INDEX_ON_START: "false"
+      # Each user writes only inside their own subtree, which is what makes this
+      # safe to turn on at all.
+      AI_CODER_ALLOW_WRITES: "true"
+      AI_IDENTITY_MODE: proxy
+      AI_IDENTITY_USER_HEADER: x-forwarded-user
+      AI_QUOTA_REQUESTS_PER_WINDOW: "200"
+      AI_QUOTA_TOKENS_PER_WINDOW: "2000000"
+      AI_QUOTA_WINDOW_SECONDS: "3600"
+    volumes:
+      - lumen-state:/var/lib/lumen:rw
+
+volumes:
+  lumen-state:

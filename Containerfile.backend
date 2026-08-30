@@ -18,6 +18,10 @@ RUN for attempt in 1 2 3; do \
 COPY --from=builder /build/target/release/ai-chatbot-gateway /usr/local/bin/lumen-api
 COPY --chmod=0755 container/api-entrypoint.sh /usr/local/bin/lumen-entrypoint
 RUN chmod 0755 /usr/local/bin/lumen-api
+# The only writable state a hosted deployment keeps: the conversation store, the
+# per-user workspaces, and the per-user indexes. It exists in the image so a
+# volume mounted over it inherits an ownership the unprivileged user can write.
+RUN install -d -o 1000 -g 1000 -m 0700 /var/lib/lumen
 USER 1000:1000
 WORKDIR /workspace
 EXPOSE 41788

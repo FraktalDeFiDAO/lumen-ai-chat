@@ -485,19 +485,40 @@ impl Config {
                 )
             })?;
         let workspace_text = env::var("AI_CODER_WORKSPACE").ok();
-        let coder_workspace = workspace_text
+        let workspace_mode = match env::var("AI_WORKSPACE_MODE")
+            .unwrap_or_else(|_| "shared".into())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "shared" => WorkspaceMode::Shared,
+            "per_user" | "per-user" => WorkspaceMode::PerUser,
+            other => return Err(ConfigError::UnknownWorkspaceMode(other.into())),
+        };
+        let requested_workspace = workspace_text
             .as_deref()
             .map(PathBuf::from)
-            .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
-            .canonicalize()
-            .map_err(|_| {
-                ConfigError::InvalidCoderWorkspace(workspace_text.unwrap_or_else(|| ".".into()))
-            })?;
-        if !coder_workspace.is_dir() {
-            return Err(ConfigError::InvalidCoderWorkspace(
-                coder_workspace.display().to_string(),
-            ));
-        }
+            .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        // In shared mode this names a project, which has to be there already. In
+        // per-user mode it names the parent the subtrees hang off, which the
+        // service creates -- a fresh deployment has an empty volume and nobody
+        // to have made it.
+        let coder_workspace = match workspace_mode {
+            WorkspaceMode::Shared => {
+                let resolved = requested_workspace.canonicalize().map_err(|_| {
+                    ConfigError::InvalidCoderWorkspace(
+                        workspace_text.clone().unwrap_or_else(|| ".".into()),
+                    )
+                })?;
+                if !resolved.is_dir() {
+                    return Err(ConfigError::InvalidCoderWorkspace(
+                        resolved.display().to_string(),
+                    ));
+                }
+                resolved
+            }
+            WorkspaceMode::PerUser => requested_workspace,
+        };
         let coder_timeout = Duration::from_secs(
             env::var("AI_CODER_TIMEOUT_SECONDS")
                 .ok()
@@ -547,16 +568,7 @@ impl Config {
             coder_allow_writes: env_flag("AI_CODER_ALLOW_WRITES"),
             coder_max_concurrency,
             harness,
-            workspace_mode: match env::var("AI_WORKSPACE_MODE")
-                .unwrap_or_else(|_| "shared".into())
-                .trim()
-                .to_ascii_lowercase()
-                .as_str()
-            {
-                "shared" => WorkspaceMode::Shared,
-                "per_user" | "per-user" => WorkspaceMode::PerUser,
-                other => return Err(ConfigError::UnknownWorkspaceMode(other.into())),
-            },
+            workspace_mode,
             trusted_proxy: env_flag("AI_TRUSTED_PROXY"),
             quotas: Limits {
                 requests: env::var("AI_QUOTA_REQUESTS_PER_WINDOW")

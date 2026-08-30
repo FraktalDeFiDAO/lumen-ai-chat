@@ -416,6 +416,37 @@ several users still cannot share a writable workspace.
 | `AI_QUOTA_WINDOW_SECONDS` | `3600` | Window length, 60–86400 |
 | `AI_TRUSTED_PROXY` | off | Assert that a proxy authenticates in front |
 
+### Running the hosted deployment
+
+```bash
+podman compose -f compose.yaml -f compose.hosted.yaml up -d
+```
+
+The overlay adds the deployment's first piece of persistent state: a volume at
+`/var/lib/lumen` holding the conversation store, the per-user workspaces, and the
+per-user indexes. The base deployment runs entirely on tmpfs, which is right when
+conversations live in a browser and the workspace is somebody's checkout; neither
+is true here. Everything else about the hardening is unchanged — read-only root,
+capabilities dropped, no privilege escalation — and the volume is the only thing
+that changes about what the container can write.
+
+Two consequences worth knowing before you run it:
+
+The agent no longer sees the repository. In per-user mode `AI_CODER_WORKSPACE` is
+the parent the subtrees hang off rather than a project, so it is the volume, not
+the read-only project mount. Each user's agent sees that user's files.
+
+The bind stays on loopback. Put an identity-aware proxy in front of
+`127.0.0.1:41789` and have it set `X-Forwarded-User`; nothing else may be able to
+reach that port, because the header is worth exactly what the network makes it
+worth. Only move `APP_BIND` off loopback when something else is enforcing that,
+and then `AI_TRUSTED_PROXY=true` is how you say so.
+
+The first time a browser meets a deployment that keeps conversations, whatever it
+already had is uploaded once and the local copy is left where it is. Turning the
+store on therefore does not strand anybody's history, and turning it off again
+does not lose it.
+
 ## Quality gates
 
 ```bash

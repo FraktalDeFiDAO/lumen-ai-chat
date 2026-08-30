@@ -156,3 +156,57 @@ test.describe('server-kept conversations', () => {
     expect((await response.json()).error.type).toBe('unauthenticated')
   })
 })
+
+test.describe('switching an existing browser to a server store', () => {
+  /// The migration a deployment needs the day it turns storage on: whatever this
+  /// browser already held has to arrive on the server, not be stranded in it.
+  test('a browser that already had history keeps it', async ({ browser }) => {
+    const context = await browser.newContext(asUser('dakota'))
+    const page = await context.newPage()
+
+    // Seed the browser as a pre-migration install would have left it, before any
+    // application script runs.
+    await page.addInitScript(() => {
+      if (window.localStorage.getItem('lumen-conversations-v1') !== null) return
+      window.localStorage.setItem('lumen-conversations-v1', JSON.stringify([{
+        id: 'legacy-chat',
+        title: 'Written before the server kept anything',
+        createdAt: 1,
+        updatedAt: 2,
+        messages: [
+          { id: 'm1', role: 'user', content: 'an old question', createdAt: 1, feedback: null },
+          { id: 'm2', role: 'assistant', content: 'an old answer', createdAt: 2, feedback: null },
+        ],
+      }]))
+    })
+
+    await page.goto('/')
+    await expect(page.locator('.history-row')).toHaveCount(1)
+    await expect(page.locator('.history-open')).toContainText('Written before the server kept anything')
+    await page.waitForTimeout(500)
+    await context.close()
+
+    // A different browser with nothing in it: if the transcript is there, it came
+    // from the server.
+    const fresh = await (await browser.newContext(asUser('dakota'))).newPage()
+    await fresh.goto('/')
+    await expect(fresh.locator('.history-row')).toHaveCount(1)
+
+    await fresh.locator('.history-open').click()
+    await expect(fresh.locator('article.user .message-content')).toHaveText('an old question')
+    await expect(fresh.locator('article.assistant .message-content')).toHaveText('an old answer')
+  })
+
+  /// Migrating again would resurrect whatever the user has since deleted.
+  test('a browser whose history already reached the server does not send it twice', async ({ browser }) => {
+    const context = await browser.newContext(asUser('emerson'))
+    const page = await context.newPage()
+    await startChat(page, 'Emerson first question')
+    await page.waitForTimeout(1_000)
+
+    // Reloading is the moment a second migration would happen.
+    await page.reload()
+    await expect(page.locator('.history-row')).toHaveCount(1)
+    await context.close()
+  })
+})
