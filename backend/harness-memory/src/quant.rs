@@ -174,8 +174,8 @@ mod tests {
         let pairs = 400;
 
         for _ in 0..pairs {
-            let a: Vec<f32> = (0..384).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
-            let b: Vec<f32> = (0..384).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+            let a: Vec<f32> = (0..384).map(|_| rng.random_range(-1.0f32..1.0)).collect();
+            let b: Vec<f32> = (0..384).map(|_| rng.random_range(-1.0f32..1.0)).collect();
             let truth = cos_f32(&a, &b);
 
             let qa = QuantizedVector::quantize(&a);
