@@ -36,6 +36,7 @@ What holds the line instead:
 | Rule | Enforced by | Bypassable |
 | --- | --- | --- |
 | Every push and pull request is built and tested | `.github/workflows/ci.yml` | No |
+| A promotion is not rebuilt, because the commit was already built where it came from | `.github/workflows/ci.yml` skips it | n/a |
 | Promotions only go `dev → staging → main` | `.github/workflows/promotion.yml` | Only by merging without the check, which requires deliberate action |
 | A promoted commit already passed CI where it came from | `.github/workflows/promotion.yml` | Same |
 

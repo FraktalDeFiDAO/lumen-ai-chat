@@ -7,13 +7,18 @@ updates:
     # Everything lands on dev first, like anything else.
     target-branch: dev
     groups:
-      # One pull request per ecosystem rather than per package: the gate takes
-      # twenty minutes, and reviewing fifteen separate bumps of the same
-      # toolchain is not fifteen times the information.
-      dev-tooling:
-        patterns: ["eslint*", "@eslint/*", "typescript-eslint", "vue-eslint-parser", "@playwright/*", "playwright-core", "vitest", "@vitejs/*", "vue-tsc", "typescript"]
+      # Two pull requests, not one per package. The gate takes twenty minutes,
+      # and reviewing nine separate bumps of one toolchain is not nine times the
+      # information -- which is what the first version of this file produced,
+      # because naming packages individually misses every one not on the list.
+      #
+      # Split by blast radius instead: what ships to users, and what only builds
+      # it. A runtime bump deserves a careful look; a linter bump deserves a
+      # green pipeline.
       runtime:
-        patterns: ["vue", "vue-router", "pinia", "tailwindcss", "@tailwindcss/*", "lucide-vue-next"]
+        dependency-type: production
+      tooling:
+        dependency-type: development
   - package-ecosystem: cargo
     directory: /backend
     schedule: { interval: weekly }

@@ -22,6 +22,14 @@ concurrency:
 
 jobs:
   quality:
+    # A promotion carries a commit that already passed CI on the branch it came
+    # from -- `promotion.yml` refuses to merge one that did not. Building it a
+    # second time confirms nothing and costs twenty minutes on every hop, which
+    # is the friction that makes people stop promoting in small steps.
+    if: >-
+      github.event_name != 'pull_request' ||
+      !((github.head_ref == 'dev' && github.base_ref == 'staging') ||
+        (github.head_ref == 'staging' && github.base_ref == 'main'))
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -35,6 +43,14 @@ jobs:
           rustup update stable --no-self-update
           rustup default stable
           rustup component add rustfmt clippy
+      - name: Cache the Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: backend
+          # The audit tools are installed into the same cargo home and are worth
+          # keeping too; they are a fixed cost on every run otherwise.
+          cache-all-crates: true
+
       - name: Install Rust audit tools
         run: |
           cargo install cargo-audit --locked

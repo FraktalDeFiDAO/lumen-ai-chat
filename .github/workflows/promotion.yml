@@ -79,6 +79,11 @@ jobs:
               exit 0
             fi
 
+            # A run that was skipped is not a verdict. CI skips itself on a
+            # promotion, because the commit was already built on the branch it
+            # came from, and counting that as "ran and did not pass" would fail
+            # every promotion for the opposite of the real reason.
+            runs=$(jq 'map(select(.conclusion != "skipped"))' <<<"$runs")
             finished=$(jq 'map(select(.status == "completed")) | length' <<<"$runs")
             total=$(jq 'length' <<<"$runs")
             if [[ "$total" -gt 0 && "$finished" -eq "$total" ]]; then
