@@ -166,7 +166,7 @@ mod tests {
     /// proves nothing in either direction. Measure the mean over a population.
     #[test]
     fn asymmetric_beats_symmetric_on_average() {
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(7);
 
         let mut sym_total = 0.0f64;
@@ -174,8 +174,8 @@ mod tests {
         let pairs = 400;
 
         for _ in 0..pairs {
-            let a: Vec<f32> = (0..384).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
-            let b: Vec<f32> = (0..384).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+            let a: Vec<f32> = (0..384).map(|_| rng.random_range(-1.0f32..1.0)).collect();
+            let b: Vec<f32> = (0..384).map(|_| rng.random_range(-1.0f32..1.0)).collect();
             let truth = cos_f32(&a, &b);
 
             let qa = QuantizedVector::quantize(&a);

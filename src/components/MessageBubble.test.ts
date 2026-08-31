@@ -100,14 +100,14 @@ describe('MessageBubble', () => {
 
     const tools = bubble.findAll('.tool-activity details')
     expect(tools).toHaveLength(3)
-    expect(tools[0]!.find('summary strong').text()).toBe('read_file')
-    expect(tools[0]!.find('summary span').text()).toBe('{"path":"src/main.ts"}')
-    expect(tools[0]!.find('pre').text()).toBe('export const app = 1')
+    expect(tools[0].find('summary strong').text()).toBe('read_file')
+    expect(tools[0].find('summary span').text()).toBe('{"path":"src/main.ts"}')
+    expect(tools[0].find('pre').text()).toBe('export const app = 1')
 
-    expect(tools[1]!.classes()).toContain('failed')
-    expect(tools[1]!.find('summary em').text()).toBe('failed')
+    expect(tools[1].classes()).toContain('failed')
+    expect(tools[1].find('summary em').text()).toBe('failed')
 
-    expect(tools[2]!.find('pre').text()).toBe('Running…')
+    expect(tools[2].find('pre').text()).toBe('Running…')
   })
 
   it('shortens a long argument to one readable line', () => {

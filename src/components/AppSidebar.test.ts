@@ -76,7 +76,7 @@ describe('AppSidebar', () => {
 
     const active = sidebar.findAll('.history-row').filter(row => row.classes().includes('active'))
     expect(active).toHaveLength(1)
-    expect(active[0]!.text()).toContain('B')
+    expect(active[0].text()).toContain('B')
   })
 
   it('opens a conversation, routes to it, and closes itself', async () => {
