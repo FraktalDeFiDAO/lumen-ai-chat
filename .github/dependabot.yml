@@ -19,6 +19,13 @@ updates:
         dependency-type: production
       tooling:
         dependency-type: development
+    ignore:
+      # typescript-eslint peers on `typescript >=4.8.4 <6.1.0`, so TypeScript 7
+      # would break `npm ci` outright rather than fail a test. Drop this the
+      # moment a typescript-eslint release accepts it: the bump is wanted, the
+      # ecosystem is not ready.
+      - dependency-name: typescript
+        update-types: [version-update:semver-major]
   - package-ecosystem: cargo
     directory: /backend
     schedule: { interval: weekly }
