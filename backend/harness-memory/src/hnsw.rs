@@ -17,7 +17,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -131,7 +131,7 @@ impl HnswIndex {
                 slot: HashMap::new(),
             },
             snapshot,
-            rng: StdRng::from_os_rng(),
+            rng: rand::make_rng::<StdRng>(),
         }
     }
 
@@ -507,7 +507,7 @@ impl HnswIndex {
         Ok(Self {
             graph,
             snapshot,
-            rng: StdRng::from_os_rng(),
+            rng: rand::make_rng::<StdRng>(),
         })
     }
 
