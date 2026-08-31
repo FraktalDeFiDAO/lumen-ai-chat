@@ -12,7 +12,7 @@ async-stream = "0.3"
 axum = { version = "0.8", features = ["json"] }
 eventsource-stream = "0.2"
 futures-util = "0.3"
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 harness-memory = { path = "harness-memory", version = "0.1.0" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
@@ -20,7 +20,7 @@ serde_json = "1"
 thiserror = "2"
 tempfile = "3"
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
-tower-http = { version = "0.6", features = ["limit", "trace"] }
+tower-http = { version = "0.7", features = ["limit", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 
