@@ -166,7 +166,7 @@ mod tests {
     /// proves nothing in either direction. Measure the mean over a population.
     #[test]
     fn asymmetric_beats_symmetric_on_average() {
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(7);
 
         let mut sym_total = 0.0f64;
