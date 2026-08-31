@@ -23,6 +23,9 @@ merge of a commit that has already gone green where it was, not a fresh attempt.
 opened directly against `staging` or `main`. Merge it back down to `dev`
 afterwards, or the next promotion will quietly revert it.
 
+A release commit is the same shape: it is cut on `main` and has to come back
+down. See [RELEASING.md](RELEASING.md).
+
 ## What is enforced, and by what
 
 This repository is private on a Free account, where **GitHub cannot enforce
