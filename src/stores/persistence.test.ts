@@ -43,7 +43,7 @@ describe('LocalBackend', () => {
 
     const all = await backend.list()
     expect(all).toHaveLength(1)
-    expect(all[0]!.title).toBe('Renamed')
+    expect(all[0].title).toBe('Renamed')
   })
 
   it('removes one and clears all', async () => {
@@ -123,11 +123,11 @@ describe('ServerBackend', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     const saved = conversation('c1', 'First')
-    saved.messages[1]!.tools = [{ id: 'call-1', name: 'read_file', output: 'ok' }]
-    saved.messages[1]!.contextRecords = 2
+    saved.messages[1].tools = [{ id: 'call-1', name: 'read_file', output: 'ok' }]
+    saved.messages[1].contextRecords = 2
     await new ServerBackend().save(saved)
 
-    const [url, options] = fetchMock.mock.calls[0]!
+    const [url, options] = fetchMock.mock.calls[0]
     expect(url).toBe('/api/conversations/c1')
     expect(options.method).toBe('PUT')
     const body = JSON.parse(options.body)
@@ -144,7 +144,7 @@ describe('ServerBackend', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     await new ServerBackend().save(conversation('c1', 'Plain'))
-    const body = JSON.parse(fetchMock.mock.calls[0]![1].body)
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body)
     expect(body.messages[0].extra).toBeUndefined()
   })
 
@@ -155,10 +155,10 @@ describe('ServerBackend', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     const withFailure = conversation('c1', 'Failed')
-    withFailure.messages[1]!.error = 'upstream refused'
+    withFailure.messages[1].error = 'upstream refused'
     await new ServerBackend().save(withFailure)
 
-    const body = JSON.parse(fetchMock.mock.calls[0]![1].body)
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body)
     expect(body.messages).toHaveLength(1)
     expect(body.messages[0].role).toBe('user')
   })
@@ -168,7 +168,7 @@ describe('ServerBackend', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     await new ServerBackend().remove('../conversations')
-    expect(fetchMock.mock.calls[0]![0]).toBe('/api/conversations/..%2Fconversations')
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/conversations/..%2Fconversations')
   })
 
   it('answers with nothing for a conversation that is not there', async () => {
@@ -226,7 +226,7 @@ describe('detectBackend', () => {
 
     await detectBackend()
     expect(fetchMock).toHaveBeenCalledTimes(1)
-    expect(fetchMock.mock.calls[0]![0]).toBe('/api/me')
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/me')
   })
 
   /// An unreachable API is the offline case: a cached page should still be able
