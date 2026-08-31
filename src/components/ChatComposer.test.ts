@@ -87,7 +87,7 @@ describe('ChatComposer', () => {
     const composer = mountComposer()
     const groups = composer.findAll('optgroup')
     expect(groups.map(group => group.attributes('label'))).toEqual(['Hermes · Z.AI', 'Codex · Codex'])
-    expect(groups[0]!.findAll('option').map(option => option.text())).toEqual(['hermes/z.ai/glm-5.2', 'hermes/z.ai/glm-5.1'])
+    expect(groups[0].findAll('option').map(option => option.text())).toEqual(['hermes/z.ai/glm-5.2', 'hermes/z.ai/glm-5.1'])
   })
 
   it('reports the route the user picked', async () => {
@@ -130,7 +130,7 @@ describe('ChatComposer', () => {
     await attach(composer, [file('app.ts', 'const x = 1')])
     await composer.find('.send-button').trigger('click')
 
-    expect(composer.emitted('send')![0]![0]).toBe(
+    expect(composer.emitted('send')![0][0]).toBe(
       ['Review this', '--- Attached file: app.ts ---\nconst x = 1\n--- End of app.ts ---'].join('\n\n'),
     )
     expect(composer.findAll('.attachment-chip')).toHaveLength(0)

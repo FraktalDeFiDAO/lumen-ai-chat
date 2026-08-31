@@ -50,8 +50,8 @@ describe('chat store', () => {
     store.selectedModel = 'hermes/provider-a/model-a'
     await store.sendMessage('Hi')
     expect(store.activeConversation?.messages.map(message => message.content)).toEqual(['Hi', 'Hello there'])
-    const [, options] = fetchMock.mock.calls[0]!
-    expect(fetchMock.mock.calls[0]![0]).toBe('/api/chat')
+    const [, options] = fetchMock.mock.calls[0]
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/chat')
     expect(JSON.parse(options.body)).toEqual({ ai_coder: 'hermes', provider: 'provider-a', model: 'hermes/provider-a/model-a', temperature: 0.7, max_tokens: 4096, messages: [{ role: 'system', content: 'Respond in English. Use a balanced level of detail.' }, { role: 'user', content: 'Hi' }] })
   })
   it('saves the streamed answer, so a reload does not lose it', async () => {
@@ -65,8 +65,8 @@ describe('chat store', () => {
 
     const stored = JSON.parse(localStorage.getItem('lumen-conversations-v1') ?? '[]') as Array<{ title: string; messages: Array<{ role: string; content: string }> }>
     expect(stored).toHaveLength(1)
-    expect(stored[0]!.title).toBe('Remember me')
-    expect(stored[0]!.messages.map(message => message.content)).toEqual(['Remember me', 'Hello there'])
+    expect(stored[0].title).toBe('Remember me')
+    expect(stored[0].messages.map(message => message.content)).toEqual(['Remember me', 'Hello there'])
   })
   it('aborts safely without leaving an empty assistant response', async () => {
     vi.stubGlobal('fetch', vi.fn((_url: string, options: RequestInit) => new Promise((_resolve, reject) => {
@@ -157,7 +157,7 @@ describe('agent mode', () => {
     const store = useChatStore()
     await store.sendMessage('what is in notes.md?')
 
-    expect(fetchMock.mock.calls[0]![0]).toBe('/api/agent')
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/agent')
     const answer = store.activeConversation?.messages[1]
     expect(answer?.content).toBe('The note says forty-two.')
     expect(answer?.tools).toEqual([{ id: 'call_1', name: 'read_file', arguments: { path: 'notes.md' }, output: 'forty-two', failed: false }])

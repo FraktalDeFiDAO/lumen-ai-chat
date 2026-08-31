@@ -36,6 +36,7 @@ What holds the line instead:
 | Rule | Enforced by | Bypassable |
 | --- | --- | --- |
 | Every push and pull request is built and tested | `.github/workflows/ci.yml` | No |
+| A promotion is not rebuilt, because the commit was already built where it came from | `.github/workflows/ci.yml` skips it | n/a |
 | Promotions only go `dev → staging → main` | `.github/workflows/promotion.yml` | Only by merging without the check, which requires deliberate action |
 | A promoted commit already passed CI where it came from | `.github/workflows/promotion.yml` | Same |
 
@@ -44,6 +45,34 @@ promotion opens at the same moment the source branch starts building, so a singl
 look always lands before CI could have finished — and a gate that always fails the
 first time is one people learn to merge past. It gives up after 35 minutes.
 | No direct commits to `dev`, `staging` or `main` | `githooks/pre-push`, opt-in per clone | Yes, `--no-verify` |
+
+### Merging a pull request that touches `.github/workflows/`
+
+GitHub refuses this over the API unless the token carries the `workflow` scope:
+
+```
+refusing to allow an OAuth App to create or update workflow
+`.github/workflows/ci.yml` without `workflow` scope
+```
+
+`gh` is not granted it by default, so `gh pr merge` fails on exactly the pull
+requests that change how anything is built. Either grant it once —
+
+```bash
+gh auth refresh -s workflow
+```
+
+— or merge that one locally and push, which is the same commit by a different
+route:
+
+```bash
+git fetch origin refs/pull/<n>/head:pr-<n>
+git switch dev && git merge pr-<n>
+git push --no-verify origin dev     # --no-verify: the hook below, deliberately
+```
+
+The `--no-verify` is the case the hook was written to allow: a decision, not an
+accident.
 
 Install the local guard once per clone:
 

@@ -26,6 +26,11 @@ if (branch !== 'main') {
   console.error(`Releases are cut from main, not ${branch}.`)
   process.exit(1)
 }
+// Before anything is rewritten, so a refusal leaves the tree as it was.
+if (git('tag', '--list', `v${version}`)) {
+  console.error(`v${version} already exists. Delete it first if you mean to move it.`)
+  process.exit(1)
+}
 
 const packagePath = `${root}package.json`
 const manifest = JSON.parse(readFileSync(packagePath, 'utf8'))
@@ -52,7 +57,17 @@ execFileSync('cargo', ['update', '--workspace', '--offline'], {
 })
 
 git('add', 'package.json', 'backend/Cargo.toml', 'backend/Cargo.lock')
-git('commit', '-m', `chore: release ${version}`)
+
+// The manifests can already carry this version -- a first release, or a second
+// attempt after a tag was deleted. There is then nothing to commit, and `git
+// commit` treats that as an error. Tagging what is already correct is the whole
+// job in that case.
+if (git('diff', '--cached', '--name-only')) {
+  git('commit', '-m', `chore: release ${version}`)
+} else {
+  console.log(`The manifests already say ${version}; tagging without a commit.`)
+}
+
 git('tag', '-a', `v${version}`, '-m', `Release ${version}`)
 
 console.log(`\nTagged v${version}. Nothing has been pushed.`)

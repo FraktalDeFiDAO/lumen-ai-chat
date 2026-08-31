@@ -17,7 +17,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -131,7 +131,7 @@ impl HnswIndex {
                 slot: HashMap::new(),
             },
             snapshot,
-            rng: StdRng::from_entropy(),
+            rng: rand::make_rng::<StdRng>(),
         }
     }
 
@@ -161,8 +161,8 @@ impl HnswIndex {
     }
 
     fn random_level(&mut self) -> usize {
-        // gen() yields [0,1); 1.0 - r moves it to (0,1] so ln() is always finite.
-        let r: f64 = 1.0 - self.rng.gen::<f64>();
+        // random() yields [0,1); 1.0 - r moves it to (0,1] so ln() is always finite.
+        let r: f64 = 1.0 - self.rng.random::<f64>();
         let lvl = (-r.ln() * self.graph.config.ml).floor();
         if !lvl.is_finite() || lvl < 0.0 {
             0
@@ -507,7 +507,7 @@ impl HnswIndex {
         Ok(Self {
             graph,
             snapshot,
-            rng: StdRng::from_entropy(),
+            rng: rand::make_rng::<StdRng>(),
         })
     }
 
