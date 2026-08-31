@@ -26,6 +26,21 @@ The workflow in `.github/workflows/release.yml` builds both images from the
 tagged commit, runs the full gate against it, and publishes a GitHub release
 whose notes are the commit subjects since the previous tag.
 
+## Then merge it back down
+
+The version bump is a commit on `main`, and `dev` and `staging` do not have it.
+Leave it there and the next promotion quietly reverts the release: `staging`
+still says the old version, `staging → main` carries that backwards, and the
+tag stops matching the manifests it was cut from.
+
+```bash
+git switch dev && git merge main && git push origin dev
+```
+
+`staging` picks it up on the next `dev → staging`, so only one merge is needed.
+This is the same rule as a `hotfix/*`: anything that lands above `dev` has to
+come back down, or the branch it skipped will undo it.
+
 ## What is deliberately not automated
 
 **Publishing images to a registry.** There is no registry configured, and
