@@ -210,6 +210,9 @@ pub fn statuses(routes: &[CoderRoute]) -> Vec<CoderStatus> {
         .collect()
 }
 
+/// Run a coder and collect its whole answer.
+///
+/// The programmatic entry point, where there is nobody watching a screen.
 pub async fn execute(
     route: &CoderRoute,
     prompt: &str,
@@ -217,6 +220,40 @@ pub async fn execute(
     allow_writes: bool,
     timeout: Duration,
 ) -> Result<CoderExecution, CoderError> {
+    execute_streaming(route, prompt, workspace, allow_writes, timeout, |_| {}).await
+}
+
+/// Whether a coder's chosen output format can be read before it finishes.
+///
+/// Hermes writes prose to stdout, so every byte is answer. Codex, OpenCode and
+/// KiloCode emit one JSON object per line, so each completed line is an event.
+/// Claude is asked for `--output-format json`, which is a single object written
+/// at the end -- there is nothing to stream, and pretending otherwise would mean
+/// emitting half a JSON document as if it were prose.
+fn streams_incrementally(kind: CoderKind) -> bool {
+    !matches!(kind, CoderKind::Claude)
+}
+
+/// Run a coder, handing over its answer as it is written.
+///
+/// A coding agent takes minutes. Collecting everything and sending it at the end
+/// means a user watches nothing happen and then everything happen, which is the
+/// difference between a tool that feels alive and one that feels broken.
+///
+/// `on_text` receives the answer in pieces. What arrives is the same text the
+/// returned `CoderExecution` carries, so a caller can stream the pieces and
+/// store the whole.
+pub async fn execute_streaming<F>(
+    route: &CoderRoute,
+    prompt: &str,
+    workspace: &Path,
+    allow_writes: bool,
+    timeout: Duration,
+    on_text: F,
+) -> Result<CoderExecution, CoderError>
+where
+    F: FnMut(&str) + Send,
+{
     let isolated_workspace = if allow_writes {
         None
     } else {
@@ -245,12 +282,33 @@ pub async fn execute(
         coder: coder.clone(),
         message: error.to_string(),
     })?;
-    let stdout = child.stdout.take().expect("stdout is piped");
-    let stderr = child.stderr.take().expect("stderr is piped");
-    let stdout_task = tokio::spawn(read_limited(stdout, MAX_CODER_OUTPUT_BYTES));
-    let stderr_task = tokio::spawn(read_limited(stderr, MAX_CODER_ERROR_BYTES));
+    let stdout_pipe = child.stdout.take().expect("stdout is piped");
+    let stderr_pipe = child.stderr.take().expect("stderr is piped");
+    let stderr_task = tokio::spawn(read_limited(stderr_pipe, MAX_CODER_ERROR_BYTES));
 
-    let status = match tokio::time::timeout(timeout, child.wait()).await {
+    // Read to the end first, then wait. The timeout covers both, so a coder that
+    // stops writing but never exits is still killed.
+    let collected =
+        tokio::time::timeout(timeout, stream_stdout(stdout_pipe, route.kind, on_text)).await;
+
+    let stdout = match collected {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(())) => {
+            let _ = child.kill().await;
+            stderr_task.abort();
+            return Err(CoderError::OutputLimit { coder });
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            stderr_task.abort();
+            return Err(CoderError::Timeout {
+                coder,
+                seconds: timeout.as_secs(),
+            });
+        }
+    };
+
+    let status = match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
         Ok(Ok(status)) => status,
         Ok(Err(error)) => {
             return Err(CoderError::Failed {
@@ -260,7 +318,6 @@ pub async fn execute(
         }
         Err(_) => {
             let _ = child.kill().await;
-            stdout_task.abort();
             stderr_task.abort();
             return Err(CoderError::Timeout {
                 coder,
@@ -269,15 +326,6 @@ pub async fn execute(
         }
     };
 
-    let stdout = stdout_task
-        .await
-        .map_err(|error| CoderError::Failed {
-            coder: coder.clone(),
-            message: error.to_string(),
-        })?
-        .map_err(|_| CoderError::OutputLimit {
-            coder: coder.clone(),
-        })?;
     let stderr = stderr_task
         .await
         .map_err(|error| CoderError::Failed {
@@ -474,6 +522,94 @@ fn apply_clean_environment(command: &mut Command) {
         }
     }
     command.env("NO_COLOR", "1");
+}
+
+/// Read a coder's stdout, handing over whatever is answer as it arrives.
+///
+/// Returns everything read, so the caller can still normalise the whole output:
+/// the streamed pieces are for the person watching, the collected bytes are for
+/// the record.
+async fn stream_stdout<R, F>(reader: R, kind: CoderKind, mut on_text: F) -> Result<Vec<u8>, ()>
+where
+    R: AsyncRead + Unpin,
+    F: FnMut(&str),
+{
+    let mut reader = reader;
+    let mut collected: Vec<u8> = Vec::new();
+    let mut buffer = [0u8; 8192];
+    // Bytes handed over already, so a line-based coder does not repeat itself.
+    let mut emitted_upto = 0usize;
+
+    loop {
+        let read = reader.read(&mut buffer).await.map_err(|_| ())?;
+        if read == 0 {
+            break;
+        }
+        collected.extend_from_slice(&buffer[..read]);
+        if collected.len() > MAX_CODER_OUTPUT_BYTES {
+            return Err(());
+        }
+        if !streams_incrementally(kind) {
+            continue;
+        }
+
+        if kind == CoderKind::Hermes {
+            // Prose: every byte is answer.
+            let text = String::from_utf8_lossy(&buffer[..read]).into_owned();
+            if !text.is_empty() {
+                on_text(&text);
+            }
+            emitted_upto = collected.len();
+            continue;
+        }
+
+        // One JSON object per line: a line is an event only once it is whole.
+        while let Some(newline) = collected[emitted_upto..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+        {
+            let end = emitted_upto + newline;
+            let line = String::from_utf8_lossy(&collected[emitted_upto..end]).into_owned();
+            emitted_upto = end + 1;
+            if let Some(text) = text_from_line(&line)
+                && !text.is_empty()
+            {
+                on_text(&text);
+            }
+        }
+    }
+
+    // A coder that could not be streamed, or whose last line had no newline,
+    // still has to reach whoever is waiting.
+    if !streams_incrementally(kind) {
+        if let Some(text) = normalize_output(kind, &collected) {
+            on_text(&text);
+        }
+    } else if kind != CoderKind::Hermes && emitted_upto < collected.len() {
+        let line = String::from_utf8_lossy(&collected[emitted_upto..]).into_owned();
+        if let Some(text) = text_from_line(&line)
+            && !text.is_empty()
+        {
+            on_text(&text);
+        }
+    }
+
+    Ok(collected)
+}
+
+/// The answer inside one line of a coder's JSON output, if it carries one.
+fn text_from_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let value: Value = serde_json::from_str(trimmed).ok()?;
+    let mut candidates = Vec::new();
+    collect_candidates(&value, &mut candidates);
+    candidates
+        .into_iter()
+        .rev()
+        .find(|value| !value.trim().is_empty())
 }
 
 async fn read_limited<R: AsyncRead + Unpin>(reader: R, limit: usize) -> Result<Vec<u8>, ()> {
@@ -982,6 +1118,124 @@ real failure here
         assert_eq!(
             std::fs::read_to_string(copy.path().join("src/inner/deep.rs")).unwrap(),
             "fn deep() {}"
+        );
+    }
+
+    /// A coding agent takes minutes. Collecting all of its output and sending it
+    /// at the end means the user watches nothing happen and then everything
+    /// happen, which is the difference between a tool that feels alive and one
+    /// that feels broken.
+    #[tokio::test]
+    async fn a_coders_answer_arrives_while_it_is_still_being_written() {
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("slow-hermes");
+        std::fs::write(
+            &program,
+            "#!/bin/sh
+printf 'first '
+sleep 0.3
+printf 'second '
+sleep 0.3
+printf 'third'
+",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&program).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o700);
+        std::fs::set_permissions(&program, permissions).unwrap();
+
+        let route = CoderRoute {
+            kind: CoderKind::Hermes,
+            provider: "auto".into(),
+            provider_name: "Auto".into(),
+            model: "default".into(),
+            model_name: "Default".into(),
+            executable: program,
+        };
+
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, std::time::Duration)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let started = Instant::now();
+        let sink = std::sync::Arc::clone(&seen);
+
+        let execution = execute_streaming(
+            &route,
+            "go",
+            directory.path(),
+            true,
+            Duration::from_secs(20),
+            move |chunk: &str| {
+                sink.lock()
+                    .unwrap()
+                    .push((chunk.to_owned(), started.elapsed()));
+            },
+        )
+        .await
+        .unwrap();
+
+        let chunks = seen.lock().unwrap().clone();
+        assert!(
+            chunks.len() >= 2,
+            "the answer arrived in one piece: {chunks:?}"
+        );
+        assert!(
+            chunks[0].1 < execution_elapsed(&execution),
+            "the first chunk was not delivered before the run finished"
+        );
+        let streamed: String = chunks.iter().map(|(text, _)| text.as_str()).collect();
+        assert_eq!(streamed.trim(), "first second third");
+        assert_eq!(execution.output, "first second third");
+    }
+
+    fn execution_elapsed(execution: &CoderExecution) -> std::time::Duration {
+        Duration::from_millis(execution.duration_ms as u64)
+    }
+
+    /// A coder whose output is one JSON object at the end cannot be streamed,
+    /// and must still work.
+    #[tokio::test]
+    async fn a_coder_that_only_speaks_at_the_end_still_answers() {
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("claude-like");
+        std::fs::write(
+            &program,
+            "#!/bin/sh
+sleep 0.1
+printf '{\"result\":\"the whole answer\"}'
+",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&program).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o700);
+        std::fs::set_permissions(&program, permissions).unwrap();
+
+        let route = CoderRoute {
+            kind: CoderKind::Claude,
+            provider: "claude".into(),
+            provider_name: "Claude".into(),
+            model: "default".into(),
+            model_name: "Default".into(),
+            executable: program,
+        };
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let sink = std::sync::Arc::clone(&seen);
+        let execution = execute_streaming(
+            &route,
+            "go",
+            directory.path(),
+            true,
+            Duration::from_secs(20),
+            move |chunk: &str| sink.lock().unwrap().push_str(chunk),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(execution.output, "the whole answer");
+        assert_eq!(
+            seen.lock().unwrap().as_str(),
+            "the whole answer",
+            "the answer has to reach the caller even when it cannot be streamed"
         );
     }
 

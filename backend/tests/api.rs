@@ -1604,3 +1604,68 @@ async fn refusing_a_busy_agent_says_when_to_come_back_and_is_counted() {
     hold.notify_waiters();
     let _ = first.await;
 }
+
+/// Streaming a native coder, observed at the edge: the first frame has to reach
+/// the client while the coder is still writing, not after it has exited.
+#[tokio::test]
+async fn a_native_coder_streams_its_answer_as_it_is_written() {
+    use futures_util::StreamExt;
+
+    let workspace = tempfile::tempdir().unwrap();
+    let program = workspace.path().join("slow-coder");
+    std::fs::write(
+        &program,
+        "#!/bin/sh\nprintf 'thinking '\nsleep 0.6\nprintf 'and done'\n",
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&program).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o700);
+    std::fs::set_permissions(&program, permissions).unwrap();
+
+    let mut settings = config("127.0.0.1:1".parse().unwrap(), workspace.path());
+    settings.providers.clear();
+    settings.default_coder = "hermes".into();
+    settings.default_provider = "auto".into();
+    settings.coder_allow_writes = true;
+    settings.coders = vec![ai_chatbot_gateway::coders::CoderRoute {
+        kind: ai_chatbot_gateway::coders::CoderKind::Hermes,
+        provider: "auto".into(),
+        provider_name: "Auto".into(),
+        model: "default".into(),
+        model_name: "Default".into(),
+        executable: program,
+    }];
+
+    let started = std::time::Instant::now();
+    let response = build_api_router(settings)
+        .unwrap()
+        .oneshot(post_json(
+            "/chat",
+            json!({"messages": [{"role": "user", "content": "go"}]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut body = response.into_body().into_data_stream();
+    let mut first_frame_at = None;
+    let mut whole = String::new();
+    while let Some(chunk) = body.next().await {
+        let text = String::from_utf8_lossy(&chunk.unwrap()).into_owned();
+        if first_frame_at.is_none() && text.contains("thinking") {
+            first_frame_at = Some(started.elapsed());
+        }
+        whole.push_str(&text);
+    }
+
+    let first = first_frame_at.expect("the first half of the answer never arrived separately");
+    assert!(
+        first < Duration::from_millis(500),
+        "the first frame waited for the coder to finish: {first:?}"
+    );
+    assert!(
+        whole.contains("and done"),
+        "the rest never arrived: {whole}"
+    );
+    assert!(whole.trim_end().ends_with("data: [DONE]"), "{whole}");
+}
