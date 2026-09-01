@@ -2973,12 +2973,6 @@ fn json_error(status: StatusCode, kind: &str, message: impl Into<String>) -> Res
     )
         .into_response()
 }
-fn sse_text(text: &str) -> Response {
-    let body = format!("data: {}\n\ndata: [DONE]\n\n", openai_delta(text));
-    let mut response = Response::new(Body::from(body));
-    add_sse_headers(response.headers_mut());
-    response
-}
 fn sse_error(message: &str) -> Response {
     let body = format!("data: {}\n\ndata: [DONE]\n\n", error_payload(message));
     let mut response = Response::new(Body::from(body));
