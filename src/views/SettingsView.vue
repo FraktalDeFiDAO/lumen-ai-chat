@@ -7,7 +7,7 @@ import { useSettingsStore } from '@/stores/settings'
 
 const router = useRouter(); const chat = useChatStore(); const preferences = useSettingsStore()
 interface CoderStatus { id: string; name: string; status: 'installed_unverified' | 'unavailable'; route_count: number }
-interface HarnessStatus { workspace: string; writes_enabled: boolean; max_steps: number; tools: string[]; memory: { records: number; retrieved_per_turn: number } | null }
+interface HarnessStatus { workspace: string; writes_enabled: boolean; max_steps: number; tools: string[]; memory: { records: number; retrieved_per_turn: number; stale?: boolean } | null }
 const active = ref<'general' | 'coders' | 'harness' | 'appearance' | 'notifications' | 'data'>('general')
 const harness = ref<HarnessStatus | null>(null); const harnessError = ref(''); const indexing = ref(''); 
 const editing = ref(false); const draftName = ref(''); const draftEmail = ref('')
@@ -81,12 +81,12 @@ onMounted(() => { void loadCoders(); void loadHarness(); void chat.ensureHistory
             <h2>Tools</h2>
             <section class="settings-card stacked"><div class="harness-tools"><code v-for="tool in harness.tools" :key="tool">{{ tool }}</code></div><p class="agent-note">Workspace <strong>{{ harness.workspace }}</strong>, {{ harness.writes_enabled ? 'writable' : 'read-only' }}. Up to {{ harness.max_steps }} model turns per request.</p></section>
             <h2>Codebase index</h2>
-            <section class="settings-card"><div><Database :size="18" /><div><strong>{{ harness.memory ? `${harness.memory.records} indexed records` : 'Retrieval unavailable' }}</strong><p>{{ harness.memory ? `${harness.memory.retrieved_per_turn} records are retrieved before each request.` : 'Set AI_HARNESS_MEMORY_DIR to a writable path to enable codebase search.' }}</p></div></div><button class="secondary-button" :disabled="!harness.memory" @click="rebuildIndex"><RefreshCw :size="14" />Rebuild</button></section>
+            <section class="settings-card"><div><Database :size="18" /><div><strong>{{ harness.memory ? `${harness.memory.records} indexed records` : 'Retrieval unavailable' }}</strong><p>{{ harness.memory ? `${harness.memory.retrieved_per_turn} records are retrieved before each request.` : 'Set AI_HARNESS_MEMORY_DIR to a writable path to enable codebase search.' }}</p><p v-if="harness.memory?.stale" class="index-stale" role="status">The workspace has changed since this was built, so searches may return code that is no longer there. Rebuild to bring it up to date.</p></div></div><button class="secondary-button" :disabled="!harness.memory" @click="rebuildIndex"><RefreshCw :size="14" />Rebuild</button></section>
             <p v-if="indexing" class="agent-note">{{ indexing }}</p>
           </template>
         </template>
         <template v-else-if="active === 'appearance'"><h1>Appearance</h1><p class="settings-lead">Choose how Lumen looks on this device.</p><section class="settings-card stacked"><label><span><strong>Theme</strong><small>Follow your system or choose a theme.</small></span><select v-model="preferences.settings.theme" aria-label="Theme"><option>System</option><option>Light</option><option>Dark</option></select></label></section></template>
-        <template v-else-if="active === 'notifications'"><h1>Notifications</h1><p class="settings-lead">Control non-essential interface notifications.</p><section class="settings-card"><div><Bell :size="18" /><div><strong>Activity notifications</strong><p>Show helpful status and product notices.</p></div></div><label class="switch"><input v-model="preferences.settings.notifications" type="checkbox" /><span aria-hidden="true" /></label></section></template>
+        <template v-else-if="active === 'notifications'"><h1>Notifications</h1><p class="settings-lead">Control non-essential interface notifications.</p><section class="settings-card"><div><Bell :size="18" /><div><strong>Activity notifications</strong><p>Show helpful status and product notices.</p></div></div><label class="switch"><input v-model="preferences.settings.notifications" type="checkbox" aria-label="Activity notifications" /><span aria-hidden="true" /></label></section></template>
         <template v-else><h1>Data controls</h1><p class="settings-lead">Manage conversation data stored in this browser.</p><section class="settings-card"><div><Trash2 :size="18" /><div><strong>Delete all chats</strong><p>Permanently remove {{ chat.conversations.length }} saved conversation{{ chat.conversations.length === 1 ? '' : 's' }}.</p></div></div><button class="danger-button" :disabled="!chat.conversations.length" @click="clearHistory">Delete all</button></section></template>
       </main>
     </div>

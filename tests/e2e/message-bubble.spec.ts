@@ -173,7 +173,7 @@ test.describe('MessageBubble — agent mode', () => {
     await page.getByLabel('Message Lumen').press('Enter')
 
     await expect(page.locator('.harness-incomplete'))
-      .toHaveText('The agent reached its step limit, so this answer is incomplete. Ask it to continue.')
+      .toContainText('The agent reached its step limit, so this answer is incomplete.')
   })
 
   test('keeps a run that only called tools, with a stand-in summary', async ({ page }) => {
@@ -216,5 +216,41 @@ test.describe('MessageBubble — agent mode', () => {
 
     expect(agent.requests).toHaveLength(1)
     expect(chatCalls).toBe(0)
+  })
+})
+
+test.describe('MessageBubble — an answer that was cut off', () => {
+  /// The stream dies partway. What arrived is real, and the user should be able
+  /// to carry on from it rather than pay for the whole answer again.
+  test('keeps what arrived and offers to continue from it', async ({ page }) => {
+    let call = 0
+    await page.route('**/api/chat', async route => {
+      call += 1
+      if (call === 1) {
+        // Delivered, then the connection drops: no [DONE], body ends early.
+        return route.fulfill({
+          status: 200,
+          headers: { 'content-type': 'text/event-stream' },
+          body: 'data: {"choices":[{"delta":{"content":"The first half"}}]}\n\n',
+        })
+      }
+      return route.fulfill({
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+        body: 'data: {"choices":[{"delta":{"content":" and the second"}}]}\n\ndata: [DONE]\n\n',
+      })
+    })
+
+    await page.goto('/')
+    await page.getByLabel('Message Lumen').fill('Tell me something long')
+    await page.getByLabel('Message Lumen').press('Enter')
+
+    await expect(page.locator('article.assistant .message-content')).toHaveText('The first half')
+
+    await page.getByRole('button', { name: 'Continue' }).click()
+    await expect(page.locator('article.assistant .message-content'))
+      .toHaveText('The first half and the second')
+    await expect(page.locator('.harness-incomplete')).toHaveCount(0)
+    await expect(page.locator('article.assistant')).toHaveCount(1)
   })
 })

@@ -1346,3 +1346,48 @@ async fn a_secret_guards_the_conversations_a_forged_identity_would_have_reached(
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
+
+/// An index that has silently stopped matching the tree answers with code that
+/// is no longer there. The status endpoint says so rather than leaving a user to
+/// wonder why retrieval is wrong.
+#[tokio::test]
+async fn the_harness_reports_an_index_the_tree_has_moved_past() {
+    let workspace = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("notes.md"), "# One\n").unwrap();
+
+    let router = || {
+        let mut settings = configured("127.0.0.1:1".parse().unwrap(), workspace.path(), None);
+        settings.harness.memory_dir = Some(store.path().to_path_buf());
+        build_api_router(settings).unwrap()
+    };
+
+    let (status, body) = call(router(), post_json("/harness/index", json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (_, body) = call(
+        router(),
+        Request::builder()
+            .uri("/harness")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    let fresh: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(fresh["memory"]["stale"], false, "{body}");
+
+    // Somebody edits the tree without going through a tool.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    std::fs::write(workspace.path().join("notes.md"), "# One, revised\n").unwrap();
+
+    let (_, body) = call(
+        router(),
+        Request::builder()
+            .uri("/harness")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    let stale: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(stale["memory"]["stale"], true, "{body}");
+}

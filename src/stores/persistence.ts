@@ -199,9 +199,11 @@ function toStored(conversation: Conversation): StoredConversation {
     created_at: conversation.createdAt,
     updated_at: conversation.updatedAt,
     messages: conversation.messages
-      // A message that failed carries no answer worth keeping, and the error
-      // text is about this attempt rather than about the conversation.
-      .filter(message => !message.error)
+      // A failure with nothing in it carries no answer worth keeping. One that
+      // died partway does: the text arrived, was paid for, and is what the user
+      // would continue from. The error itself is about the attempt rather than
+      // the conversation, so it is not stored.
+      .filter(message => !message.error || !!message.content)
       .map(message => ({
         id: message.id,
         role: message.role,

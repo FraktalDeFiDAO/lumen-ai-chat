@@ -88,6 +88,18 @@ with real branch protection: require the `quality` check, require a review, and
 disallow force pushes. The workflow above is designed to survive that change
 without alteration.
 
+## Vocabulary and decisions
+
+[CONTEXT.md](CONTEXT.md) defines the terms this codebase uses precisely —
+*route*, *coder*, *provider*, *harness*, *tenancy*, *record*, *promotion*. Use
+them in commit messages and test names; a test called "the route resolves to a
+native coder" says more than one called "test routing 2".
+
+[docs/adr/](docs/adr/) records decisions that would otherwise be re-litigated.
+Read the ones covering an area before proposing to change it. If you disagree
+with one, that is worth doing — reopen it deliberately rather than working
+around it.
+
 ## Commits
 
 Conventional prefixes — `feat:`, `fix:`, `test:`, `chore:`, `docs:`, `refactor:`.
@@ -102,6 +114,7 @@ the reasoning. Several commits in this history exist mainly to record a decision
 
 ```bash
 npm run check:server   # rustfmt, clippy -D warnings, every Rust test
+npm run test:coverage  # what the unit tests reach; see the caveat below
 npm run lint           # eslint, type-aware
 npm run typecheck
 npm test               # vitest
@@ -119,6 +132,13 @@ the image builds locally before claiming a change is done:
 podman build -f Containerfile.backend -t lumen-ai-chat-api:dev .
 podman build -f Containerfile.frontend -t lumen-ai-chat-web:dev .
 ```
+
+`npm run test:coverage` measures the **unit** tests only. It reads around 65% of
+statements, and that number understates the real figure by a lot: the browser
+suites drive the same code through a real browser and are not instrumented. Treat
+it as a floor and a way to spot whole files nobody tests, not as a target to
+optimise. `npm run test:coverage:server` does the same for Rust and needs
+`cargo llvm-cov` installed.
 
 `npm run test:podman` needs a running Compose deployment and makes real calls
 through a real coder CLI. It is not in CI, and it costs whatever your provider

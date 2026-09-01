@@ -68,6 +68,81 @@ describe('chat store', () => {
     expect(stored[0].title).toBe('Remember me')
     expect(stored[0].messages.map(message => message.content)).toEqual(['Remember me', 'Hello there'])
   })
+  it('keeps a partial answer when the stream drops, and saves it', async () => {
+    // A stream that dies mid-answer has still produced an answer. Discarding it
+    // throws away tokens the user paid for and work they may want to continue.
+    const encoder = new TextEncoder()
+    // Pull-based on purpose: erroring a stream discards whatever is queued, so
+    // the chunk has to be delivered on one read and the failure raised on the
+    // next, which is what a connection dropping mid-answer actually looks like.
+    let delivered = false
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(new ReadableStream({
+      pull(controller) {
+        if (delivered) return controller.error(new Error('network dropped'))
+        delivered = true
+        controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"The first half"}}]}\n\n'))
+      },
+    }), { status: 200 })))
+
+    const store = useChatStore()
+    await store.sendMessage('Tell me something long')
+    await nextTick()
+
+    const assistant = store.activeConversation!.messages[1]
+    expect(assistant.content).toBe('The first half')
+    expect(assistant.error).toBeTruthy()
+    expect(assistant.incomplete).toBe(true)
+
+    const stored = JSON.parse(localStorage.getItem('lumen-conversations-v1') ?? '[]') as Array<{ messages: Array<{ content: string }> }>
+    expect(stored[0].messages.map(message => message.content))
+      .toEqual(['Tell me something long', 'The first half'])
+  })
+
+  it('continues a cut-off answer instead of throwing it away', async () => {
+    // Regenerating discards what arrived and pays for it again. Continuing sends
+    // the partial answer back and appends what comes next to the same message.
+    const store = useChatStore()
+    const conversation = store.createConversation('Tell me something long')
+    store.$patch(() => {
+      conversation.messages.push(
+        { id: 'm1', role: 'user', content: 'Tell me something long', createdAt: 1, feedback: null },
+        { id: 'm2', role: 'assistant', content: 'The first half', createdAt: 2, feedback: null, error: 'network dropped', incomplete: true },
+      )
+    })
+
+    const fetchMock = vi.fn().mockResolvedValue(sseResponse(['data: {"choices":[{"delta":{"content":" and the second"}}]}\n\ndata: [DONE]\n\n']))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await store.continueAnswer('m2')
+
+    const assistant = store.activeConversation!.messages[1]
+    expect(assistant.content).toBe('The first half and the second')
+    expect(assistant.incomplete).toBeFalsy()
+    expect(assistant.error).toBeFalsy()
+    expect(store.activeConversation!.messages).toHaveLength(2)
+
+    // The model has to see what it already said, or it cannot continue it.
+    const sent = JSON.parse(fetchMock.mock.calls[0][1].body) as { messages: Array<{ role: string; content: string }> }
+    expect(sent.messages.at(-1)).toEqual({ role: 'assistant', content: 'The first half' })
+  })
+
+  it('marks an answer incomplete when the stream ends without saying it finished', async () => {
+    // A proxy timing out mid-response usually just closes the connection. There
+    // is no error to catch: the body simply stops, and without [DONE] there is
+    // no way to tell a finished answer from a truncated one except its absence.
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(sseResponse([
+      'data: {"choices":[{"delta":{"content":"The first half"}}]}\n\n',
+    ])))
+
+    const store = useChatStore()
+    await store.sendMessage('Tell me something long')
+
+    const assistant = store.activeConversation!.messages[1]
+    expect(assistant.content).toBe('The first half')
+    expect(assistant.incomplete).toBe(true)
+    expect(assistant.error).toBeFalsy()
+  })
+
   it('aborts safely without leaving an empty assistant response', async () => {
     vi.stubGlobal('fetch', vi.fn((_url: string, options: RequestInit) => new Promise((_resolve, reject) => {
       options.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')))

@@ -1899,6 +1899,10 @@ async fn harness_status(State(state): State<AppState>, CurrentUser(user): Curren
         "memory": tenancy.memory.as_ref().map(|memory| json!({
             "records": memory.live_count(),
             "retrieved_per_turn": state.config.harness.memory_hits,
+            // An index the harness has not been told about has silently stopped
+            // describing the tree. Saying so is the difference between a stale
+            // answer and a wrong one.
+            "stale": !memory.is_fresh(),
         })),
         "tools": ToolRegistry::builtin(&context).names(),
     }))
