@@ -68,6 +68,28 @@ describe('AppSidebar', () => {
     expect(sidebar.findAll('.history-row')).toHaveLength(0)
   })
 
+  /// Someone looking for the chat where they discussed a thing searches for the
+  /// thing, not for whatever the first line happened to be.
+  it('finds a conversation by what was said in it, not just its title', async () => {
+    const store = useChatStore()
+    store.conversations = [
+      { ...conversation('a', 'Deployment notes', 2_000), messages: [
+        { id: 'm1', role: 'user', content: 'How do I roll back a release?', createdAt: 1, feedback: null },
+        { id: 'm2', role: 'assistant', content: 'Tag the previous commit.', createdAt: 2, feedback: null },
+      ] },
+      { ...conversation('b', 'Unrelated', 1_000), messages: [
+        { id: 'm3', role: 'user', content: 'What is for lunch?', createdAt: 1, feedback: null },
+      ] },
+    ]
+    const sidebar = await mountSidebar()
+
+    await sidebar.find('.search-input').setValue('roll back')
+    expect(sidebar.findAll('.history-open').map(row => row.text())).toEqual(['Deployment notes'])
+
+    await sidebar.find('.search-input').setValue('lunch')
+    expect(sidebar.findAll('.history-open').map(row => row.text())).toEqual(['Unrelated'])
+  })
+
   it('marks the conversation that is open', async () => {
     const store = useChatStore()
     store.conversations = [conversation('a', 'A', 2_000), conversation('b', 'B', 1_000)]

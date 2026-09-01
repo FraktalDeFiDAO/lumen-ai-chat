@@ -194,4 +194,30 @@ test.describe('SettingsView — agent harness', () => {
     await openSection(page, 'Agent harness')
     await expect(page.getByLabel('Agent mode')).toBeChecked()
   })
+
+  /// An index that has quietly stopped matching the tree returns code that is no
+  /// longer there. Nothing else would tell the user why an answer looks wrong.
+  test('says when the index has fallen behind the workspace', async ({ page }) => {
+    await mockJson(page, '**/api/harness', {
+      workspace: '/workspace', writes_enabled: false, max_steps: 12,
+      tools: ['read_file', 'search_memory'],
+      memory: { records: 120, retrieved_per_turn: 6, stale: true },
+    })
+    await openSection(page, 'Agent harness')
+
+    await expect(page.locator('.index-stale'))
+      .toContainText('The workspace has changed since this was built')
+    await expect(page.getByRole('button', { name: 'Rebuild' })).toBeEnabled()
+  })
+
+  test('says nothing when the index is current', async ({ page }) => {
+    await mockJson(page, '**/api/harness', {
+      workspace: '/workspace', writes_enabled: false, max_steps: 12,
+      tools: ['read_file', 'search_memory'],
+      memory: { records: 120, retrieved_per_turn: 6, stale: false },
+    })
+    await openSection(page, 'Agent harness')
+
+    await expect(page.locator('.index-stale')).toHaveCount(0)
+  })
 })

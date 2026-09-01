@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { MessageSquare, PanelLeftClose, Search, Settings, Sparkles, Trash2, Plus } from 'lucide-vue-next'
 import { useChatStore } from '@/stores/chat'
@@ -11,6 +11,21 @@ const store = useChatStore(); const preferences = useSettingsStore(); const rout
 function newChat() { store.selectConversation(null); void router.push('/'); emit('close') }
 function openChat(id: string) { store.selectConversation(id); void router.push(`/chat/${id}`); emit('close') }
 function removeChat(id: string) { store.deleteConversation(id); if (!store.activeId) void router.push('/') }
+
+/// Search what was said, not only what the conversation was called.
+///
+/// A title is the first 42 characters of the first message, so searching titles
+/// finds a conversation only if the thing you remember happened to be said at
+/// the very start of it. In the hosted deployment a transcript arrives only when
+/// its conversation is opened, so unopened ones are matched on title alone --
+/// which is the same behaviour as before rather than a regression.
+const matches = computed(() => {
+  const needle = query.value.trim().toLowerCase()
+  if (!needle) return store.sortedConversations
+  return store.sortedConversations.filter(chat =>
+    chat.title.toLowerCase().includes(needle)
+    || chat.messages.some(message => message.content.toLowerCase().includes(needle)))
+})
 </script>
 
 <template>
@@ -20,7 +35,7 @@ function removeChat(id: string) { store.deleteConversation(id); if (!store.activ
     <div class="px-3 pb-3"><button class="new-chat" @click="newChat"><Plus :size="17" /><span>New chat</span><kbd>⌘ K</kbd></button></div>
     <div class="relative mx-3 mb-3"><Search class="absolute left-3 top-2.5 text-stone-400" :size="15" /><input v-model="query" class="search-input" aria-label="Search conversations" placeholder="Search conversations" /></div>
     <div class="sidebar-scroll"><p class="section-label">Recent</p><div v-if="!store.sortedConversations.length" class="empty-history">Your conversations will appear here.</div>
-      <div v-for="chat in store.sortedConversations.filter(c => c.title.toLowerCase().includes(query.toLowerCase()))" :key="chat.id" :class="['history-row group', { active: chat.id === store.activeId }]">
+      <div v-for="chat in matches" :key="chat.id" :class="['history-row group', { active: chat.id === store.activeId }]">
         <button class="history-open" @click="openChat(chat.id)"><MessageSquare :size="15" class="shrink-0" /><span class="min-w-0 flex-1 truncate text-left">{{ chat.title }}</span></button><button class="row-delete" :aria-label="`Delete ${chat.title}`" @click="removeChat(chat.id)"><Trash2 :size="14" /></button>
       </div>
     </div>
