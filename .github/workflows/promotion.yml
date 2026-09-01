@@ -71,8 +71,18 @@ jobs:
           # always fails the first time is one people learn to merge past.
           deadline=$(( SECONDS + 2100 ))
           while true; do
+            # A poll that fails is not an answer. The API times out
+            # occasionally, and with `set -e` one hiccup used to end the whole
+            # wait and fail a promotion that was otherwise fine -- which teaches
+            # people to re-run the gate reflexively, and a gate nobody reads is
+            # not a gate.
             runs=$(gh api "repos/$REPO/actions/runs?head_sha=$SHA&per_page=100" \
-                     --jq '[.workflow_runs[] | select(.name == "CI")]')
+                     --jq '[.workflow_runs[] | select(.name == "CI")]' 2>/dev/null || true)
+            if ! jq -e 'type == "array"' >/dev/null 2>&1 <<<"${runs:-}"; then
+              echo "Could not reach the run history; trying again."
+              sleep 30
+              continue
+            fi
 
             if [[ $(jq 'map(select(.conclusion == "success")) | length' <<<"$runs") -gt 0 ]]; then
               echo "CI passed on $SHA."
