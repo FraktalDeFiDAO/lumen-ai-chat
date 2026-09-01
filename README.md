@@ -351,6 +351,17 @@ rather than as forbidden, and an id cannot be taken over by saving onto it.
 `GET /api/me` reports who the gateway thinks is asking and whether it keeps
 conversations; the client uses it to decide where to put them.
 
+One person may keep 1,000 conversations. The volume is shared, so an unbounded
+history is a denial of service against everyone else on it. Writing to a
+conversation that already exists always succeeds, so reaching the limit never
+freezes somebody out of the chat they are in the middle of.
+
+`GET /api/ready` opens the store rather than echoing configuration back, and
+answers `503` when it cannot. Compose gates the web container on it. Providers
+are deliberately not probed: they fail independently, and going unready because
+somebody else's API is slow would take down a service that can still answer from
+a native coder.
+
 - `GET /api/conversations` — history, summaries only
 - `GET /api/conversations/{id}` — one transcript
 - `PUT /api/conversations/{id}` — save one, replacing what was there

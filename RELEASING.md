@@ -41,6 +41,27 @@ git switch dev && git merge main && git push origin dev
 This is the same rule as a `hotfix/*`: anything that lands above `dev` has to
 come back down, or the branch it skipped will undo it.
 
+## Backing up the store
+
+The hosted deployment's volume holds the only copy of everyone's conversations.
+SQLite is not a file you can `cp` while it is being written -- a copy taken
+mid-transaction is a copy of a half-written database. Use SQLite's own backup,
+which is consistent against a live writer:
+
+```bash
+podman exec lumen-ai-chat-api \
+  sqlite3 /var/lib/lumen/conversations.db ".backup '/var/lib/lumen/backup.db'"
+podman cp lumen-ai-chat-api:/var/lib/lumen/backup.db ./conversations-$(date +%F).db
+```
+
+Restoring is the reverse, with the service stopped: replace the file, and delete
+any `-wal` and `-shm` beside it so SQLite does not replay a log belonging to the
+database you just removed.
+
+The per-user workspaces and indexes on the same volume are rebuildable -- an
+index from its workspace, a workspace from whatever the user put in it -- so the
+database is the part worth a schedule.
+
 ## What is deliberately not automated
 
 **Publishing images to a registry.** There is no registry configured, and

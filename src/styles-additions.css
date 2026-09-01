@@ -104,3 +104,14 @@
 
 .index-stale { margin:6px 0 0;color:#74563e;font-size:11px;line-height:1.45; }
 .theme-dark .index-stale { color:#e6c9a4; }
+
+.app-failure { display:flex;align-items:center;justify-content:center;min-height:100vh;padding:24px;background:#f7f7f5; }
+.app-failure > div { max-width:460px; }
+.app-failure h1 { margin:0 0 10px;color:#403e39;font-size:19px;font-weight:600; }
+.app-failure p { margin:0 0 8px;color:#615d56;font-size:13px;line-height:1.55; }
+.app-failure-detail { padding:8px 10px;border-radius:8px;background:#f0eee9;color:#615d56;font-family:ui-monospace,monospace;font-size:11px;word-break:break-word; }
+.app-failure-actions { display:flex;gap:8px;margin-top:16px; }
+.theme-dark .app-failure { background:#23221f; }
+.theme-dark .app-failure h1 { color:#eee; }
+.theme-dark .app-failure p { color:#b5b1a7; }
+.theme-dark .app-failure-detail { background:#302f2b;color:#b5b1a7; }

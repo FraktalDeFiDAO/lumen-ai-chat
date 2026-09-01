@@ -1391,3 +1391,65 @@ async fn the_harness_reports_an_index_the_tree_has_moved_past() {
     let stale: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(stale["memory"]["stale"], true, "{body}");
 }
+
+/// Readiness that only echoes configuration is not readiness. Compose gates the
+/// web container on this, so answering "ready" while the store is unopenable
+/// puts a broken deployment behind a healthy-looking front door.
+#[tokio::test]
+async fn readiness_reports_the_store_it_depends_on() {
+    let workspace = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let address = upstream().await;
+
+    let mut settings = configured(address, workspace.path(), None);
+    settings.store = StoreSettings {
+        path: Some(directory.path().join("conversations.db")),
+        required: true,
+        enabled: true,
+    };
+    let (status, body) = call(
+        build_api_router(settings).unwrap(),
+        Request::builder()
+            .uri("/ready")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let value: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["status"], "ready");
+    assert_eq!(value["store"], "ok", "{body}");
+}
+
+/// A deployment that keeps conversations in the browser has no store to check,
+/// and must not be called unhealthy for it.
+#[tokio::test]
+async fn readiness_is_content_without_a_store() {
+    let (status, body) = get_json("/ready").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "ready");
+    assert_eq!(body["store"], "disabled", "{body}");
+}
+
+/// Two requests must not share an id, or a shared log has no thread to pull.
+#[test]
+fn request_ids_are_unique_within_a_process() {
+    use std::collections::HashSet;
+    let ids: HashSet<String> = (0..5_000)
+        .map(|_| ai_chatbot_gateway::new_request_id())
+        .collect();
+    assert_eq!(ids.len(), 5_000, "request ids collided");
+}
+
+/// Short enough to read in a log line, and free of anything that would need
+/// quoting there.
+#[test]
+fn a_request_id_is_readable() {
+    let id = ai_chatbot_gateway::new_request_id();
+    assert!(id.len() <= 48, "{id} is too long to read in a log line");
+    assert!(
+        id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+        "{id} would need quoting in a log line"
+    );
+}
