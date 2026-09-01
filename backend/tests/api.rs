@@ -81,6 +81,7 @@ fn configured(address: SocketAddr, workspace: &Path, identity: Option<Identity>)
         coder_timeout: Duration::from_secs(30),
         coder_allow_writes: false,
         coder_max_concurrency: 2,
+        agent_max_concurrency: 2,
         workspace_mode: WorkspaceMode::Shared,
         quotas: Limits::default(),
         trusted_proxy: false,
@@ -1452,4 +1453,154 @@ fn a_request_id_is_readable() {
         id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
         "{id} would need quoting in a log line"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Agent concurrency
+// ---------------------------------------------------------------------------
+
+/// An upstream that holds its answer until told to let go, so a run can be
+/// observed while it is still in flight rather than after it has finished.
+async fn slow_upstream(hold: std::sync::Arc<tokio::sync::Notify>) -> SocketAddr {
+    async fn completions(
+        State(hold): State<std::sync::Arc<tokio::sync::Notify>>,
+        _body: String,
+    ) -> Response {
+        hold.notified().await;
+        Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\ndata: [DONE]\n\n",
+            ))
+            .unwrap()
+    }
+    let router = Router::new()
+        .route("/v1/chat/completions", post(completions))
+        .with_state(hold);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    address
+}
+
+/// A quota is a count over an hour. It says nothing about how many runs are in
+/// flight at once, and an agent run is a dozen model calls -- so ten users
+/// starting one together means ten loops competing for this process with no
+/// backpressure and no queue.
+#[tokio::test]
+async fn a_second_agent_run_is_refused_while_the_first_is_still_going() {
+    let workspace = tempfile::tempdir().unwrap();
+    let hold = std::sync::Arc::new(tokio::sync::Notify::new());
+    let address = slow_upstream(hold.clone()).await;
+
+    let mut settings = config(address, workspace.path());
+    settings.agent_max_concurrency = 1;
+    let router = build_api_router(settings).unwrap();
+
+    let first = tokio::spawn({
+        let router = router.clone();
+        async move {
+            call(
+                router,
+                post_json(
+                    "/agent",
+                    json!({"messages": [{"role": "user", "content": "go"}]}),
+                ),
+            )
+            .await
+        }
+    });
+
+    // Let the first run reach the upstream and block there.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let (status, body) = call(
+        router.clone(),
+        post_json(
+            "/agent",
+            json!({"messages": [{"role": "user", "content": "also go"}]}),
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    let refused: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(refused["error"]["type"], "agent_busy");
+
+    hold.notify_waiters();
+    let (first_status, _) = first.await.unwrap();
+    assert_eq!(
+        first_status,
+        StatusCode::OK,
+        "the first run should have been served"
+    );
+
+    // And once it is done, the next one is admitted again.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    hold.notify_waiters();
+    let (after, _) = call(
+        router,
+        post_json(
+            "/agent",
+            json!({"messages": [{"role": "user", "content": "again"}]}),
+        ),
+    )
+    .await;
+    assert_eq!(after, StatusCode::OK, "the slot was never given back");
+}
+
+#[tokio::test]
+async fn refusing_a_busy_agent_says_when_to_come_back_and_is_counted() {
+    let workspace = tempfile::tempdir().unwrap();
+    let hold = std::sync::Arc::new(tokio::sync::Notify::new());
+    let address = slow_upstream(hold.clone()).await;
+
+    let mut settings = config(address, workspace.path());
+    settings.agent_max_concurrency = 1;
+    let router = build_api_router(settings).unwrap();
+
+    let first = tokio::spawn({
+        let router = router.clone();
+        async move {
+            call(
+                router,
+                post_json(
+                    "/agent",
+                    json!({"messages": [{"role": "user", "content": "go"}]}),
+                ),
+            )
+            .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let response = router
+        .clone()
+        .oneshot(post_json(
+            "/agent",
+            json!({"messages": [{"role": "user", "content": "also go"}]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        response.headers().contains_key(header::RETRY_AFTER),
+        "a refusal a caller can retry should say when"
+    );
+
+    let (_, metrics) = call(
+        router,
+        Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        metrics.contains("lumen_agent_busy_rejections_total 1"),
+        "an operator cannot see the pressure: {metrics}"
+    );
+
+    hold.notify_waiters();
+    let _ = first.await;
 }

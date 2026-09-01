@@ -399,7 +399,14 @@ export AI_QUOTA_TOKENS_PER_WINDOW=2000000
 export AI_QUOTA_WINDOW_SECONDS=3600     # default: 3600
 ```
 
-Both are per user and off by default. A refusal is `429` with `Retry-After`, and
+Both are per user and off by default.
+
+A quota is a count over a window and says nothing about simultaneity. An agent
+run is a dozen model calls, each of which may execute tools, so a handful started
+together is real load on one process — `AI_AGENT_MAX_CONCURRENCY` bounds how many
+run at once across everyone, and a request that arrives with none free is refused
+with `503` and `Retry-After` rather than queued. The slot is held for the whole
+run and returned when it ends, including when it ends by failing. A refusal is `429` with `Retry-After`, and
 `GET /api/me` reports what the caller has spent. Tokens are counted only where a
 provider reports them — OpenAI-compatible providers are asked to include usage,
 Anthropic reports input and output separately, Gemini repeats a running total —
@@ -436,6 +443,7 @@ still cannot share a writable workspace.
 | `AI_QUOTA_REQUESTS_PER_WINDOW` | `0` (unlimited) | Requests one person may make per window |
 | `AI_QUOTA_TOKENS_PER_WINDOW` | `0` (unlimited) | Tokens one person may spend per window |
 | `AI_QUOTA_WINDOW_SECONDS` | `3600` | Window length, 60–86400 |
+| `AI_AGENT_MAX_CONCURRENCY` | `4` | Agent runs in flight at once, across everyone |
 | `AI_TRUSTED_PROXY` | off | Assert that a proxy authenticates in front |
 | `AI_IDENTITY_SHARED_SECRET` | unset | A value only the proxy knows; required off loopback |
 | `AI_IDENTITY_SECRET_HEADER` | `x-lumen-proxy-secret` | Header the secret arrives in |
