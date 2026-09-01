@@ -30,6 +30,10 @@ use thiserror::Error;
 const MAX_TITLE_CHARS: usize = 200;
 const MAX_MESSAGES_PER_CONVERSATION: usize = 2_000;
 const MAX_CONTENT_BYTES: usize = 1024 * 1024;
+/// Conversations one person may keep. The volume is shared, so an unbounded
+/// history is a denial of service against everyone else on it -- reachable
+/// from inside the trust boundary, by a client with a loop in it.
+const MAX_CONVERSATIONS_PER_USER: usize = 1_000;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -270,6 +274,20 @@ impl ConversationStore {
             ));
         }
 
+        // Counted after the upsert so that writing to a conversation that
+        // already exists always succeeds: reaching the cap must not freeze
+        // somebody out of the chat they are in the middle of.
+        let held: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM conversations WHERE user_id = ?1",
+            params![user],
+            |row| row.get(0),
+        )?;
+        if held > MAX_CONVERSATIONS_PER_USER as i64 {
+            return Err(StoreError::Invalid(format!(
+                "you have reached the limit of {MAX_CONVERSATIONS_PER_USER} conversations; delete some to make room"
+            )));
+        }
+
         transaction.execute(
             "DELETE FROM messages WHERE conversation_id = ?1",
             params![conversation.id],
@@ -321,6 +339,16 @@ impl ConversationStore {
             "DELETE FROM conversations WHERE user_id = ?1",
             params![user],
         )?)
+    }
+
+    /// Whether the store can still answer.
+    ///
+    /// Opening succeeded once, at startup. This asks whether that is still
+    /// true: a volume can be unmounted, truncated or corrupted underneath a
+    /// running process, and nothing else would notice until a user lost a
+    /// conversation.
+    pub fn is_usable(&self) -> bool {
+        self.total().is_ok()
     }
 
     /// Total conversations held, for the metrics endpoint. Not per user, and
@@ -617,6 +645,96 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+
+    /// The volume is shared. One person filling it is a denial of service
+    /// against everyone else, from inside the trust boundary.
+    #[test]
+    fn one_user_cannot_fill_the_volume_with_conversations() {
+        let store = store();
+        for index in 0..MAX_CONVERSATIONS_PER_USER {
+            store
+                .save(
+                    "riley",
+                    &conversation(&format!("c{index}"), "Kept", index as i64),
+                )
+                .unwrap();
+        }
+
+        let refused = store.save("riley", &conversation("one-too-many", "Refused", 1));
+        assert!(refused.is_err(), "the cap did not hold");
+        assert_eq!(
+            store.list("riley").unwrap().len(),
+            MAX_CONVERSATIONS_PER_USER
+        );
+    }
+
+    /// The cap is per person, so one user reaching it must not stop another
+    /// from starting their first conversation.
+    #[test]
+    fn one_users_cap_is_not_anothers() {
+        let store = store();
+        for index in 0..MAX_CONVERSATIONS_PER_USER {
+            store
+                .save(
+                    "riley",
+                    &conversation(&format!("c{index}"), "Kept", index as i64),
+                )
+                .unwrap();
+        }
+
+        assert!(
+            store
+                .save("sam", &conversation("sam-1", "First", 1))
+                .is_ok()
+        );
+    }
+
+    /// Updating a conversation that already exists is not a new one, and must
+    /// keep working at the cap -- otherwise reaching it would freeze the
+    /// conversation someone is in the middle of.
+    #[test]
+    fn a_user_at_the_cap_can_still_write_to_what_they_have() {
+        let store = store();
+        for index in 0..MAX_CONVERSATIONS_PER_USER {
+            store
+                .save(
+                    "riley",
+                    &conversation(&format!("c{index}"), "Kept", index as i64),
+                )
+                .unwrap();
+        }
+
+        let mut existing = conversation("c0", "Still writable", 99);
+        existing
+            .messages
+            .push(message("m3", StoredRole::User, "another"));
+        assert!(
+            store.save("riley", &existing).is_ok(),
+            "a user at the cap was frozen out of their own chat"
+        );
+    }
+
+    /// The case readiness exists for: the store opened at startup and has since
+    /// stopped answering. A volume can be unmounted, truncated or corrupted
+    /// under a running process, and nothing else would notice until somebody
+    /// lost a conversation.
+    #[test]
+    fn a_store_that_has_stopped_answering_says_so() {
+        let store = store();
+        assert!(store.is_usable());
+
+        // What a corrupted store looks like from in here: the schema is no
+        // longer the one every query is written against.
+        store
+            .lock()
+            .execute("DROP TABLE conversations", [])
+            .unwrap();
+
+        assert!(
+            !store.is_usable(),
+            "a broken store still reported itself usable"
+        );
+    }
 
     #[test]
     fn deleting_a_conversation_takes_its_messages_with_it() {
