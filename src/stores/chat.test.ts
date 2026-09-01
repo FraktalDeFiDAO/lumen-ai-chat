@@ -137,7 +137,7 @@ describe('chat store', () => {
     const store = useChatStore()
     await store.sendMessage('Tell me something long')
 
-    const assistant = store.activeConversation!.messages[1]!
+    const assistant = store.activeConversation!.messages[1]
     expect(assistant.content).toBe('The first half')
     expect(assistant.incomplete).toBe(true)
     expect(assistant.error).toBeFalsy()
