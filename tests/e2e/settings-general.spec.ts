@@ -110,7 +110,7 @@ test.describe('SettingsView — preferences and generation', () => {
     await page.goto('/settings')
 
     await page.getByLabel('Response style').selectOption('Concise')
-    await page.getByLabel('Language').selectOption('Spanish')
+    await page.getByLabel('Response language').selectOption('Spanish')
     await page.getByLabel('Temperature').fill('0.4')
     await page.getByLabel('Maximum output tokens').fill('2048')
     await page.getByLabel('Custom system instruction').fill('Prefer actionable answers.')
@@ -119,7 +119,7 @@ test.describe('SettingsView — preferences and generation', () => {
 
     await page.reload()
     await expect(page.getByLabel('Response style')).toHaveValue('Concise')
-    await expect(page.getByLabel('Language')).toHaveValue('Spanish')
+    await expect(page.getByLabel('Response language')).toHaveValue('Spanish')
     await expect(page.getByLabel('Temperature')).toHaveValue('0.4')
     await expect(page.getByLabel('Maximum output tokens')).toHaveValue('2048')
     await expect(page.getByLabel('Custom system instruction')).toHaveValue('Prefer actionable answers.')
@@ -262,5 +262,22 @@ test.describe('SettingsView — data controls', () => {
 
     await page.getByRole('button', { name: 'Delete all' }).click()
     await expect(page.getByText('Permanently remove 1 saved conversation.')).toBeVisible()
+  })
+})
+
+test.describe('SettingsView — saying what a setting does', () => {
+  /// The control offered three languages and its help text claimed the interface
+  /// followed. It never did: it only ever changed the system prompt. Claiming an
+  /// interface translation that does not exist is the one bug here a user can
+  /// see for themselves.
+  test('the language control promises only what it delivers', async ({ page }) => {
+    await page.goto('/settings')
+
+    await expect(page.getByText('The language Lumen answers in. The interface stays in English.')).toBeVisible()
+    await expect(page.getByText('Used for interface and response preferences.')).toHaveCount(0)
+
+    await page.getByLabel('Response language').selectOption('Spanish')
+    // The interface is still English, which is now what it said would happen.
+    await expect(page.getByRole('heading', { name: 'General', level: 1 })).toBeVisible()
   })
 })
