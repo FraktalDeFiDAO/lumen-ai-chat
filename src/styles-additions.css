@@ -101,3 +101,6 @@
 .theme-dark .harness-context { color:#b5b1a7; }
 .theme-dark .harness-incomplete { background:#3b332a;color:#e6c9a4; }
 .theme-dark .send-button { color:#b5b1a7; }
+
+.index-stale { margin:6px 0 0;color:#74563e;font-size:11px;line-height:1.45; }
+.theme-dark .index-stale { color:#e6c9a4; }

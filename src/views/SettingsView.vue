@@ -7,7 +7,7 @@ import { useSettingsStore } from '@/stores/settings'
 
 const router = useRouter(); const chat = useChatStore(); const preferences = useSettingsStore()
 interface CoderStatus { id: string; name: string; status: 'installed_unverified' | 'unavailable'; route_count: number }
-interface HarnessStatus { workspace: string; writes_enabled: boolean; max_steps: number; tools: string[]; memory: { records: number; retrieved_per_turn: number } | null }
+interface HarnessStatus { workspace: string; writes_enabled: boolean; max_steps: number; tools: string[]; memory: { records: number; retrieved_per_turn: number; stale?: boolean } | null }
 const active = ref<'general' | 'coders' | 'harness' | 'appearance' | 'notifications' | 'data'>('general')
 const harness = ref<HarnessStatus | null>(null); const harnessError = ref(''); const indexing = ref(''); 
 const editing = ref(false); const draftName = ref(''); const draftEmail = ref('')
@@ -81,7 +81,7 @@ onMounted(() => { void loadCoders(); void loadHarness(); void chat.ensureHistory
             <h2>Tools</h2>
             <section class="settings-card stacked"><div class="harness-tools"><code v-for="tool in harness.tools" :key="tool">{{ tool }}</code></div><p class="agent-note">Workspace <strong>{{ harness.workspace }}</strong>, {{ harness.writes_enabled ? 'writable' : 'read-only' }}. Up to {{ harness.max_steps }} model turns per request.</p></section>
             <h2>Codebase index</h2>
-            <section class="settings-card"><div><Database :size="18" /><div><strong>{{ harness.memory ? `${harness.memory.records} indexed records` : 'Retrieval unavailable' }}</strong><p>{{ harness.memory ? `${harness.memory.retrieved_per_turn} records are retrieved before each request.` : 'Set AI_HARNESS_MEMORY_DIR to a writable path to enable codebase search.' }}</p></div></div><button class="secondary-button" :disabled="!harness.memory" @click="rebuildIndex"><RefreshCw :size="14" />Rebuild</button></section>
+            <section class="settings-card"><div><Database :size="18" /><div><strong>{{ harness.memory ? `${harness.memory.records} indexed records` : 'Retrieval unavailable' }}</strong><p>{{ harness.memory ? `${harness.memory.retrieved_per_turn} records are retrieved before each request.` : 'Set AI_HARNESS_MEMORY_DIR to a writable path to enable codebase search.' }}</p><p v-if="harness.memory?.stale" class="index-stale" role="status">The workspace has changed since this was built, so searches may return code that is no longer there. Rebuild to bring it up to date.</p></div></div><button class="secondary-button" :disabled="!harness.memory" @click="rebuildIndex"><RefreshCw :size="14" />Rebuild</button></section>
             <p v-if="indexing" class="agent-note">{{ indexing }}</p>
           </template>
         </template>

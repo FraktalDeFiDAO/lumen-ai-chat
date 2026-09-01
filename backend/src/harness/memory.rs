@@ -12,6 +12,7 @@
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
+    time::SystemTime,
 };
 
 use harness_memory::{
@@ -53,6 +54,11 @@ pub struct IndexStats {
 pub struct HarnessMemory {
     inner: CodebaseMemory,
     root: PathBuf,
+    /// Where the index's own segments live. Their modification time is when the
+    /// index was last written, which survives a restart -- an in-process stamp
+    /// would not, and a service that had just come back would call every stale
+    /// index fresh.
+    store: PathBuf,
 }
 
 impl HarnessMemory {
@@ -67,11 +73,31 @@ impl HarnessMemory {
         Ok(Self {
             inner,
             root: root.to_path_buf(),
+            store: dir.to_path_buf(),
         })
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Whether the index still describes the tree.
+    ///
+    /// The harness reindexes what its own tools change, but a `git pull`, an
+    /// editor, or anything else outside it is invisible -- and an index that has
+    /// silently stopped matching answers with code that is no longer there.
+    /// Comparing the newest modification time under the root against when the
+    /// index was last written is cheap and catches every one of those.
+    pub fn is_fresh(&self) -> bool {
+        // Nothing indexed yet is empty rather than stale: saying stale would
+        // send someone to rebuild what does not exist.
+        if self.live_count() == 0 {
+            return true;
+        }
+        let Some(written) = newest_mtime(&self.store, |_| true) else {
+            return true;
+        };
+        newest_mtime(&self.root, indexable_extension).is_none_or(|changed| changed <= written)
     }
 
     pub fn live_count(&self) -> usize {
@@ -149,6 +175,18 @@ fn read_indexable(path: &Path) -> Option<String> {
         return None;
     }
     String::from_utf8(bytes).ok()
+}
+
+/// The newest modification time under `root`, among files `wanted` accepts.
+///
+/// Over the workspace it uses the same traversal policy as indexing, so a file
+/// the index ignores cannot make it look stale.
+fn newest_mtime(root: &Path, wanted: impl Fn(&Path) -> bool) -> Option<SystemTime> {
+    walk_files(root, MAX_INDEXED_FILES)
+        .into_iter()
+        .filter(|path| wanted(path))
+        .filter_map(|path| std::fs::metadata(&path).ok()?.modified().ok())
+        .max()
 }
 
 fn indexable_extension(path: &Path) -> bool {
@@ -427,6 +465,102 @@ fn symbol_name(tail: &str) -> Option<String> {
         .collect();
     let name = name.trim_end_matches(':').to_string();
     (!name.is_empty() && name.chars().next().is_some_and(|c| !c.is_numeric())).then_some(name)
+}
+
+#[cfg(test)]
+mod staleness_tests {
+    use super::*;
+
+    fn memory(root: &Path, store: &Path) -> HarnessMemory {
+        HarnessMemory::open(store, root).unwrap()
+    }
+
+    /// An index that has never been told a file changed will happily answer with
+    /// code that is no longer there. The harness reindexes what its own tools
+    /// touch, but a `git pull` or an editor is invisible to it -- and nothing
+    /// said so.
+    #[test]
+    fn an_index_knows_when_the_tree_has_moved_on_without_it() {
+        let workspace = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("notes.md"),
+            "# Retrieval\nthe passphrase is hunter2\n",
+        )
+        .unwrap();
+
+        let memory = memory(workspace.path(), store.path());
+        memory.index_workspace().unwrap();
+        assert!(memory.is_fresh(), "an index built just now is not stale");
+
+        // Somebody else edits the tree: a pull, an editor, anything not a tool.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(
+            workspace.path().join("notes.md"),
+            "# Retrieval\nthe passphrase was rotated\n",
+        )
+        .unwrap();
+
+        assert!(
+            !memory.is_fresh(),
+            "the index is answering from a file that has since changed"
+        );
+
+        memory.index_workspace().unwrap();
+        assert!(memory.is_fresh(), "reindexing did not settle it");
+    }
+
+    #[test]
+    fn a_new_file_makes_the_index_stale_too() {
+        let workspace = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("a.md"), "# One\n").unwrap();
+
+        let memory = memory(workspace.path(), store.path());
+        memory.index_workspace().unwrap();
+        assert!(memory.is_fresh());
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(workspace.path().join("b.md"), "# Two\n").unwrap();
+        assert!(
+            !memory.is_fresh(),
+            "a file nobody indexed left the index fresh"
+        );
+    }
+
+    /// The reason freshness is read off the index files rather than remembered:
+    /// a service that has just restarted has no memory of when it last indexed,
+    /// and must not therefore call every stale index fresh.
+    #[test]
+    fn a_restarted_service_still_knows_the_index_is_stale() {
+        let workspace = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("a.md"), "# One\n").unwrap();
+
+        memory(workspace.path(), store.path())
+            .index_workspace()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(workspace.path().join("a.md"), "# One, revised\n").unwrap();
+
+        // A completely new handle, as a restart would build.
+        let reopened = memory(workspace.path(), store.path());
+        assert!(
+            !reopened.is_fresh(),
+            "a reopened index forgot that the tree had moved on"
+        );
+    }
+
+    /// An index nobody has built yet is not stale, it is empty, and saying
+    /// "stale" would send a user to rebuild something that does not exist.
+    #[test]
+    fn an_index_that_was_never_built_is_not_called_stale() {
+        let workspace = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("a.md"), "# One\n").unwrap();
+
+        assert!(memory(workspace.path(), store.path()).is_fresh());
+    }
 }
 
 #[cfg(test)]
