@@ -142,6 +142,7 @@ fn config(address: SocketAddr, workspace: &std::path::Path) -> Config {
         coder_timeout: std::time::Duration::from_secs(30),
         coder_allow_writes: true,
         coder_max_concurrency: 2,
+        agent_max_concurrency: 2,
         workspace_mode: WorkspaceMode::Shared,
         quotas: Limits::default(),
         trusted_proxy: false,
