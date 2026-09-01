@@ -312,6 +312,18 @@ data: {"event":"outcome","text":"Lumen routes chat…","steps":2,"tool_calls":1,
 data: [DONE]
 ```
 
+Everything streams. A hosted provider's answer is forwarded token by token as it
+arrives, and a native coder's is forwarded as the CLI writes it — Hermes writes
+prose, so every byte goes straight out; Codex, OpenCode and KiloCode emit one
+JSON object per line, so each completed line is forwarded as it lands. Claude is
+asked for `--output-format json`, which is a single object written at the end:
+there is nothing to stream, and half a JSON document is not an answer, so that
+route arrives whole.
+
+It matters because a coding agent takes minutes. The difference between
+forwarding as it writes and collecting first is the difference between watching
+it work and watching a spinner.
+
 Open http://127.0.0.1:41789. The Rust API binds to http://127.0.0.1:41788 and Vite proxies `/api` to it.
 
 ## Identity and stored conversations
