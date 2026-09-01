@@ -129,7 +129,25 @@ describe('MessageBubble', () => {
   it('says when the harness stopped at its step limit', () => {
     const bubble = mountBubble({ incomplete: true })
     expect(bubble.find('.harness-incomplete').text())
-      .toBe('The agent reached its step limit, so this answer is incomplete. Ask it to continue.')
+      .toContain('The agent reached its step limit, so this answer is incomplete.')
     expect(mountBubble().find('.harness-incomplete').exists()).toBe(false)
+  })
+
+  /// Running out of steps and losing the connection both leave a half-finished
+  /// answer, and a user can act on either the same way -- but they are not the
+  /// same thing, and saying so would be wrong.
+  it('distinguishes an answer cut off by a dropped stream', () => {
+    const bubble = mountBubble({ incomplete: true, error: 'network dropped', content: 'The first half' })
+    expect(bubble.find('.harness-incomplete').text())
+      .toContain('This answer was cut off before it finished.')
+  })
+
+  it('offers to continue an unfinished answer, and cannot while one is running', async () => {
+    const bubble = mountBubble({ incomplete: true, content: 'The first half' })
+    await bubble.find('.continue-button').trigger('click')
+    expect(bubble.emitted('continue')).toEqual([['message-1']])
+
+    const busy = mountBubble({ incomplete: true, content: 'The first half' }, true)
+    expect(busy.find('.continue-button').attributes('disabled')).toBeDefined()
   })
 })

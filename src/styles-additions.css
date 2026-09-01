@@ -76,3 +76,9 @@
 .theme-dark .tool-activity pre,.theme-dark .harness-context,.theme-dark .agent-note { color:#aaa69c; }
 .theme-dark .harness-tools code { background:#3a3934;color:#ddd9d0; }
 .theme-dark .harness-incomplete { background:#3a352b;color:#d8c39c; }
+
+.harness-incomplete { display:flex;align-items:center;gap:10px;flex-wrap:wrap; }
+.continue-button { padding:3px 10px;border:1px solid #d8c3a5;border-radius:7px;background:white;color:#8a694e;font-size:11px;font-weight:500;cursor:pointer; }
+.continue-button:hover:not(:disabled) { background:#fbf6ee; }
+.continue-button:disabled { opacity:.5;cursor:default; }
+.theme-dark .continue-button { background:#3a3934;border-color:#5a5148;color:#e0c9a8; }

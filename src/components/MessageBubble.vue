@@ -3,7 +3,7 @@ import { ref } from 'vue'
 import { AlertCircle, Check, Clipboard, RotateCcw, ThumbsDown, ThumbsUp, Sparkles, Wrench } from 'lucide-vue-next'
 import type { Message } from '@/types/chat'
 const props = defineProps<{ message: Message; regenerating?: boolean }>()
-const emit = defineEmits<{ regenerate: [id: string]; feedback: [id: string, value: 'up' | 'down'] }>()
+const emit = defineEmits<{ regenerate: [id: string]; feedback: [id: string, value: 'up' | 'down']; continue: [id: string] }>()
 const copied = ref(false)
 async function copy() {
   try {
@@ -33,7 +33,7 @@ function summarize(value: unknown) {
         </details>
       </section>
       <div class="message-content">{{ message.content }}</div>
-      <p v-if="message.incomplete" class="harness-incomplete" role="status">The agent reached its step limit, so this answer is incomplete. Ask it to continue.</p>
+      <p v-if="message.incomplete" class="harness-incomplete" role="status">{{ message.error ? 'This answer was cut off before it finished.' : 'The agent reached its step limit, so this answer is incomplete.' }}<button type="button" class="continue-button" :disabled="regenerating" @click="emit('continue', message.id)">Continue</button></p>
       <p v-if="message.error" class="message-error" role="alert"><AlertCircle :size="15" />{{ message.error }}</p>
       <div v-if="message.role === 'assistant'" class="message-actions">
         <button type="button" :aria-label="copied ? 'Response copied' : 'Copy response'" @click="copy"><Check v-if="copied" :size="15" /><Clipboard v-else :size="15" /></button>
