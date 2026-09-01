@@ -102,6 +102,7 @@ the reasoning. Several commits in this history exist mainly to record a decision
 
 ```bash
 npm run check:server   # rustfmt, clippy -D warnings, every Rust test
+npm run test:coverage  # what the unit tests reach; see the caveat below
 npm run lint           # eslint, type-aware
 npm run typecheck
 npm test               # vitest
@@ -119,6 +120,13 @@ the image builds locally before claiming a change is done:
 podman build -f Containerfile.backend -t lumen-ai-chat-api:dev .
 podman build -f Containerfile.frontend -t lumen-ai-chat-web:dev .
 ```
+
+`npm run test:coverage` measures the **unit** tests only. It reads around 65% of
+statements, and that number understates the real figure by a lot: the browser
+suites drive the same code through a real browser and are not instrumented. Treat
+it as a floor and a way to spot whole files nobody tests, not as a target to
+optimise. `npm run test:coverage:server` does the same for Rust and needs
+`cargo llvm-cov` installed.
 
 `npm run test:podman` needs a running Compose deployment and makes real calls
 through a real coder CLI. It is not in CI, and it costs whatever your provider

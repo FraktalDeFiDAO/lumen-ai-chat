@@ -59,7 +59,7 @@ async function chooseFiles(event: Event) {
     <textarea ref="textarea" v-model="text" rows="1" aria-label="Message Lumen" placeholder="Message Lumen..." @input="resize" @keydown="keydown" />
     <div class="composer-actions">
       <div class="flex items-center gap-1">
-        <input ref="fileInput" class="sr-only" type="file" multiple accept="text/*,.md,.json,.csv,.ts,.tsx,.js,.jsx,.vue,.css,.html,.yaml,.yml,.py,.rs,.go,.java,.c,.cpp,.h,.sh,.sql,.toml" @change="chooseFiles" />
+        <input ref="fileInput" class="sr-only" type="file" aria-label="Choose text or code files to attach" multiple accept="text/*,.md,.json,.csv,.ts,.tsx,.js,.jsx,.vue,.css,.html,.yaml,.yml,.py,.rs,.go,.java,.c,.cpp,.h,.sh,.sql,.toml" @change="chooseFiles" />
         <button type="button" class="composer-icon" aria-label="Attach text or code files" @click="fileInput?.click()"><Paperclip :size="18" /></button>
         <label class="model-select-label"><span class="sr-only">AI coder, provider, and model</span><select :value="model" :disabled="!models.length" aria-label="AI coder, provider, and model" @change="emit('update:model', ($event.target as HTMLSelectElement).value)"><option v-if="!models.length" value="">{{ modelsError ? 'Models unavailable' : 'Loading models…' }}</option><optgroup v-for="group in groupedModels" :key="group.key" :label="group.label"><option v-for="item in group.models" :key="item.key" :value="item.key">{{ item.key }}</option></optgroup></select></label>
       </div>
