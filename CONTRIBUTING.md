@@ -43,7 +43,10 @@ What holds the line instead:
 | Promotions only go `dev → staging → main` | `.github/workflows/promotion.yml` | Only by merging without the check, which requires deliberate action |
 | A promoted commit already passed CI where it came from | `.github/workflows/promotion.yml` | Same |
 
-That second check waits for CI on the head commit rather than looking once. A
+That second check waits for CI on the head commit rather than looking once, and
+treats a failed poll as no answer rather than as a verdict — the API times out
+occasionally, and a gate that fails on that teaches people to re-run it without
+reading it. A
 promotion opens at the same moment the source branch starts building, so a single
 look always lands before CI could have finished — and a gate that always fails the
 first time is one people learn to merge past. It gives up after 35 minutes.
