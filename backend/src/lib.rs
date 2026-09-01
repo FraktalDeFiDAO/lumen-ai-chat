@@ -48,6 +48,10 @@ use tokio::sync::{Semaphore, mpsc};
 use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+/// Concurrent agent runs. Low on purpose: each is a loop of model calls holding
+/// a workspace and an index, and the failure mode of setting it high is a
+/// machine that stops answering anything.
+const DEFAULT_AGENT_CONCURRENCY: usize = 4;
 const MAX_MESSAGES: usize = 100;
 const MAX_CONTENT_BYTES: usize = 256 * 1024;
 const MAX_TOTAL_CONTENT_BYTES: usize = 768 * 1024;
@@ -203,6 +207,13 @@ pub struct Config {
     pub coder_timeout: Duration,
     pub coder_allow_writes: bool,
     pub coder_max_concurrency: usize,
+    /// Agent runs allowed to be in flight at once.
+    ///
+    /// A quota is a count over a window; it says nothing about simultaneity. An
+    /// agent run is a dozen model calls, each of which may execute tools, so a
+    /// handful started together is real load on one process with nothing between
+    /// it and the machine.
+    pub agent_max_concurrency: usize,
     /// Whether everyone shares one workspace or each user gets a subtree.
     pub workspace_mode: WorkspaceMode,
     /// What one person may spend. Unlimited unless configured.
@@ -573,6 +584,11 @@ impl Config {
             coder_timeout,
             coder_allow_writes: env_flag("AI_CODER_ALLOW_WRITES"),
             coder_max_concurrency,
+            agent_max_concurrency: env::var("AI_AGENT_MAX_CONCURRENCY")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|value| (1..=64).contains(value))
+                .unwrap_or(DEFAULT_AGENT_CONCURRENCY),
             harness,
             workspace_mode,
             trusted_proxy: env_flag("AI_TRUSTED_PROXY"),
@@ -904,6 +920,7 @@ struct AppState {
     config: Arc<Config>,
     client: Client,
     coder_slots: Arc<Semaphore>,
+    agent_slots: Arc<Semaphore>,
     metrics: Arc<AppMetrics>,
     /// Which files a given user is allowed to touch, and the index over them.
     workspaces: Arc<Workspaces>,
@@ -964,6 +981,7 @@ struct AppMetrics {
     agent_requests: AtomicU64,
     tool_calls: AtomicU64,
     coder_busy_rejections: AtomicU64,
+    agent_busy_rejections: AtomicU64,
     quota_rejections: AtomicU64,
     tokens_charged: AtomicU64,
 }
@@ -1026,6 +1044,7 @@ pub fn build_api_router(config: Config) -> Result<Router, BuildError> {
 fn gateway_state(config: Config) -> Result<AppState, BuildError> {
     config.validate()?;
     let coder_slots = Arc::new(Semaphore::new(config.coder_max_concurrency));
+    let agent_slots = Arc::new(Semaphore::new(config.agent_max_concurrency));
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .read_timeout(Duration::from_secs(120))
@@ -1058,6 +1077,7 @@ fn gateway_state(config: Config) -> Result<AppState, BuildError> {
         config: Arc::new(config),
         client,
         coder_slots,
+        agent_slots,
         metrics: Arc::new(AppMetrics::default()),
         workspaces: Arc::new(workspaces),
     };
@@ -1434,6 +1454,10 @@ async fn metrics(State(state): State<AppState>) -> Response {
             "lumen_quota_rejections_total {}\n",
             "# TYPE lumen_tokens_charged_total counter\n",
             "lumen_tokens_charged_total {}\n",
+            "# TYPE lumen_agent_busy_rejections_total counter\n",
+            "lumen_agent_busy_rejections_total {}\n",
+            "# TYPE lumen_agent_slots_available gauge\n",
+            "lumen_agent_slots_available {}\n",
             "# TYPE lumen_coder_busy_rejections_total counter\n",
             "lumen_coder_busy_rejections_total {}\n",
             "# TYPE lumen_coder_slots_available gauge\n",
@@ -1449,6 +1473,8 @@ async fn metrics(State(state): State<AppState>) -> Response {
         state.workspaces.live_records(),
         state.metrics.quota_rejections.load(Ordering::Relaxed),
         state.metrics.tokens_charged.load(Ordering::Relaxed),
+        state.metrics.agent_busy_rejections.load(Ordering::Relaxed),
+        state.agent_slots.available_permits(),
         state.metrics.coder_busy_rejections.load(Ordering::Relaxed),
         state.coder_slots.available_permits(),
         state.config.coders.len(),
@@ -1902,12 +1928,37 @@ async fn agent(
         Ok(tenancy) => tenancy,
         Err(rejection) => return rejection.into_response(),
     };
+
+    // Held for the whole run, not just its first turn. The permit moves into
+    // the task below so the slot comes back when the loop ends -- including
+    // when it ends by failing.
+    let Ok(permit) = Arc::clone(&state.agent_slots).try_acquire_owned() else {
+        state
+            .metrics
+            .agent_busy_rejections
+            .fetch_add(1, Ordering::Relaxed);
+        tracing::info!(user = user.id, "agent slots exhausted");
+        let mut response = json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "agent_busy",
+            "all agent slots are busy; try again shortly",
+        );
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+        return response;
+    };
+
     let metrics = Arc::clone(&state.metrics);
     let harness = state.harness_for(&tenancy);
     let (sender, mut receiver) = mpsc::unbounded_channel();
     // The run owns the sender, so the channel closes when the run ends and the
     // loop below terminates without needing a sentinel.
-    let run = tokio::spawn(async move { harness.run(request, Some(sender)).await });
+    let run = tokio::spawn(async move {
+        let outcome = harness.run(request, Some(sender)).await;
+        drop(permit);
+        outcome
+    });
 
     let output = stream! {
         while let Some(event) = receiver.recv().await {
@@ -2957,6 +3008,7 @@ mod tests {
             coder_timeout: Duration::from_secs(30),
             coder_allow_writes: false,
             coder_max_concurrency: 2,
+            agent_max_concurrency: 2,
             workspace_mode: WorkspaceMode::Shared,
             quotas: Limits::default(),
             trusted_proxy: false,
@@ -3045,6 +3097,7 @@ mod tests {
             coder_timeout: Duration::from_secs(5),
             coder_allow_writes: true,
             coder_max_concurrency: 1,
+            agent_max_concurrency: 1,
             workspace_mode: WorkspaceMode::Shared,
             quotas: Limits::default(),
             trusted_proxy: false,
@@ -3481,6 +3534,7 @@ mod tests {
             coder_timeout: Duration::from_secs(30),
             coder_allow_writes: false,
             coder_max_concurrency: 2,
+            agent_max_concurrency: 2,
             workspace_mode: WorkspaceMode::Shared,
             quotas: Limits::default(),
             trusted_proxy: false,
@@ -3647,6 +3701,7 @@ mod bind_tests {
             coder_timeout: Duration::from_secs(30),
             coder_allow_writes: false,
             coder_max_concurrency: 2,
+            agent_max_concurrency: 2,
             workspace_mode: WorkspaceMode::Shared,
             quotas: Limits::default(),
             trusted_proxy: false,
