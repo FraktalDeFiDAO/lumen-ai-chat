@@ -22,7 +22,7 @@ function blockData(block: string): string {
 
 /// Read an SSE body block by block. `onBlock` returns true when the stream is
 /// over, which is what `[DONE]` means on every endpoint this app talks to.
-async function readFrames(response: Response, onBlock: (block: string) => boolean) {
+async function readFrames(response: Response, onBlock: (block: string) => boolean): Promise<boolean> {
   if (!response.body) throw new Error('The server returned an empty response.')
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
@@ -39,7 +39,8 @@ async function readFrames(response: Response, onBlock: (block: string) => boolea
     if (done) break
   }
   // A stream cut off mid-frame still carries whatever the last block held.
-  if (buffer.trim() && !finished) onBlock(buffer)
+  if (buffer.trim() && !finished) finished = onBlock(buffer)
+  return finished
 }
 
 export function parseSSEBlock(block: string): { done: boolean; content: string; error?: string } {
@@ -57,8 +58,13 @@ export function parseSSEBlock(block: string): { done: boolean; content: string; 
   } catch { return { done: false, content: '' } }
 }
 
-export async function readSSE(response: Response, onContent: (content: string) => void) {
-  await readFrames(response, block => {
+/// Returns whether the stream said it had finished.
+///
+/// A body that simply stops is what a proxy timing out mid-response looks like:
+/// no error to catch, no way to tell a finished answer from a truncated one
+/// except that `[DONE]` never arrived.
+export async function readSSE(response: Response, onContent: (content: string) => void): Promise<boolean> {
+  return readFrames(response, block => {
     const event = parseSSEBlock(block)
     if (event.error) throw new Error(event.error)
     if (event.content) onContent(event.content)
@@ -97,8 +103,8 @@ export function parseHarnessBlock(block: string): { done: boolean; frame?: Harne
   } catch { return { done: false } }
 }
 
-export async function readHarnessSSE(response: Response, onFrame: (frame: HarnessFrame) => void) {
-  await readFrames(response, block => {
+export async function readHarnessSSE(response: Response, onFrame: (frame: HarnessFrame) => void): Promise<boolean> {
+  return readFrames(response, block => {
     const event = parseHarnessBlock(block)
     if (event.error) throw new Error(event.error)
     if (event.frame) onFrame(event.frame)
@@ -309,9 +315,20 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
-  async function generateAssistant(conversation: Conversation) {
+  /// Run the model and write its answer into `into`, or into a new message.
+  ///
+  /// Continuing passes the message that was cut off, so the text is appended to
+  /// what is already there rather than replacing it, and the transcript sent to
+  /// the model ends with the partial answer -- without which it has nothing to
+  /// continue from.
+  async function generateAssistant(conversation: Conversation, into?: Message) {
     if (isGenerating.value) return conversation.id
-    const assistant = addMessage(conversation, 'assistant', '')
+    const assistant = into ?? addMessage(conversation, 'assistant', '')
+    const continuing = into !== undefined
+    if (continuing) {
+      assistant.error = undefined
+      assistant.incomplete = undefined
+    }
     isGenerating.value = true
     controller = new AbortController()
     const currentController = controller
@@ -331,7 +348,11 @@ export const useChatStore = defineStore('chat', () => {
           max_tokens: preferences.settings.maxTokens,
           messages: [
             { role: 'system', content: systemPrompt },
-            ...conversation.messages.slice(0, -1).filter(message => !message.error).map(({ role, content }) => ({ role, content })),
+            ...conversation.messages
+              .slice(0, conversation.messages.indexOf(assistant))
+              .filter(message => !message.error || !!message.content)
+              .map(({ role, content }) => ({ role, content })),
+            ...(continuing ? [{ role: 'assistant' as const, content: assistant.content }] : []),
           ],
         }),
       })
@@ -344,21 +365,27 @@ export const useChatStore = defineStore('chat', () => {
         throw new Error(detail || `Request failed (${response.status})`)
       }
       if (agent) {
-        await readHarnessSSE(response, frame => { applyHarnessFrame(assistant, frame); conversation.updatedAt = Date.now() })
+        const finished = await readHarnessSSE(response, frame => { applyHarnessFrame(assistant, frame); conversation.updatedAt = Date.now() })
+        if (!finished) assistant.incomplete = true
         // A run that only called tools has no text, but it is not a failure --
         // the tools it ran are the answer, and they are on the message.
         if (!assistant.content && !assistant.tools?.length) throw new Error('The agent returned no response.')
         if (!assistant.content) assistant.content = 'No summary was returned; see the tool activity above.'
       } else {
-        await readSSE(response, chunk => { assistant.content += chunk; conversation.updatedAt = Date.now() })
+        const finished = await readSSE(response, chunk => { assistant.content += chunk; conversation.updatedAt = Date.now() })
         if (!assistant.content) throw new Error('The model returned no response.')
+        if (!finished) assistant.incomplete = true
       }
     } catch (error) {
       if (currentController.signal.aborted) {
         if (!assistant.content && !assistant.tools?.length) conversation.messages = conversation.messages.filter(message => message.id !== assistant.id)
       } else {
         assistant.error = error instanceof Error ? error.message : 'Something went wrong. Please try again.'
-        if (!assistant.content) assistant.content = 'Unable to generate a response.'
+        // A stream that died partway still produced an answer. Marking it
+        // incomplete rather than replacing it keeps the tokens the user paid
+        // for and gives them something to continue from.
+        if (assistant.content || assistant.tools?.length) assistant.incomplete = true
+        else assistant.content = 'Unable to generate a response.'
       }
     } finally {
       if (controller === currentController) {
@@ -379,6 +406,17 @@ export const useChatStore = defineStore('chat', () => {
     return generateAssistant(conversation)
   }
 
+  /// Ask the model to carry on from an answer that was cut off.
+  async function continueAnswer(messageId: string) {
+    if (isGenerating.value) return activeId.value
+    const conversation = activeConversation.value
+    const message = conversation?.messages.find(item => item.id === messageId)
+    if (!conversation || !message || message.role !== 'assistant' || !message.content) {
+      return activeId.value
+    }
+    return generateAssistant(conversation, message)
+  }
+
   async function regenerate(messageId?: string) {
     if (isGenerating.value) return activeId.value
     const conversation = activeConversation.value
@@ -397,5 +435,5 @@ export const useChatStore = defineStore('chat', () => {
     if (message) message.feedback = message.feedback === feedback ? null : feedback
   }
 
-  return { conversations, activeId, activeConversation, sortedConversations, isGenerating, models, selectedModel, modelsError, historyError, backend, loadHistory, ensureHistory, ensureLoaded, flush, createConversation, selectConversation, deleteConversation, clearAll, sendMessage, stopGenerating, regenerate, setFeedback, loadModels }
+  return { conversations, activeId, activeConversation, sortedConversations, isGenerating, models, selectedModel, modelsError, historyError, backend, loadHistory, ensureHistory, ensureLoaded, flush, createConversation, selectConversation, deleteConversation, clearAll, sendMessage, stopGenerating, regenerate, continueAnswer, setFeedback, loadModels }
 })
