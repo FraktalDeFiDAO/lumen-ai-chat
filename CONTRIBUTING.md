@@ -88,6 +88,18 @@ with real branch protection: require the `quality` check, require a review, and
 disallow force pushes. The workflow above is designed to survive that change
 without alteration.
 
+## Vocabulary and decisions
+
+[CONTEXT.md](CONTEXT.md) defines the terms this codebase uses precisely —
+*route*, *coder*, *provider*, *harness*, *tenancy*, *record*, *promotion*. Use
+them in commit messages and test names; a test called "the route resolves to a
+native coder" says more than one called "test routing 2".
+
+[docs/adr/](docs/adr/) records decisions that would otherwise be re-litigated.
+Read the ones covering an area before proposing to change it. If you disagree
+with one, that is worth doing — reopen it deliberately rather than working
+around it.
+
 ## Commits
 
 Conventional prefixes — `feat:`, `fix:`, `test:`, `chore:`, `docs:`, `refactor:`.
