@@ -862,6 +862,22 @@ fn optional_header(key: &str, fallback: Option<String>) -> Option<String> {
     }
 }
 
+/// A short, unique-enough id for one request.
+///
+/// Not a UUID: this identifies a line in a log for as long as somebody is
+/// reading it, and pulling in a dependency to make it prettier would be the
+/// wrong trade. Time plus a counter cannot collide within a process, and the
+/// process id separates two of them.
+pub fn new_request_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+    let micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_micros() as u64);
+    format!("{:x}-{:x}-{n:x}", std::process::id(), micros)
+}
+
 fn env_flag(name: &str) -> bool {
     env::var(name).ok().is_some_and(|value| {
         matches!(
@@ -985,7 +1001,26 @@ pub fn build_api_router(config: Config) -> Result<Router, BuildError> {
         .with_state(state)
         .layer(DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES))
-        .layer(TraceLayer::new_for_http()))
+        // Every line a request produces carries the same id, and the caller
+        // gets it back. Without that, "my agent run failed" cannot be turned
+        // into the lines that describe it -- a shared log has no thread to pull.
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
+                let id = request
+                    .headers()
+                    .get("x-request-id")
+                    .and_then(|value| value.to_str().ok())
+                    .filter(|value| !value.is_empty() && value.len() <= 128)
+                    .map(str::to_owned)
+                    .unwrap_or_else(new_request_id);
+                tracing::info_span!(
+                    "request",
+                    method = %request.method(),
+                    path = %request.uri().path(),
+                    request_id = %id,
+                )
+            }),
+        ))
 }
 
 fn gateway_state(config: Config) -> Result<AppState, BuildError> {
@@ -1352,12 +1387,37 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
         "coder_count": state.config.coders.len()
     }))
 }
-async fn ready(State(state): State<AppState>) -> Json<Value> {
-    Json(json!({
-        "status": "ready",
+/// Whether this instance can serve.
+///
+/// Compose gates the web container on this, so echoing configuration back was
+/// worse than useless: it put a broken deployment behind a healthy-looking
+/// front door. The store is the one dependency whose loss is silent -- a volume
+/// can be unmounted or truncated under a running process -- so it is the one
+/// this asks about.
+///
+/// Providers are deliberately not probed. They are remote, they fail
+/// independently, and a readiness check that goes unready because somebody
+/// else's API is slow takes down a service that could still answer from a
+/// native coder.
+async fn ready(State(state): State<AppState>) -> Response {
+    let store = match &state.store {
+        None => "disabled",
+        Some(store) if store.is_usable() => "ok",
+        Some(_) => "failing",
+    };
+    let healthy = store != "failing";
+    let body = Json(json!({
+        "status": if healthy { "ready" } else { "unavailable" },
+        "store": store,
         "default_ai_coder": state.config.default_coder,
         "default_provider": state.config.default_provider,
-    }))
+    }));
+    if healthy {
+        body.into_response()
+    } else {
+        tracing::error!("the conversation store has stopped answering; reporting unready");
+        (StatusCode::SERVICE_UNAVAILABLE, body).into_response()
+    }
 }
 async fn metrics(State(state): State<AppState>) -> Response {
     let body = format!(
