@@ -513,6 +513,7 @@ surfaced as an unhandled rejection.
 | `tests/contract/config-guards.test.mjs` | `node --test` | That naming a local model does not by itself enable local inference, and that `OLLAMA_ENABLED` does |
 | `tests/contract/provider-contract.test.mjs` | `node --test` | The service surface, the model catalog, a streamed answer from each of the five CLI adapters and all four hosted protocols, route conflicts, and the harness driving its own loop over every protocol and delegating to a native coder |
 | `tests/e2e/*.spec.ts` | Playwright | The browser, below |
+| `tests/e2e/accessibility.spec.ts` | Playwright + axe | WCAG 2 A and AA across both themes, every settings section, agent output, and keyboard reachability |
 | `tests/hosted/*.spec.ts` | Playwright | The server-backed deployment, against a second stack with a store and proxy identity: history surviving a browser that remembers nothing, following the person rather than the machine, and never crossing between two people |
 
 `npm run test:podman` runs `tests/podman/podman-smoke.spec.ts` against a Compose deployment you already have running — production images, hardened containers, and a real Hermes invocation rather than a mock. It is the only suite that is not mocked, which is why it is a separate config with its own timeouts.

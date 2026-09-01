@@ -148,19 +148,39 @@ describe('ServerBackend', () => {
     expect(body.messages[0].extra).toBeUndefined()
   })
 
-  /// A failed attempt is about this request, not about the conversation; saving
-  /// it would resurrect the error on every later read.
-  it('does not store a message that failed', async () => {
+  /// A failure with nothing in it is about this request, not the conversation;
+  /// saving it would resurrect the error on every later read.
+  it('does not store a failure that produced nothing', async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, {}))
     vi.stubGlobal('fetch', fetchMock)
 
     const withFailure = conversation('c1', 'Failed')
     withFailure.messages[1].error = 'upstream refused'
+    withFailure.messages[1].content = ''
     await new ServerBackend().save(withFailure)
 
     const body = JSON.parse(fetchMock.mock.calls[0][1].body)
     expect(body.messages).toHaveLength(1)
     expect(body.messages[0].role).toBe('user')
+  })
+
+  /// A failure that arrived partway is different: the text is real, the user
+  /// paid for it, and it is what they would continue from.
+  it('stores a failure that produced a partial answer, without the error', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, {}))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const partial = conversation('c1', 'Cut short')
+    partial.messages[1].error = 'network dropped'
+    partial.messages[1].content = 'The first half'
+    partial.messages[1].incomplete = true
+    await new ServerBackend().save(partial)
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body)
+    expect(body.messages).toHaveLength(2)
+    expect(body.messages[1].content).toBe('The first half')
+    expect(body.messages[1].extra.incomplete).toBe(true)
+    expect(JSON.stringify(body)).not.toContain('network dropped')
   })
 
   it('escapes an id that would otherwise change the path', async () => {

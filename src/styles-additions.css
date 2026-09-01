@@ -10,16 +10,16 @@
 .overflow-menu { position:absolute; z-index:30; top:43px; right:0; min-width:155px; padding:6px; border:1px solid #e2dfd8; border-radius:10px; background:white; box-shadow:0 10px 28px rgb(0 0 0 / .10); color:#65635d; font-size:12px; }
 .overflow-menu button { width:100%; display:flex; align-items:center; gap:8px; padding:8px; border:0; border-radius:7px; background:transparent; color:#a43d31; text-align:left; }
 .overflow-menu button:hover { background:#f5ece8; }
-.overflow-menu span { display:block; padding:7px; color:#99958d; }
-.share-status { color:#77736c; font-size:11px; }
+.overflow-menu span { display:block; padding:7px; color:#615d56; }
+.share-status { color:#615d56; font-size:11px; }
 .attachment-list { display:flex; flex-wrap:wrap; gap:6px; padding:1px 0 7px; }
 .attachment-chip { max-width:235px; display:flex; align-items:center; gap:6px; padding:5px 6px 5px 8px; border:1px solid #e1ddd5; border-radius:8px; background:#f6f4ef; color:#5d5a54; font-size:11px; }
 .attachment-chip>span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.attachment-chip button { display:grid; width:20px; height:20px; flex:none; place-items:center; padding:0; border:0; border-radius:5px; background:transparent; color:#89857d; }
+.attachment-chip button { display:grid; width:20px; height:20px; flex:none; place-items:center; padding:0; border:0; border-radius:5px; background:transparent; color:#615d56; }
 .attachment-chip button:hover { background:#e4e0d8;color:#333; }
 .composer-error { margin:0 0 4px; color:#a43d31; font-size:11px; }
 .model-warning { margin:0 0 5px;color:#8a694e;font-size:10px; }
-.model-select-label select { max-width:260px; height:31px; padding:0 24px 0 8px; border:0; border-radius:8px; background:transparent; color:#77746d; font-size:11px; }
+.model-select-label select { max-width:260px; height:31px; padding:0 24px 0 8px; border:0; border-radius:8px; background:transparent; color:#615d56; font-size:11px; }
 .model-select-label select:hover:not(:disabled) { background:#f0efeb;color:#45433e; }
 .model-select-label select:disabled { opacity:.7; }
 .send-button:disabled { cursor:default; }
@@ -29,8 +29,8 @@
 .coder-status>span:first-child { display:flex;flex-direction:column;gap:3px; }
 .status-pill { padding:4px 8px;border-radius:999px;font-size:10px;font-weight:650;white-space:nowrap; }
 .status-pill.installed_unverified { background:#e6f1e8;color:#356544; }
-.status-pill.unavailable { background:#efede8;color:#77736b; }
-.coder-safety,.coder-error { color:#77736b;font-size:12px;line-height:1.5; }
+.status-pill.unavailable { background:#efede8;color:#615d56; }
+.coder-safety,.coder-error { color:#615d56;font-size:12px;line-height:1.5; }
 .coder-error { color:#a43d31; }
 .message-actions { opacity:1; }
 .message-actions button.selected { background:#eee1d9;color:#a65333; }
@@ -53,21 +53,21 @@
 .theme-dark { background:#23221f;color:#eee; }.theme-dark .settings-header,.theme-dark .settings-card { background:#302f2b;border-color:#45433d; }.theme-dark .settings-layout nav button { color:#bdb9af; }.theme-dark .settings-layout nav button.active,.theme-dark .settings-layout nav button:hover { background:#3a3934;color:white; }.theme-dark .settings-lead,.theme-dark .settings-card p,.theme-dark .settings-card small { color:#aaa69c; }.theme-dark .settings-card select,.theme-dark .profile-form input,.theme-dark .number-input,.theme-dark .system-prompt-row textarea { background:#292824;border-color:#4b4942;color:#eee; }
 .theme-dark .app-shell,.theme-dark .main-panel,.theme-dark .welcome-composer,.theme-dark .conversation-composer { background:#23221f; }
 .theme-dark .sidebar { background:#292824;border-color:#403e38; }.theme-dark .brand,.theme-dark .profile-row strong { color:#f0eee8; }.theme-dark .new-chat,.theme-dark .composer-shell { background:#302f2b;border-color:#4a4841;color:#eee; }.theme-dark .search-input,.theme-dark .history-row,.theme-dark .profile-row { color:#bdb9af; }.theme-dark .search-input:hover,.theme-dark .search-input:focus,.theme-dark .history-row:hover,.theme-dark .history-row.active,.theme-dark .profile-row:hover { background:#393833;color:#fff; }.theme-dark .sidebar-footer,.theme-dark .topbar { border-color:#403e38; }.theme-dark .topbar { background:rgb(35 34 31 / .9);color:#eee; }.theme-dark .icon-button:hover { background:#3a3934;color:#fff; }
-.theme-dark .welcome h1,.theme-dark .message-content { color:#eee; }.theme-dark .welcome-inner>p,.theme-dark .disclaimer { color:#99958d; }.theme-dark .suggestion-card { background:#2d2c28;border-color:#46443e; }.theme-dark .suggestion-card:hover { background:#34332e;border-color:#5a574f; }.theme-dark .suggestion-card strong { color:#e5e2da; }.theme-dark .composer-shell textarea { color:#eee; }.theme-dark .model-select-label select,.theme-dark .composer-icon { color:#b7b3aa; }.theme-dark .message.user .message-body { background:#3a3934;color:#eee; }.theme-dark .message-actions button:hover,.theme-dark .model-select-label select:hover:not(:disabled),.theme-dark .composer-icon:hover { background:#3b3934;color:#fff; }.theme-dark .attachment-chip { background:#3a3934;border-color:#504e47;color:#ddd9d0; }.theme-dark .overflow-menu { background:#302f2b;border-color:#4a4841; }.theme-dark .settings-page { background:#23221f;color:#eee; }
+.theme-dark .welcome h1,.theme-dark .message-content { color:#eee; }.theme-dark .welcome-inner>p,.theme-dark .disclaimer { color:#b5b1a7; }.theme-dark .suggestion-card { background:#2d2c28;border-color:#46443e; }.theme-dark .suggestion-card:hover { background:#34332e;border-color:#5a574f; }.theme-dark .suggestion-card strong { color:#e5e2da; }.theme-dark .composer-shell textarea { color:#eee; }.theme-dark .model-select-label select,.theme-dark .composer-icon { color:#b7b3aa; }.theme-dark .message.user .message-body { background:#3a3934;color:#eee; }.theme-dark .message-actions button:hover,.theme-dark .model-select-label select:hover:not(:disabled),.theme-dark .composer-icon:hover { background:#3b3934;color:#fff; }.theme-dark .attachment-chip { background:#3a3934;border-color:#504e47;color:#ddd9d0; }.theme-dark .overflow-menu { background:#302f2b;border-color:#4a4841; }.theme-dark .settings-page { background:#23221f;color:#eee; }
 .theme-dark .coder-status { border-color:#45433d; }.theme-dark .status-pill.installed_unverified { background:#294333;color:#a9dbb7; }.theme-dark .status-pill.unavailable { background:#3a3934;color:#aaa69c; }.theme-dark .coder-safety { color:#aaa69c; }
 @media (max-width:640px){.settings-layout nav{display:flex;flex-direction:row;overflow-x:auto;margin-bottom:24px}.settings-layout nav button{flex:none}.profile-form{grid-template-columns:1fr}.profile-card{align-items:flex-start;flex-direction:column}.settings-card{align-items:flex-start}.share-status{display:none}.model-select-label select{max-width:180px}}
 
-.harness-context { margin:0 0 8px;color:#77736b;font-size:11px; }
-.harness-incomplete { margin:9px 0 0;padding:8px 10px;border-radius:8px;background:#f7f0e4;color:#8a694e;font-size:12px; }
+.harness-context { margin:0 0 8px;color:#615d56;font-size:11px; }
+.harness-incomplete { margin:9px 0 0;padding:8px 10px;border-radius:8px;background:#f7f0e4;color:#74563e;font-size:12px; }
 .tool-activity { display:flex;flex-direction:column;gap:5px;margin:0 0 10px; }
 .tool-activity details { border:1px solid #e4e0d8;border-radius:8px;background:#faf9f6;font-size:11px; }
 .tool-activity details.failed { border-color:#e6c9c2;background:#fbefec; }
 .tool-activity summary { display:flex;align-items:center;gap:7px;padding:7px 9px;cursor:pointer;color:#6d6962; }
 .tool-activity summary strong { color:#45433e;font-weight:650; }
-.tool-activity summary span { flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:ui-monospace,SFMono-Regular,monospace;color:#8a867e; }
+.tool-activity summary span { flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:ui-monospace,SFMono-Regular,monospace;color:#615d56; }
 .tool-activity summary em { font-style:normal;color:#a43d31;font-weight:650; }
 .tool-activity pre { max-height:260px;overflow:auto;margin:0;padding:0 9px 9px;font-family:ui-monospace,SFMono-Regular,monospace;font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-word;color:#55524c; }
-.agent-note { margin:0;color:#77736b;font-size:12px;line-height:1.5; }
+.agent-note { margin:0;color:#615d56;font-size:12px;line-height:1.5; }
 .harness-tools { display:flex;flex-wrap:wrap;gap:6px; }
 .harness-tools code { padding:3px 7px;border-radius:999px;background:#f0efeb;color:#5d5a54;font-size:11px; }
 .theme-dark .tool-activity details { background:#2d2c28;border-color:#46443e; }
@@ -76,3 +76,31 @@
 .theme-dark .tool-activity pre,.theme-dark .harness-context,.theme-dark .agent-note { color:#aaa69c; }
 .theme-dark .harness-tools code { background:#3a3934;color:#ddd9d0; }
 .theme-dark .harness-incomplete { background:#3a352b;color:#d8c39c; }
+
+.harness-incomplete { display:flex;align-items:center;gap:10px;flex-wrap:wrap; }
+.continue-button { padding:3px 10px;border:1px solid #c4a87f;border-radius:7px;background:white;color:#74563e;font-size:11px;font-weight:500;cursor:pointer; }
+.continue-button:hover:not(:disabled) { background:#fbf6ee; }
+.continue-button:disabled { opacity:.5;cursor:default; }
+.theme-dark .continue-button { background:#3a3934;border-color:#5a5148;color:#e0c9a8; }
+
+/* The sidebar's muted text inherited the light-theme grey, which is nearly
+   invisible on a dark ground. axe measured it; nothing else would have. */
+.theme-dark .section-label,
+.theme-dark .new-chat kbd,
+.theme-dark .topbar-title small,
+.theme-dark .profile-row small,
+.theme-dark .empty-history,
+.theme-dark .suggestion-card small,
+.theme-dark .message-actions button,
+.theme-dark .overflow-menu span,
+.theme-dark .tool-activity summary span,
+.theme-dark .attachment-chip button,
+.theme-dark .composer-shell textarea::placeholder,
+.theme-dark .share-status,
+.theme-dark .agent-note,
+.theme-dark .harness-context { color:#b5b1a7; }
+.theme-dark .harness-incomplete { background:#3b332a;color:#e6c9a4; }
+.theme-dark .send-button { color:#b5b1a7; }
+
+.index-stale { margin:6px 0 0;color:#74563e;font-size:11px;line-height:1.45; }
+.theme-dark .index-stale { color:#e6c9a4; }
