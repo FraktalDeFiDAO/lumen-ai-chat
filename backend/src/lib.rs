@@ -1829,22 +1829,64 @@ async fn chat(
             }
         };
         let prompt = coder_prompt(&request.messages, state.config.coder_allow_writes);
-        let result = coders::execute(
-            route,
-            &prompt,
-            &coder_root,
-            state.config.coder_allow_writes,
-            state.config.coder_timeout,
-        )
-        .await;
-        drop(permit);
-        return match result {
-            Ok(execution) => sse_text(&execution.output),
-            Err(coders::CoderError::Timeout { .. }) => sse_error("The selected AI coder timed out"),
-            Err(_) => {
-                sse_error("The selected AI coder failed; verify its native CLI authentication")
+
+        // The answer is forwarded as the coder writes it. A coding agent takes
+        // minutes, and collecting the whole thing before saying anything is the
+        // difference between watching it work and watching a spinner.
+        let (chunks, mut incoming) = mpsc::unbounded_channel::<String>();
+        let route = route.clone();
+        let allow_writes = state.config.coder_allow_writes;
+        let coder_timeout = state.config.coder_timeout;
+        let run = tokio::spawn(async move {
+            let outcome = coders::execute_streaming(
+                &route,
+                &prompt,
+                &coder_root,
+                allow_writes,
+                coder_timeout,
+                |text| {
+                    // A receiver that has hung up does not stop the coder; the
+                    // run still finishes and its workspace is still cleaned up.
+                    let _ = chunks.send(text.to_owned());
+                },
+            )
+            .await;
+            drop(permit);
+            outcome
+        });
+
+        let output = stream! {
+            while let Some(text) = incoming.recv().await {
+                yield Ok::<Bytes, std::io::Error>(Bytes::from(format!(
+                    "data: {}\n\n",
+                    openai_delta(&text)
+                )));
             }
+            let closing = match run.await {
+                Ok(Ok(_)) => None,
+                Ok(Err(coders::CoderError::Timeout { .. })) => {
+                    Some(error_payload("The selected AI coder timed out"))
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "coder run failed");
+                    Some(error_payload(
+                        "The selected AI coder failed; verify its native CLI authentication",
+                    ))
+                }
+                Err(error) => {
+                    tracing::error!(%error, "coder task did not finish");
+                    Some(error_payload("The selected AI coder stopped unexpectedly"))
+                }
+            };
+            if let Some(payload) = closing {
+                yield Ok(Bytes::from(format!("data: {payload}\n\n")));
+            }
+            yield Ok(Bytes::from_static(b"data: [DONE]\n\n"));
         };
+
+        let mut response = Response::new(Body::from_stream(output));
+        add_sse_headers(response.headers_mut());
+        return response;
     }
     let (provider_kind, upstream) = match open_upstream(&state, &request).await {
         Ok(pair) => pair,
