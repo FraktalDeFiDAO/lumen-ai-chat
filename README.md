@@ -24,6 +24,24 @@ When `AI_CODER_ROUTES_JSON` is unset, each installed CLI receives a default rout
 
 Coders that support multiple providers use their provider as the middle segment. Fixed-provider coders repeat their coder name as the provider segment.
 
+### Model discovery
+
+A `default` route means "whatever this CLI is configured for", which is all some
+coders can offer. The rest can say more, so on startup each installed CLI is
+asked what it can run and every answer becomes a route of its own under its real
+provider and model name:
+
+- Hermes reads the provider cache it refreshes from each provider's live `/v1/models`
+- OpenCode and KiloCode are asked with `models`, which both print as `provider/model`
+- Codex reports the model its `config.toml` selects
+- Claude Code has no list command, so it offers the aliases its help documents
+
+Discovery is best-effort. A coder that is not logged in, has no cache yet, or
+cannot be reached contributes nothing and keeps its `default` route, which is
+also what happens when a coder is asked and fails. Setting
+`AI_CODER_ROUTES_JSON` turns discovery off entirely: an operator who has written
+out the routes they want should not have others added to them.
+
 Configure explicit routes and display names when you want model-level selection:
 
 ```bash
@@ -253,7 +271,9 @@ Ollama is added only when `OLLAMA_ENABLED=true` or legacy `AI_PROVIDER=openai-co
 | `APP_BIND` | `127.0.0.1:41788` | Rust HTTP bind address |
 | `AI_DEFAULT_CODER` | `hermes` | Default AI coder |
 | `AI_DEFAULT_PROVIDER` | first provider for default coder | Default provider |
-| `AI_CODER_ROUTES_JSON` | one default route per installed CLI | Coder/provider/model catalog |
+| `AI_CODER_ROUTES_JSON` | one default route per installed CLI | Coder/provider/model catalog; also disables discovery |
+| `AI_CODER_MODEL_DISCOVERY` | on | Set to `off` to skip asking coders for their models |
+| `AI_CODER_DISCOVERY_TIMEOUT_SECS` | `30` | How long one coder may take to answer |
 | `AI_CODER_WORKSPACE` | startup directory | Fixed coder workspace |
 | `AI_CODER_ALLOW_WRITES` | `false` | Explicit workspace-write opt-in |
 | `AI_CODER_TIMEOUT_SECONDS` | `300` | Per-execution deadline |

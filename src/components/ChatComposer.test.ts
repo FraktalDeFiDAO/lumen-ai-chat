@@ -87,7 +87,16 @@ describe('ChatComposer', () => {
     const composer = mountComposer()
     const groups = composer.findAll('optgroup')
     expect(groups.map(group => group.attributes('label'))).toEqual(['Hermes · Z.AI', 'Codex · Codex'])
-    expect(groups[0].findAll('option').map(option => option.text())).toEqual(['hermes/z.ai/glm-5.2', 'hermes/z.ai/glm-5.1'])
+    expect(groups[0].findAll('option').map(option => option.text())).toEqual(['GLM 5.2', 'GLM 5.1'])
+  })
+
+  /// The group already says which coder and provider a model belongs to, so
+  /// repeating them in every option leaves the one thing the user is choosing
+  /// -- the model -- buried at the end of a long route key.
+  it('names the model rather than repeating its route', () => {
+    const options = mountComposer().findAll('option')
+    expect(options.map(option => option.text())).not.toContain('hermes/z.ai/glm-5.2')
+    expect(options.map(option => option.attributes('value'))).toContain('hermes/z.ai/glm-5.2')
   })
 
   it('reports the route the user picked', async () => {

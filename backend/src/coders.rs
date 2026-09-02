@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     env,
     path::{Path, PathBuf},
     process::Stdio,
@@ -12,6 +13,8 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::Command,
 };
+
+use crate::catalog::{self, DiscoveredModel};
 
 const MAX_CODER_ROUTES: usize = 100;
 const MAX_CODER_OUTPUT_BYTES: usize = 1024 * 1024;
@@ -188,6 +191,92 @@ pub fn discover_routes() -> Result<Vec<CoderRoute>, String> {
         });
     }
     Ok(routes)
+}
+
+/// What one coder answered when asked for its models.
+pub struct Discovery {
+    pub kind: CoderKind,
+    pub executable: PathBuf,
+    pub models: Vec<DiscoveredModel>,
+}
+
+/// Discovery is bounded so that a coder fronting a large gateway cannot turn
+/// the model catalog into something the service has to carry for every request.
+const MAX_DISCOVERED_ROUTES: usize = 2000;
+
+/// Offer every discovered model as a route of its own.
+///
+/// The routes already present are kept, and kept first: each coder's `default`
+/// route means "whatever this CLI is configured for", which stays useful and is
+/// the only thing that works for a coder that cannot be asked.
+fn merge(existing: Vec<CoderRoute>, found: Vec<Discovery>) -> Vec<CoderRoute> {
+    let mut seen: HashSet<String> = existing.iter().map(CoderRoute::key).collect();
+    let mut routes = existing;
+
+    for discovery in found {
+        for model in discovery.models {
+            if routes.len() >= MAX_DISCOVERED_ROUTES {
+                tracing::warn!(
+                    limit = MAX_DISCOVERED_ROUTES,
+                    "discovered more models than the catalog will carry"
+                );
+                return routes;
+            }
+            let route = CoderRoute {
+                kind: discovery.kind,
+                provider_name: display_identifier(&model.provider),
+                model_name: model.model.clone(),
+                provider: model.provider,
+                model: model.model,
+                executable: discovery.executable.clone(),
+            };
+            if seen.insert(route.key()) {
+                routes.push(route);
+            }
+        }
+    }
+    routes
+}
+
+/// How long one coder is given to answer. KiloCode takes about seven seconds
+/// to list four hundred models, so the default leaves real headroom.
+fn discovery_timeout() -> Duration {
+    env::var("AI_CODER_DISCOVERY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .map_or(Duration::from_secs(30), Duration::from_secs)
+}
+
+/// Ask every installed coder what it can run, and offer each answer as a route.
+///
+/// Skipped when the operator has written `AI_CODER_ROUTES_JSON`: they have said
+/// exactly which routes they want, and discovery must not add to that.
+pub async fn with_discovered_models(routes: Vec<CoderRoute>) -> Vec<CoderRoute> {
+    if env::var_os("AI_CODER_ROUTES_JSON").is_some()
+        || env::var("AI_CODER_MODEL_DISCOVERY").is_ok_and(|value| value == "off")
+    {
+        return routes;
+    }
+
+    let timeout = discovery_timeout();
+    // Concurrently: the slowest coder decides how long this takes, not the sum.
+    let found = futures_util::future::join_all(CoderKind::ALL.into_iter().map(|kind| async move {
+        let executable = resolve_executable(kind)?;
+        let models = catalog::discover(catalog::catalog_for(kind), &executable, timeout).await;
+        tracing::info!(
+            coder = kind.id(),
+            models = models.len(),
+            "discovered models"
+        );
+        Some(Discovery {
+            kind,
+            executable,
+            models,
+        })
+    }))
+    .await;
+
+    merge(routes, found.into_iter().flatten().collect())
 }
 
 pub fn statuses(routes: &[CoderRoute]) -> Vec<CoderStatus> {
@@ -500,23 +589,29 @@ pub(crate) fn excluded_workspace_entry(name: &str) -> bool {
         || name == "auth.json"
 }
 
+const CODER_ENV_PASSTHROUGH: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LC_ALL",
+    "TERM",
+    "SHELL",
+    "TMPDIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+    // Obsidian binds its REST server to host loopback. The API container uses
+    // host networking, and this deployment intentionally lets coding agents
+    // operate that vault without exposing unrelated provider credentials.
+    "OBSIDIAN_API_KEY",
+];
+
 fn apply_clean_environment(command: &mut Command) {
     command.env_clear();
-    for key in [
-        "PATH",
-        "HOME",
-        "USER",
-        "LOGNAME",
-        "LANG",
-        "LC_ALL",
-        "TERM",
-        "SHELL",
-        "TMPDIR",
-        "XDG_CONFIG_HOME",
-        "XDG_DATA_HOME",
-        "XDG_STATE_HOME",
-        "XDG_CACHE_HOME",
-    ] {
+    for key in CODER_ENV_PASSTHROUGH {
         if let Some(value) = env::var_os(key) {
             command.env(key, value);
         }
@@ -1090,6 +1185,19 @@ real failure here
     }
 
     #[test]
+    fn only_the_obsidian_application_secret_is_forwarded_to_coders() {
+        assert!(CODER_ENV_PASSTHROUGH.contains(&"OBSIDIAN_API_KEY"));
+        for secret in [
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GOOGLE_API_KEY",
+            "AI_API_KEY",
+        ] {
+            assert!(!CODER_ENV_PASSTHROUGH.contains(&secret), "{secret} leaked");
+        }
+    }
+
+    #[test]
     fn a_workspace_copy_follows_no_symlinks() {
         let source = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
@@ -1274,5 +1382,108 @@ printf '{\"result\":\"the whole answer\"}'
         assert!(!copy.path().join(".env").exists());
         assert!(!copy.path().join("node_modules").exists());
         assert!(!copy.path().join("data").exists());
+    }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+
+    fn route(kind: CoderKind, provider: &str, model: &str) -> CoderRoute {
+        CoderRoute {
+            kind,
+            provider: provider.into(),
+            provider_name: provider.into(),
+            model: model.into(),
+            model_name: model.into(),
+            executable: PathBuf::from("/usr/bin/coder"),
+        }
+    }
+
+    fn discovery(kind: CoderKind, models: &[(&str, &str)]) -> Discovery {
+        Discovery {
+            kind,
+            executable: PathBuf::from("/usr/bin/coder"),
+            models: models
+                .iter()
+                .map(|(provider, model)| DiscoveredModel {
+                    provider: (*provider).into(),
+                    model: (*model).into(),
+                })
+                .collect(),
+        }
+    }
+
+    /// `default` means "whatever this CLI is configured for". It is the only
+    /// route Claude Code and Codex can really offer, so discovery adds to it
+    /// rather than replacing it.
+    #[test]
+    fn the_default_route_survives_and_stays_first() {
+        let merged = merge(
+            vec![route(CoderKind::Hermes, "auto", "default")],
+            vec![discovery(
+                CoderKind::Hermes,
+                &[("anthropic", "claude-opus-5")],
+            )],
+        );
+
+        assert_eq!(merged[0].key(), "hermes/auto/default");
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn a_discovered_model_becomes_a_route_under_its_real_name() {
+        let merged = merge(
+            Vec::new(),
+            vec![discovery(
+                CoderKind::Hermes,
+                &[("anthropic", "claude-opus-5")],
+            )],
+        );
+
+        assert_eq!(merged[0].key(), "hermes/anthropic/claude-opus-5");
+        assert_eq!(merged[0].model_name, "claude-opus-5");
+        assert_eq!(merged[0].provider_name, "Anthropic");
+    }
+
+    /// Two coders can front the same gateway, and an operator can already have
+    /// configured a route discovery then finds again.
+    #[test]
+    fn the_same_model_is_never_offered_twice() {
+        let merged = merge(
+            vec![route(
+                CoderKind::Opencode,
+                "zenmux",
+                "anthropic/claude-opus-5",
+            )],
+            vec![discovery(
+                CoderKind::Opencode,
+                &[
+                    ("zenmux", "anthropic/claude-opus-5"),
+                    ("zenmux", "anthropic/claude-fable-5"),
+                ],
+            )],
+        );
+
+        assert_eq!(
+            merged.iter().map(CoderRoute::key).collect::<Vec<_>>(),
+            vec![
+                "opencode/zenmux/anthropic/claude-opus-5",
+                "opencode/zenmux/anthropic/claude-fable-5"
+            ],
+        );
+    }
+
+    #[test]
+    fn the_catalog_is_bounded() {
+        let many: Vec<(String, String)> = (0..MAX_DISCOVERED_ROUTES + 50)
+            .map(|index| ("provider".to_string(), format!("model-{index}")))
+            .collect();
+        let borrowed: Vec<(&str, &str)> =
+            many.iter().map(|(p, m)| (p.as_str(), m.as_str())).collect();
+
+        let merged = merge(Vec::new(), vec![discovery(CoderKind::Hermes, &borrowed)]);
+
+        assert_eq!(merged.len(), MAX_DISCOVERED_ROUTES);
     }
 }

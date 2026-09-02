@@ -1,0 +1,42 @@
+{
+  "openrouter": {
+    "fp": "515a14b338a90eb6",
+    "at": 1787824618.5517068,
+    "models": [
+      "anthropic/claude-opus-5",
+      "anthropic/claude-fable-5",
+      "anthropic/claude-opus-5-fast",
+      "anthropic/claude-opus-4.8"
+    ]
+  },
+  "anthropic": {
+    "fp": "b8e5668620f855f2",
+    "at": 1787824628.4034011,
+    "models": [
+      "claude-opus-5",
+      "claude-fable-5",
+      "claude-sonnet-5",
+      "claude-opus-4-8",
+      "claude-opus-4-7"
+    ]
+  },
+  "zai": {
+    "fp": "df8e7d599e637b42",
+    "at": 1787824618.5567892,
+    "models": [
+      "glm-5.2",
+      "glm-5",
+      "glm-4-9b"
+    ]
+  },
+  "opencode-zen": {
+    "fp": "506500fbb8c4ef48",
+    "at": 1787824621.2957234,
+    "models": [
+      "claude-opus-5",
+      "claude-fable-5",
+      "claude-opus-4-8",
+      "claude-opus-4-7"
+    ]
+  }
+}

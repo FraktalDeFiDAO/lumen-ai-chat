@@ -1,0 +1,8 @@
+zenmux/anthropic/claude-fable-5
+zenmux/anthropic/claude-haiku-4.5
+zenmux/anthropic/claude-opus-4
+kilo/~anthropic/claude-fable-latest
+kilo/~anthropic/claude-haiku-latest
+kilo/~anthropic/claude-opus-latest
+kilo/~anthropic/claude-sonnet-latest
+kilo/~deepseek/deepseek-v4-flash-latest
