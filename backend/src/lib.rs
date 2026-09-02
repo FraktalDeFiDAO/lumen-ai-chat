@@ -11,6 +11,7 @@ use std::{
     time::Duration,
 };
 
+pub mod catalog;
 pub mod coders;
 pub mod harness;
 pub mod identity;

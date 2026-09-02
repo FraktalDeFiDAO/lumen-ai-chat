@@ -16,10 +16,13 @@ test.describe('the Compose deployment', () => {
     await expect(page.getByRole('heading', { name: 'How can I help you today?' })).toBeVisible()
 
     // No AI_CODER_ROUTES_JSON in the deployment, so every coder contributes its
-    // own default route and Hermes leads.
+    // own default route and Hermes leads. Model discovery adds however many
+    // routes the coders inside the container can actually reach, which depends
+    // on their credentials and on the network -- so the floor is asserted, not
+    // an exact count.
     const selector = page.getByLabel('AI coder, provider, and model')
     await expect(selector).toHaveValue('hermes/auto/default')
-    await expect(selector.locator('optgroup')).toHaveCount(5)
+    expect(await selector.locator('optgroup').count()).toBeGreaterThanOrEqual(5)
     expect(consoleErrors).toEqual([])
   })
 

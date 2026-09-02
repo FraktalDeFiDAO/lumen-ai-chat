@@ -1,4 +1,4 @@
-use ai_chatbot_gateway::{Config, build_router};
+use ai_chatbot_gateway::{Config, build_router, coders};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
@@ -19,7 +19,10 @@ async fn main() {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let config = Config::from_env()?;
+    let mut config = Config::from_env()?;
+    // Asking each coder what it can run needs to happen once, and needs a
+    // runtime; building the configuration needs neither, so it happens here.
+    config.coders = coders::with_discovered_models(config.coders).await;
     let bind = config.bind;
     let app = build_router(config)?;
     let listener = TcpListener::bind(bind).await?;
