@@ -108,7 +108,7 @@ Coder processes run in one fixed workspace and cannot accept a working directory
 export AI_CODER_WORKSPACE="/absolute/path/to/project"
 ```
 
-The default is the gateway's startup directory. Child processes receive a scrubbed environment that excludes provider keys and application secrets while retaining standard OS paths needed to load native CLI credential files.
+The default is the gateway's startup directory. Child processes receive a scrubbed environment that excludes provider keys and application secrets while retaining standard OS paths needed to load native CLI credential files. The local deployment deliberately forwards one narrowly scoped exception, `OBSIDIAN_API_KEY`, so coding agents can call the host-only Obsidian REST server over host networking.
 
 The gateway requires a loopback `APP_BIND`; every non-loopback bind is rejected. Remote access must be provided by a separately managed TLS and identity-aware reverse proxy rather than by exposing Lumen directly.
 

@@ -33,9 +33,28 @@ services:
       # mean a store that fails to open and a warning on every start.
       # `compose.hosted.yaml` is the deployment that keeps them server-side.
       AI_STORE: "off"
+      # A general-purpose model without an API key.
+      #
+      # Every other route in this deployment is a coding agent -- Hermes, Codex,
+      # Claude Code and the rest are wrapped in coding system prompts and will
+      # decline anything else, which is the right behaviour for what they are and
+      # the wrong thing to hand somebody who wanted a conversation. Ollama runs
+      # locally and needs no key, so it is the one route that answers generally.
+      #
+      # Opt in from the host, because a route that points at nothing is worse
+      # than no route: `OLLAMA_ENABLED=true podman compose up -d`, with Ollama
+      # listening on the host. `network_mode: host` means 127.0.0.1 here is the
+      # host's, so the default base URL already reaches it.
+      OLLAMA_ENABLED: "${OLLAMA_ENABLED:-}"
+      OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:-http://127.0.0.1:11434/v1}"
+      OLLAMA_MODEL: "${OLLAMA_MODEL:-}"
       HOME: /run/lumen-home
       USER: "${USER:-admministrator}"
       PATH: "${HOME}/.local/bin:${HOME}/.local/share/pnpm/bin:/usr/local/sbin:/usr/local/bin:/usr/bin"
+      # The host-only Obsidian REST server is reachable because this service
+      # uses host networking. Its key is the sole application secret forwarded
+      # to native coding agents; backend/src/coders.rs owns that narrow exception.
+      OBSIDIAN_API_KEY: "${OBSIDIAN_API_KEY:-}"
       RUST_LOG: info,tower_http=info
     volumes:
       - .:/workspace:ro
